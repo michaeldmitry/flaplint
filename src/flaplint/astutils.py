@@ -7,11 +7,11 @@ same result, which makes them trivial to unit-test in isolation.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from .constants import (
     ACCUMULATOR_METHODS,
-    CONFIG_WRITE_METHODS,
+    FILE_WRITE_METHODS,
     MAPPING_WRITE_METHODS,
     PROPAGATE_CALLS,
     UNORDERED_CALLS,
@@ -153,17 +153,42 @@ def databag_mutation_args(
 
 
 def annotation_root(node: Optional[ast.AST]) -> Optional[str]:
-    """Outermost name of an annotation: ``Iterable[X]`` -> ``Iterable``."""
+    """Outermost name of an annotation: ``Iterable[X]`` -> ``Iterable``.
+
+    ``Optional[X]`` and ``Union[X, None]`` are transparent wrappers: the
+    interesting type is the payload, not the wrapper. ``Optional[str]`` is a
+    scalar string, not an unordered collection, so it must resolve to ``str``
+    (the wrapper itself carries no ordering semantics). The first
+    non-``None``/``NoneType`` argument of the wrapper is used.
+    """
     if node is None:
         return None
     if isinstance(node, ast.Subscript):
-        return annotation_root(node.value)
+        head = annotation_root(node.value)
+        if head in ("Optional", "Union"):
+            return _unwrap_optional(node.slice) or head
+        return head
     if isinstance(node, ast.Attribute):
         return node.attr
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value.split("[", 1)[0].strip()
+    return None
+
+
+def _unwrap_optional(sl: ast.AST) -> Optional[str]:
+    """Resolve the payload type of an ``Optional``/``Union`` subscript slice.
+
+    ``Optional[str]`` -> ``str``; ``Union[Set[str], None]`` -> ``Set``. A bare
+    ``Optional[X]`` has a single-element slice; ``Union[A, B]`` is an
+    ``ast.Tuple``. ``None`` / ``NoneType`` members are ignored.
+    """
+    elts = sl.elts if isinstance(sl, ast.Tuple) else [sl]
+    for elt in elts:
+        root = annotation_root(elt)
+        if root not in (None, "None", "NoneType"):
+            return root
     return None
 
 
@@ -282,22 +307,31 @@ def loop_accumulators(node: ast.For) -> set:
     return names
 
 
-def config_write_args(call: ast.Call) -> Optional[List[ast.expr]]:
-    """Content expression(s) written by a known workload-config / file call.
+def file_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
+    """``(method, content exprs)`` written by a known on-disk file call.
 
-    Recognises ``container.push(path, source)``, ``container.add_layer(label,
-    layer)`` and ``Path.write_text``/``write_bytes`` and returns the argument(s)
-    that carry the *content* (so an order-unstable payload there is a config/file
-    flap). Returns ``None`` when ``call`` is not such a write, and an empty list
-    when the method matches but the content argument is absent.
+    Recognises the workload/charm file writers in :data:`FILE_WRITE_METHODS` --
+    ``container.push(path, source)``, ``container.add_layer(label, layer)``,
+    ``Path.write_text``/``write_bytes`` (also ``charmlibs.pathops``), open-handle
+    ``f.write(data)`` / ``f.writelines(lines)``, and ``os.write(fd, data)`` --
+    and returns the method key plus the argument(s) carrying the *content* (so an
+    order-unstable payload there is a file flap). Returns ``None`` when ``call``
+    is not such a write, and ``(method, [])`` when the method matches but the
+    content argument is absent.
 
-    Like the other sinks this anchors on a stable framework method name (the
-    module docstring's "match on the final name" convention); the *content
-    position* is what we read, so it is structural rather than a fuzzy match.
+    ``os.write`` and a path/handle's ``.write`` share the final attribute name
+    but differ in content position (``os.write(fd, data)`` vs ``f.write(data)``),
+    so ``os.write`` is disambiguated by its ``os`` module root and looked up
+    under the synthetic ``os_write`` key. Like the other sinks this anchors on a
+    stable framework/stdlib method name; the *content position* is structural.
     """
     if not isinstance(call.func, ast.Attribute):
         return None
-    spec = CONFIG_WRITE_METHODS.get(call.func.attr)
+    attr = call.func.attr
+    key = attr
+    if attr == "write" and module_root(call.func) == "os":
+        key = "os_write"  # os.write(fd, data) -- content is the 2nd positional
+    spec = FILE_WRITE_METHODS.get(key)
     if spec is None:
         return None
     idx, kw_aliases = spec
@@ -308,7 +342,7 @@ def config_write_args(call: ast.Call) -> Optional[List[ast.expr]]:
     for kw in call.keywords:
         if kw.arg in kw_aliases and kw.value is not None:
             out.append(kw.value)
-    return out
+    return key, out
 
 
 def map_call_args(call: ast.Call, fi: FuncInfo) -> Dict[int, ast.expr]:

@@ -8,6 +8,7 @@ import sys
 from typing import List, Optional
 
 from .analyzer import Analyzer
+from .render import colour_enabled, render_report
 
 _DESCRIPTION = (
     "Detect order-unstable values written to Juju relation data, which cause "
@@ -75,7 +76,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="order findings by criticality (most severe first) or by file "
         "location (default: criticality)",
     )
-    parser.add_argument("--json", action="store_true", help="emit JSON output")
+    parser.add_argument(
+        "--format",
+        choices=("pretty", "concise", "json"),
+        default="pretty",
+        help="output style: a grouped, colourised report (pretty, default); the "
+        "one-line-per-finding form for editors/grep (concise); or machine JSON "
+        "(json). --json is an alias for --format json.",
+    )
+    parser.add_argument("--json", action="store_true", help="alias for --format json")
     parser.add_argument(
         "--relations-unordered",
         action="store_true",
@@ -102,9 +111,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     findings = analyzer.run()
 
-    if args.json:
+    fmt = "json" if args.json else args.format
+
+    if fmt == "json":
         print(json.dumps([f.__dict__ for f in findings], indent=2))
-    else:
+    elif fmt == "concise":
         for finding in findings:
             print(finding.format())
         errors = sum(1 for f in findings if f.level == "error")
@@ -115,6 +126,13 @@ def main(argv: Optional[List[str]] = None) -> int:
             f"in {len(analyzer.primary_files)} file(s).",
             file=sys.stderr,
         )
+    else:  # pretty
+        report = render_report(
+            findings,
+            len(analyzer.primary_files),
+            colour=colour_enabled(sys.stdout),
+        )
+        print(report)
 
     # Only charm-owned (error) findings fail the run; dependency warnings don't.
     return 1 if any(f.level == "error" for f in findings) else 0

@@ -2,9 +2,9 @@
 
 > **Keep your charm's databags steady, your reconcilers quiet.**
 
-`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a `set`, a `glob`, a `uuid4()`, …) reaches a *churn-sensitive sink*: a relation databag, a config file, or a content-hash restart gate.
+`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a `set`, a `glob`, a `uuid4()`, …) reaches a *churn-sensitive sink*: a relation databag, an on-disk file, or a content-hash change-detector.
 
-The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* instability also flaps a rendered config or pebble layer and content-hash restart gates. So `flaplint` checks all three. See [§c](#c-what-it-recognises-sources-propagators-sanitisers-sinks) for the full sink list.
+The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* instability also flaps an on-disk file (a rendered config, pebble layer, or any file used as a change-detector) and content-hash change-detectors — both of which gate a restart / replan / re-sync. So `flaplint` checks all three. See [§c](#c-what-it-recognises-sources-propagators-sanitisers-sinks) for the full sink list.
 
 
 ---
@@ -120,7 +120,11 @@ for f in findings:
 | `--report-deps` | also report findings *inside* `--venv` packages (default: trace only) |
 | `--min-confidence {low,medium,high}` | reporting threshold (default `medium`) |
 | `--sort {criticality,location}` | finding order: most severe first, or by file location (default `criticality`) |
-| `--json` | emit JSON instead of `path:line:col` text |
+| `--format {pretty,concise,json}` | output style: grouped colour report (`pretty`, default), one-line-per-finding for editors/grep (`concise`), or machine `json` |
+| `--json` | alias for `--format json` |
+
+> Colour in `pretty` mode is emitted only to a terminal; it auto-disables when
+> piped or in CI, and honours the `NO_COLOR` / `FORCE_COLOR` conventions.
 
 > For how `--venv`, `--auto-deps` and `--python` discover *vendored* vs *installed*
 > libraries (and why `--python` is the most robust), see
@@ -152,12 +156,23 @@ relation.data[self.app]["priorities"] = json.dumps(items)  # databag-order: igno
   `time`, `monotonic`, `random`, `token_hex`, `token_bytes`. Sorting cannot fix these.
 - **Sinks** (where instability bites -> each tagged `sink=` in the output):
   - **`databag`**: a relation-data write in any of its shapes.
-  - **`config`**: content rendered, where churn forces a false
-    `replan()` / restart: `container.push(path, source)`,
-    `path.write_text(…)` / `write_bytes(…)`, and a function that `return`s a rendered blob
+  - **`file`**: unstable content written to an on-disk file (workload container
+    *or* the charm container). Like a content hash, an on-disk file is almost
+    always a **change-detector**: the charm (or workload) diffs it against the
+    previous reconcile to gate expensive work — a pebble replan, a workload
+    restart, a re-render, or further file I/O. If the bytes reshuffle, that gate
+    trips every reconcile. Recognised writers: `container.push(path, source)`,
+    `container.add_layer(label, layer)`, `Path.write_text(…)` / `write_bytes(…)`
+    (also `charmlibs.pathops`), open-handle `f.write(…)` / `f.writelines(…)`,
+    `os.write(fd, data)`, and a function that `return`s a rendered blob
     (`return yaml.dump(x)` / `json.dumps(x)`) for a consumer to diff.
-  - **`hash`**: a content-hash change-detector (`sha256(str(x))`, `md5`, `blake2b`, …)
-    whose digest gates a restart/replan.
+  - **`hash`**: a content-hash change-detector (`sha256(str(x))`, `md5`, `blake2b`, …).
+    The charm diffs the digest against the previous reconcile to decide whether to
+    do expensive work; if the hashed value is unstable the digest changes every
+    reconcile and the gate trips. The *hashing of unstable content* is the sink —
+    `flaplint` flags the digest call itself and assumes the digest is used as a
+    change-detector (its near-universal purpose); it does not trace which specific
+    effect (restart, replan, re-sync, re-publish) the digest ultimately gates.
 
 
 ---
@@ -343,13 +358,59 @@ def _on_changed(self, event):
 
 ## f. Reading the output
 
+By default `flaplint` prints a **grouped, colourised report**: findings are
+gathered under each file, aligned, marked by *who can fix it*, and annotated with
+a plain-English *what / why / fix* so you don't have to memorise the rule names.
+
+```text
+flaplint  · relation-databag flapping check
+
+src/charm.py  · 3 error(s)
+  ✖  142:9  unordered collection · peers → databag  [high]
+            a set/dict is serialised without sorted(), so its bytes reshuffle
+            from one reconcile to the next; downstream: spurious relation-changed churn
+            fix: sort before writing — json.dumps(sorted(x)) (or sort_keys=True for dict keys)
+            ↳ born at src/utils.py:20, written via _collect()
+  ✖  51:13  nondeterministic value · uuid4 → databag  [high]
+            the value is regenerated every reconcile, so it differs even when sorted;
+            downstream: spurious relation-changed churn
+            fix: make it stable — derive it deterministically, or persist it once and reuse it
+
+lib/charms/grafana_k8s/v0/grafana_dashboard.py  · 1 warning(s)
+  ▲ 1359:9  nondeterministic value · json → databag  [high]
+            the value is regenerated every reconcile, so it differs even when sorted;
+            downstream: spurious relation-changed churn
+            fix lives in a dependency you don't own — reported for awareness, doesn't fail CI
+
+────────────────────────────────────────────────────────
+  ✖ 4 problem(s)   3 error(s)   1 warning(s)   · 11 file(s) scanned
+  ✖ you own this — fails CI     ▲ in a dependency — non-blocking
+```
+
+Each finding's first line reads `mark line:col  <failure mode> · <variable> → <sink>  [confidence]`:
+
+| Part | Meaning |
+|------|---------|
+| `✖` / `▲` | **who can fix it** — `✖` is code you own (fails CI); `▲` lives in a dependency (non-blocking) |
+| `line:col` | **where to fix it** — for `unordered-pick` this is the pick itself, not the blameless serialiser |
+| failure mode | one of the three root causes below; tells you *how to fix it* |
+| `· <variable>` | the **affected identifier** to go look at (`peers`, `scheduler_addrs`, or the volatile call `uuid4`) |
+| `→ <sink>` | where the value lands: `databag`, an `on-disk file`, or a `content hash` (both change-detectors) |
+| `[confidence]` | `high` / `medium` / `low` confidence that this is a real bug |
+
+The indented lines explain *why* it flaps, the concrete *fix*, and — when the value
+is born elsewhere — a `↳ born at …` provenance trail back to its origin.
+
+### Machine-readable / editor output
+
+For editors, `grep`, or scripts, `--format concise` emits one flat line per finding
+(and `--json` emits the structured records):
+
 ```text
 src/charm.py:142:9: type=unordered-collection severity=high sink=databag var=peers
-src/coordinator.py:229:42: type=unordered-pick severity=high sink=config var=scheduler_addrs
+src/coordinator.py:229:42: type=unordered-pick severity=high sink=file var=scheduler_addrs
 src/charm.py:51:13: type=nondeterministic severity=high sink=databag var=uuid4
 lib/charms/grafana_k8s/v0/grafana_dashboard.py:1359:9: [warning] type=nondeterministic severity=high sink=databag var=json
-
-4 potential databag-ordering issue(s): 3 error(s), 1 warning(s) (fix lives in a dependency / vendored lib) across 11 file(s) (+0 dependency file(s) traced).
 ```
 
 Each line is `path:line:col:` followed by an optional `[warning]` marker and four flat fields:
@@ -358,7 +419,7 @@ Each line is `path:line:col:` followed by an optional `[warning]` marker and fou
 |-------|---------|
 | `type=` | **which failure mode** — one of the three below; tells you *how to fix it* |
 | `severity=` | `high` / `medium` / `low` confidence that this is a real bug |
-| `sink=` | where the value lands: `databag`, `config` (a rendered workload config), or `hash` (a content-hash restart gate) |
+| `sink=` | where the value lands: `databag`, `file` (an on-disk file / rendered workload config used as a change-detector), or `hash` (a content-hash change-detector) |
 | `var=` | the **affected variable** — the identifier to go look at (`peers`, `scheduler_addrs`, or the volatile call `uuid4`) |
 
 ### Errors vs warnings — *who can fix it*

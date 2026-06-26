@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from . import astutils
-from .constants import CONFIG_WRITE_DESCS, HASH_CALLS, RENDER_SERIALIZERS
+from .constants import FILE_WRITE_DESCS, HASH_CALLS, RENDER_SERIALIZERS
 from .handlers import Handler
 from .model import FuncInfo, Origin, Registry
 from .taint import TaintEngine
@@ -180,23 +180,24 @@ class FunctionAnalyzer:
                         sub,
                         origins,
                         "direct",
-                        "content hash (restart/replan gate)",
+                        "content hash (change-detection gate)",
                         sub.args[0],
                         "hash",
                     )
-            cwargs = astutils.config_write_args(sub)
-            if cwargs:
+            fwrite = astutils.file_write_args(sub)
+            if fwrite is not None:
+                fmethod, fwargs = fwrite
                 origins = set()
-                for content in cwargs:
+                for content in fwargs:
                     origins |= self._eval(content, ctx)
                 if origins:
                     handler.sink(
                         sub,
                         origins,
                         "direct",
-                        CONFIG_WRITE_DESCS.get(name, "config/file write"),
-                        cwargs[0],
-                        "config",
+                        FILE_WRITE_DESCS.get(fmethod, "on-disk file write"),
+                        fwargs[0],
+                        "file",
                     )
             margs = astutils.databag_mutation_args(sub, ctx.databags)
             if margs is not None:
@@ -315,7 +316,7 @@ class FunctionAnalyzer:
                         "direct",
                         "config rendered for the workload",
                         v.args[0] if v.args else v,
-                        "config",
+                        "file",
                     )
             handler.ret(self._eval(stmt.value, ctx))
             return

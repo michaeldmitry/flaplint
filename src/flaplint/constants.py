@@ -88,9 +88,22 @@ VOLATILE_CALLS: Set[str] = {
 #: their input.
 NONSORTING_SERIALIZERS: Set[str] = {"str", "repr"}
 
-#: Digest/hash calls used as change-detectors. Hashing an unordered value yields
-#: a different digest for the same logical content, which spuriously trips
-#: config-hash-gated workload restarts / pebble replans.
+#: Pydantic model serializers. A model serializes its fields in *definition*
+#: order, so ``<model>.model_dump_json()`` / ``<model>.model_dump()`` produce a
+#: byte-stable top-level shape regardless of the receiver's iteration order.
+#: They therefore launder the receiver's *ordering* taint rather than inheriting
+#: it -- writing ``param.model_dump_json()`` to a databag is not a raw-unordered
+#: write, so it must not trip the contract-boundary sink heuristic.
+MODEL_SERIALIZERS: Set[str] = {"model_dump_json", "model_dump"}
+
+#: Digest/hash calls used as change-detectors. A charm hashes some content and
+#: diffs the digest against the previous reconcile to decide whether to do
+#: expensive work (restart, pebble replan, rule re-sync, databag re-publish, ...).
+#: Hashing an unordered (or otherwise unstable) value yields a different digest
+#: for the same logical content, so that gate trips on every reconcile. The
+#: *hashing of unstable content* is the sink: the analyzer flags the digest call
+#: itself and assumes the digest is used as a change-detector (its near-universal
+#: purpose); it does not trace which specific effect the digest gates.
 HASH_CALLS: Set[str] = {
     "md5",
     "sha1",
@@ -123,7 +136,13 @@ UNORDERED_ANNOTATIONS: Set[str] = {
 }
 
 #: Parameter annotations that are ordered/irrelevant: dumping them is the
-#: caller's responsibility, so the helper itself is not at fault.
+#: caller's responsibility, so the helper itself is not at fault. Mappings live
+#: here too: the only instability a ``Dict``/``Mapping`` can introduce at a sink
+#: is *key* order, which every real databag serializer fixes (PyYAML sorts keys
+#: by default; ``json.dumps(sort_keys=True)``; a Pydantic model dumps fields in
+#: definition order). A bare mapping *parameter* therefore is not the helper's
+#: fault -- if the caller passes order-shuffled *values*, that is a caller-side
+#: ``caller`` finding, not a contract-boundary ``sink`` one.
 ORDERED_ANNOTATIONS: Set[str] = {
     "list",
     "List",
@@ -135,6 +154,11 @@ ORDERED_ANNOTATIONS: Set[str] = {
     "int",
     "float",
     "bool",
+    "dict",
+    "Dict",
+    "Mapping",
+    "MutableMapping",
+    "OrderedDict",
 }
 
 #: Names of the attribute-mutation methods that accumulate values in iteration
@@ -166,29 +190,46 @@ MAPPING_WRITE_METHODS: Set[str] = {"update", "setdefault"}
 #: These names must therefore bypass user-summary resolution.
 BUILTIN_VIEW_METHODS: Set[str] = {"items", "keys", "values"}
 
-#: Workload-config / file emission APIs. Order-unstable (or volatile) content
-#: reaching one of these flaps the rendered config or on-disk file, which
-#: triggers a spurious pebble replan / workload restart -- and, downstream,
-#: relation-changed churn once the restarted workload re-publishes. Databag
-#: writes are not the only churn sink: a flapping config file or pebble layer
-#: re-runs commands and bounces the workload on every reconcile.
+#: On-disk file / workload-config emission APIs (the ``file`` sink). Order-
+#: unstable (or volatile) content reaching one of these writes a byte-unstable
+#: file to a workload container or the charm container's disk. Like a content
+#: hash, such a file is overwhelmingly used as a *change-detector*: the charm
+#: (or a downstream consumer) diffs the file against its previous contents to
+#: gate expensive work -- a pebble replan, a workload restart, a re-render, or
+#: further file I/O. If the bytes reshuffle every reconcile, that gate trips
+#: spuriously and the workload churns. The *write of unstable content to disk*
+#: is the sink; flaplint flags it and assumes the file feeds a change-detector
+#: (its near-universal purpose), without tracing which specific effect it gates.
 #:
-#: Each entry maps the (well-known, stable) framework method name to the
+#: Each entry maps the (well-known, stable) framework/stdlib method name to the
 #: argument carrying the *content*: ``(positional index, keyword aliases)``.
-CONFIG_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
-    "push": (1, ("source",)),  # ops.Container.push(path, source)
-    "add_layer": (1, ("layer",)),  # ops.Container.add_layer(label, layer)
-    "write_text": (0, ()),  # pathlib.Path.write_text(data, ...)
-    "write_bytes": (0, ()),  # pathlib.Path.write_bytes(data)
+#: Directory/deletion ops (``make_dir``/``mkdir``/``remove_path``/``rmdir``/
+#: ``unlink``) carry no content and are not flap sinks, so they are absent.
+FILE_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
+    # ops.Container (workload container).
+    "push": (1, ("source",)),  # Container.push(path, source, ...)
+    "add_layer": (1, ("layer",)),  # Container.add_layer(label, layer)
+    # pathlib.Path AND charmlibs.pathops (ContainerPath / LocalPath share the
+    # same names + content-first signature): write_text(data)/write_bytes(data).
+    "write_text": (0, ("data",)),
+    "write_bytes": (0, ("data",)),
+    # Open file handles: ``f.write(data)`` / ``f.writelines(lines)``.
+    "write": (0, ("data",)),
+    "writelines": (0, ("lines",)),
+    # Low-level: ``os.write(fd, data)`` -- content is the *second* positional.
+    "os_write": (1, ("data",)),
 }
 
-#: Human-readable sink descriptions for the config-write methods above, keyed by
+#: Human-readable sink descriptions for the file-write methods above, keyed by
 #: method name, used in the finding message.
-CONFIG_WRITE_DESCS: Dict[str, str] = {
-    "push": "container push (pebble replan / workload restart)",
-    "add_layer": "pebble layer (replan / workload restart)",
-    "write_text": "config file write",
-    "write_bytes": "config file write",
+FILE_WRITE_DESCS: Dict[str, str] = {
+    "push": "container push (file change-detector: replan / restart)",
+    "add_layer": "pebble layer (change-detector: replan / restart)",
+    "write_text": "on-disk file write (change-detector gate)",
+    "write_bytes": "on-disk file write (change-detector gate)",
+    "write": "on-disk file write (change-detector gate)",
+    "writelines": "on-disk file write (change-detector gate)",
+    "os_write": "on-disk file write (change-detector gate)",
 }
 
 #: Serializers whose *return value* is a rendered config/data blob. A function

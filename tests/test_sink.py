@@ -64,6 +64,25 @@ def test_hash_of_set_is_flagged(lint_source):
     assert findings[0].sink == "hash"
 
 
+def test_hash_finding_names_the_collection_not_the_wrapper(lint_source):
+    # ``sha256(str(peers).encode())`` -- the offending identifier is ``peers``,
+    # the set being hashed, NOT the ``str`` serializer wrapper nor the ``.encode``
+    # method. The encode/decode pass-through must be peeled to its receiver.
+    findings = lint_source(
+        """
+        import hashlib
+
+        class Charm:
+            def _hash(self):
+                peers = {u.name for u in self.units}
+                return hashlib.sha256(str(peers).encode()).hexdigest()
+        """
+    )
+    hashes = [f for f in findings if f.sink == "hash"]
+    assert len(hashes) == 1
+    assert hashes[0].variable == "peers"
+
+
 def test_hash_inside_dunder_is_suppressed(lint_source):
     # __hash__/__eq__ object hashing is in-process and never causes churn.
     findings = lint_source(
@@ -226,6 +245,58 @@ def test_model_dump_escape_propagates_param_taint(lint_source):
     assert sinks[0].confidence == "high"
 
 
+def test_optional_scalar_param_is_not_a_sink(lint_source):
+    # ``Optional[str]`` is a scalar string -- its serialization is deterministic.
+    # The wrapper must be unwrapped to ``str`` (ordered), so dumping it through a
+    # model is the caller's concern, not a contract-boundary sink.
+    findings = lint_source(
+        """
+        from typing import Optional
+
+        class Charm:
+            def publish(self, relation, server_cert: Optional[str] = None):
+                bag = relation.data[self.app]
+                ProviderApplicationData(cert=server_cert).dump(bag)
+        """
+    )
+    assert [f for f in findings if f.kind == "sink"] == []
+
+
+def test_optional_mapping_param_is_not_a_sink(lint_source):
+    # ``Optional[Dict[str, str]]`` -> ``Dict``: a mapping's only sink-side
+    # instability is key order, which every databag serializer fixes. Not a
+    # contract-boundary sink.
+    findings = lint_source(
+        """
+        from typing import Dict, Optional
+
+        class Charm:
+            def publish(self, relation, labels: Optional[Dict[str, str]] = None):
+                bag = relation.data[self.app]
+                ProviderApplicationData(labels=labels).dump(bag)
+        """
+    )
+    assert [f for f in findings if f.kind == "sink"] == []
+
+
+def test_optional_set_param_is_still_a_high_sink(lint_source):
+    # ``Optional[Set[str]]`` -> ``Set``: the wrapper is transparent, the payload
+    # is genuinely unordered, so the high-confidence sink survives unwrapping.
+    findings = lint_source(
+        """
+        from typing import Optional, Set
+
+        class Charm:
+            def publish(self, relation, data: Optional[Set[str]] = None):
+                bag = relation.data[self.app]
+                ProviderApplicationData(certificates=data).dump(bag, True)
+        """
+    )
+    sinks = [f for f in findings if f.kind == "sink"]
+    assert len(sinks) == 1
+    assert sinks[0].confidence == "high"
+
+
 def test_databag_passed_to_reader_is_not_a_sink(lint_source):
     # ``acc.extend(relation.data[app])`` *reads* the bag into a list; the bag is
     # the source, not a write destination, so it must not be flagged.
@@ -347,7 +418,7 @@ def test_container_push_of_unordered_is_a_config_sink(lint_source):
     callers = [f for f in findings if f.kind == "caller"]
     assert len(callers) == 1
     assert callers[0].confidence == "high"
-    assert callers[0].sink == "config"
+    assert callers[0].sink == "file"
 
 
 def test_pebble_add_layer_with_unordered_value_is_a_config_sink(lint_source):
@@ -388,6 +459,68 @@ def test_write_text_via_source_kwarg_is_a_config_sink(lint_source):
     )
     callers = [f for f in findings if f.kind == "caller"]
     assert len(callers) == 1
+
+
+def test_file_handle_write_of_unordered_is_a_file_sink(lint_source):
+    # ``open(...).write(content)`` -- the open file handle's ``.write`` carries
+    # the content as its first positional argument.
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self, names):
+                with open("/etc/app.conf", "w") as f:
+                    f.write(str(set(names)))
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].sink == "file"
+
+
+def test_file_handle_writelines_of_unordered_is_a_file_sink(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self, names):
+                with open("/etc/app.conf", "w") as f:
+                    f.writelines(set(names))
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].sink == "file"
+
+
+def test_os_write_of_unordered_is_a_file_sink(lint_source):
+    # ``os.write(fd, data)`` -- content is the SECOND positional argument; it must
+    # not be confused with a path/handle ``.write(data)`` (content first).
+    findings = lint_source(
+        """
+        import os
+
+        class Charm:
+            def reconcile(self, fd, names):
+                os.write(fd, str(set(names)).encode())
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].sink == "file"
+
+
+def test_pathops_write_bytes_of_unordered_is_a_file_sink(lint_source):
+    # charmlibs.pathops ContainerPath/LocalPath share write_text/write_bytes with
+    # the content as the first positional argument, like pathlib.Path.
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self, root, names):
+                (root / "app.conf").write_bytes(str(set(names)).encode())
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].sink == "file"
 
 
 def test_config_write_of_sorted_value_is_not_a_sink(lint_source):

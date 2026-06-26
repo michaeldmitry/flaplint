@@ -66,12 +66,21 @@ def _unwrap(node: ast.AST) -> ast.AST:
     """Peel transparent serialiser / repackaging calls to the real value.
 
     ``str(json.dumps(list(x)))`` -> ``x``: each layer just reformats its first
-    argument, so the offending identifier is whatever they all wrap.
+    argument, so the offending identifier is whatever they all wrap. Receiver
+    methods that pass their value through unchanged -- ``x.encode()`` /
+    ``x.decode()`` -- are peeled to their *receiver* (``str(peers).encode()`` ->
+    ``peers``), mirroring the taint engine's encode/decode pass-through; without
+    this the name would wrongly resolve to the outer ``str`` wrapper.
     """
     cur = node
-    while isinstance(cur, ast.Call) and cur.args:
+    while isinstance(cur, ast.Call):
         name = astutils.final_attr(cur.func)
-        if name in _TRANSPARENT_WRAPPERS:
+        if (
+            name in ("encode", "decode")
+            and isinstance(cur.func, ast.Attribute)
+        ):
+            cur = cur.func.value  # peel to the receiver: ``x.encode()`` -> ``x``
+        elif name in _TRANSPARENT_WRAPPERS and cur.args:
             cur = cur.args[0]
         else:
             break

@@ -15,6 +15,7 @@ from typing import Dict, Optional, Set
 from . import astutils
 from .constants import (
     BUILTIN_VIEW_METHODS,
+    MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
     PROPAGATE_CALLS,
     SANITIZER_CALLS,
@@ -194,6 +195,11 @@ class TaintEngine:
         if name in SANITIZER_CALLS:
             return set()
         if name in UNORDERED_CALLS:
+            # An *empty* collection constructor (``set()`` / ``frozenset()`` with
+            # no arguments) has a single, stable serialization -- it cannot
+            # reshuffle. Only a populated collection inherits hash-seed ordering.
+            if name in ("set", "frozenset") and not call.args and not call.keywords:
+                return set()
             return {("local", None, call, None)}
         if name in VOLATILE_CALLS:
             return {"volatile"}
@@ -277,7 +283,11 @@ class TaintEngine:
         # The receiver may itself be an expression -- a chained call
         # (``cluster.gather_addresses_by_role().get(role)``) or a subscript -- so
         # evaluate it rather than only reading a plain name's environment taint.
-        if isinstance(call.func, ast.Attribute):
+        # A Pydantic serializer (``<model>.model_dump_json()``) is the exception:
+        # it emits fields in definition order, so the receiver's iteration order
+        # never reaches the output -- it launders ordering taint, it doesn't
+        # inherit it.
+        if isinstance(call.func, ast.Attribute) and name not in MODEL_SERIALIZERS:
             recv = call.func.value
             if isinstance(recv, ast.Name):
                 out |= set(env.get(recv.id, ()))
