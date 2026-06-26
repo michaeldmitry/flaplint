@@ -1,0 +1,287 @@
+"""Sink visitors: what to *do* when the traversal reaches a sink or a return.
+
+The traversal is decoupled from policy through the :class:`Handler` interface.
+The same statement walk drives two passes:
+
+* :class:`SummaryHandler` records parameter/return taint into a function's
+  summary during the fixed-point computation;
+* :class:`ReportHandler` collects concrete, user-facing findings for the final
+  report.
+"""
+
+from __future__ import annotations
+
+import ast
+from typing import List, Optional, Set, Tuple
+
+from . import astutils
+from .constants import NONSORTING_SERIALIZERS, PROPAGATE_CALLS, VOLATILE_CALLS
+from .model import (
+    FuncInfo,
+    Origin,
+    has_element,
+    has_local,
+    is_element,
+    is_local,
+    local_site,
+)
+
+
+def _loc_key(site: Tuple) -> Tuple[str, int, int]:
+    """Sort key ``(path, line, col)`` for a ``(path, node, ...)`` pick site."""
+    path, node = site[0], site[1]
+    return (path, getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+
+def _pick_local_site(origins, fi: FuncInfo):
+    """``(path, line, via)`` born-site of the earliest ``local`` origin (or ``None``).
+
+    Points a finding's ``origin=`` at where the unordered value is *created* (the
+    ``set()`` / ``glob()`` / unsorted helper) rather than where it is written.
+    ``None`` placeholders in an origin resolve to ``fi``'s file/name; ``via`` is
+    blanked when the born site lives in the finding's own function (the
+    ``origin=`` pointer already says so).
+    """
+    sites = [local_site(o) for o in origins if is_local(o)]
+    if not sites:
+        return None
+    path, node, func = min(
+        ((s[0] or fi.path, s[1], s[2] or fi.name) for s in sites),
+        key=lambda t: _loc_key((t[0], t[1])),
+    )
+    via = "" if func == fi.name else func
+    return (path, getattr(node, "lineno", 0), via)
+
+
+#: Wrapper callables whose offending content is their *first argument*, not the
+#: wrapper itself. ``str(peers)`` / ``json.dumps(peers)`` / ``list(peers)`` all
+#: serialise or repackage ``peers`` -- so the variable a user should look at is
+#: the argument inside, not ``str`` / ``dumps`` / ``list``.
+_TRANSPARENT_WRAPPERS: Set[str] = (
+    NONSORTING_SERIALIZERS | PROPAGATE_CALLS | {"dumps", "dump", "safe_dump"}
+)
+
+
+def _unwrap(node: ast.AST) -> ast.AST:
+    """Peel transparent serialiser / repackaging calls to the real value.
+
+    ``str(json.dumps(list(x)))`` -> ``x``: each layer just reformats its first
+    argument, so the offending identifier is whatever they all wrap.
+    """
+    cur = node
+    while isinstance(cur, ast.Call) and cur.args:
+        name = astutils.final_attr(cur.func)
+        if name in _TRANSPARENT_WRAPPERS:
+            cur = cur.args[0]
+        else:
+            break
+    return cur
+
+
+def _variable(node: ast.AST) -> str:
+    """Best-effort name of the offending variable/collection (``""`` if none).
+
+    The root of an access chain (``addrs[0]`` -> ``addrs``, ``glob(...)`` ->
+    ``glob``) is the actionable identifier a user looks at; anonymous values
+    (a bare ``{...}`` set literal) have no name and yield ``""``. Transparent
+    serialiser wrappers (``str(peers)``) are peeled first so the collection is
+    named, not the wrapper.
+    """
+    name = astutils.root_name(_unwrap(node))
+    return name if name and name not in ("self", "cls") else ""
+
+
+def _volatile_name(node: Optional[ast.AST]) -> str:
+    """Name the nondeterministic call inside ``node`` (``uuid4`` / ``time`` ...).
+
+    For a volatile write the offending thing is the regenerating call, not the
+    serializer wrapping it -- so ``json.dumps({"id": str(uuid.uuid4())})`` should
+    report ``var=uuid4``, not ``var=json``. Walk the subtree for the first call
+    whose final attribute is a known volatile source and return that name.
+    """
+    if node is None:
+        return ""
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            name = astutils.final_attr(sub.func)
+            if name in VOLATILE_CALLS:
+                return name
+    return ""
+
+
+
+class Handler:
+    """Callbacks invoked by the traversal at sinks and returns.
+
+    The default implementation ignores everything; subclasses override the
+    callbacks they care about.
+    """
+
+    def sink(
+        self,
+        node: ast.AST,
+        origins: Set[Origin],
+        kind: str,
+        desc: str,
+        arg: ast.AST,
+        sink_type: str = "databag",
+    ) -> None:
+        """Called when ``origins`` reach a sink (``databag`` or ``hash``)."""
+
+    def ret(self, origins: Set[Origin]) -> None:
+        """Called for each ``return <value>`` with the value's taint."""
+
+
+class SummaryHandler(Handler):
+    """Accumulate a function's interprocedural summary from one analysis pass."""
+
+    def __init__(self, fi: FuncInfo) -> None:
+        self.fi = fi
+        self.changed = False
+
+    def _mark(self, idx: int, kind: str) -> None:
+        prev = self.fi.dangerous.get(idx)
+        if prev is None:
+            self.fi.dangerous[idx] = kind
+            self.changed = True
+        elif prev == "via" and kind == "direct":
+            self.fi.dangerous[idx] = "direct"
+            self.changed = True
+
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
+        # Hash sinks are reported only at concrete local-origin sites, not folded
+        # into parameter summaries (which describe relation-data writes).
+        if sink_type != "databag":
+            return
+        marker = "direct" if kind == "direct" else "via"
+        for origin in origins:
+            if isinstance(origin, tuple) and origin[0] == "param":
+                self._mark(origin[1], marker)
+
+    def ret(self, origins) -> None:
+        for origin in origins:
+            if is_local(origin):
+                # A locally-born unordered value reaches the return: remember its
+                # born site (mirrors ``element_site``) so callers can blame the
+                # ``set()`` / ``glob()`` rather than their own serializer. ``None``
+                # placeholders mean "this function's file/name".
+                site = local_site(origin)
+                resolved = (
+                    site[0] or self.fi.path,
+                    site[1],
+                    site[2] or self.fi.name,
+                )
+                if self.fi.unordered_site is None or _loc_key(
+                    resolved
+                ) < _loc_key(self.fi.unordered_site):
+                    self.fi.unordered_site = resolved
+                    self.changed = True
+                if not self.fi.returns_unordered:
+                    self.fi.returns_unordered = True
+                    self.changed = True
+            elif is_element(origin):
+                # Remember *where* the pick happened (and which function owns it)
+                # so callers can blame the subscript, not their own serializer.
+                # ``path is None`` means the pick is in this function's own file;
+                # ``func is None`` means this function owns it.
+                site = (
+                    origin[1] or self.fi.path,
+                    origin[2],
+                    origin[3] or self.fi.name,
+                )
+                if self.fi.element_site is None or _loc_key(
+                    site
+                ) < _loc_key(self.fi.element_site):
+                    self.fi.element_site = site
+                    self.changed = True
+                if not self.fi.returns_element:
+                    self.fi.returns_element = True
+                    self.changed = True
+            elif isinstance(origin, tuple) and origin[0] == "param":
+                if origin[1] not in self.fi.returns_params:
+                    self.fi.returns_params.add(origin[1])
+                    self.changed = True
+
+
+class ReportHandler(Handler):
+    """Collect concrete findings (local/volatile origins) for one function.
+
+    Each record is the structured tuple
+    ``(node, confidence, rule, sink_type, variable, path, origin)`` consumed by
+    :func:`flaplint.report.report`. ``origin`` is the
+    ``(path, line, via)`` born-site pointer (or ``None``).
+    """
+
+    def __init__(self, fi: FuncInfo, sink_out: List[Tuple]) -> None:
+        self.fi = fi
+        self.out = sink_out
+
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
+        # Only locally-born unstable values are concrete bugs at this site;
+        # parameter-only flows are reported on the helper that owns the sink.
+        # ``element`` is value-position order instability (a pick) and reports
+        # like ``local``.
+        volatile = "volatile" in origins
+        if not has_local(origins) and not has_element(origins) and not volatile:
+            return
+        # A builtin ``hash()`` inside a value-object dunder (``__hash__`` /
+        # ``__eq__``) is in-process object hashing -- consistent only within one
+        # interpreter by design -- not a cross-reconcile change-detection gate,
+        # so it never causes churn. Suppress to avoid flagging e.g.
+        # ``hash((..., frozenset(x), ...))``.
+        if sink_type == "hash":
+            fname = self.fi.name or ""
+            if fname.startswith("__") and fname.endswith("__"):
+                return
+        if volatile:
+            # A fresh nondeterministic value (uuid/time/random) churns on *every*
+            # reconcile and sorting cannot fix it -- strictly worse than order
+            # instability. Name the regenerating call, not the serializer.
+            self.out.append(
+                (
+                    node,
+                    "high",
+                    "nondeterministic",
+                    sink_type,
+                    _volatile_name(arg) or _variable(arg),
+                    self.fi.path,
+                    None,
+                )
+            )
+            return
+        if has_element(origins):
+            # Value-position instability: a value picked by *position* from an
+            # unordered collection (``addrs[0]``). It survives key-sorting, so the
+            # serializer / write site is NOT where to fix it. Report *at the pick*
+            # (its own file:line), not at the blameless sink.
+            site_path, site_node = min(
+                (
+                    (o[1] or self.fi.path, o[2])
+                    for o in origins
+                    if is_element(o)
+                ),
+                key=_loc_key,
+            )
+            self.out.append(
+                (
+                    site_node,
+                    "high",
+                    "unordered-pick",
+                    sink_type,
+                    _variable(site_node),
+                    site_path,
+                    None,
+                )
+            )
+            return
+        self.out.append(
+            (
+                node,
+                "high",
+                "unordered-collection",
+                sink_type,
+                _variable(arg),
+                self.fi.path,
+                _pick_local_site(origins, self.fi),
+            )
+        )

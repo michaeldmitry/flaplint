@@ -1,0 +1,43 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flaplint"
+version = "1.0.0"
+description = "Static interprocedural taint linter for Juju relation-databag ordering churn."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Canonical Observability" }]
+keywords = ["juju", "charm", "linter", "static-analysis", "ast", "relation-data"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# The analyzer is deliberately stdlib-only (ast). No runtime dependencies.
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.scripts]
+flaplint = "flaplint.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/canonical/observability"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/flaplint"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 88
+target-version = "py38"
