@@ -205,6 +205,11 @@ class FuncInfo:
     is_property: bool = False
     class_name: Optional[str] = None
     primary: bool = False  # report findings for this function?
+    #: True if this function/property *returns a relation databag* -- its body
+    #: returns ``relation.data[app|unit]`` / ``relation.data.get(entity)`` (or
+    #: chains to another such accessor). Lets a write through the accessor
+    #: (``self.unit_databag.update(...)``) be recognised as a databag sink.
+    returns_databag: bool = False
 
     # --- summary (computed by fixed point) ---
     #: parameter index -> "direct" (written to a sink here) | "via" (forwarded

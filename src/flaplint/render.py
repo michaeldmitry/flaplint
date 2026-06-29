@@ -153,12 +153,16 @@ def _describe(f: Finding) -> str:
     elif f.rule == "nondeterministic":
         if is_detector:
             core = (
-                f"{subject} is regenerated every hook execution before it is fed into "
-                f"{target}, so any change-detection built on it trips."
+                f"{subject} is freshly generated each time this code runs, so when this "
+                f"path executes it feeds a different value into {target} and any "
+                "change-detection built on it trips."
             )
         else:
             core = (
-                f"{subject} is regenerated every hook execution before it reaches {target}."
+                f"{subject} is freshly generated each time this code runs, so when this "
+                f"path executes the value written to {target} differs from last time "
+                "(sorting cannot fix it). If that write is intentional, suppress it with "
+                "`# databag-order: ignore`."
             )
     else:
         core = f"{subject} reaches {target} in a nondeterministic form."

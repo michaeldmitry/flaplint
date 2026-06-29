@@ -84,6 +84,24 @@ def databag_expr(node: ast.AST) -> bool:
     )
 
 
+def databag_get_call(node: ast.AST) -> bool:
+    """``<expr>.data.get(<entity>)`` -- a databag accessed via ``.get`` not ``[]``.
+
+    The ``.get(app | unit)`` form is equivalent to ``.data[entity]`` for reading a
+    relation databag. Requiring the argument to be an ``app``/``unit`` entity keeps
+    this from matching an unrelated ``.data.get("key")`` on some other mapping.
+    """
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "data"
+        and len(node.args) >= 1
+        and is_entity(node.args[0])
+    )
+
+
 def is_entity(node: ast.AST) -> bool:
     """``<expr>.app`` / ``<expr>.unit`` -- a Juju ``Application``/``Unit`` entity.
 
@@ -168,6 +186,15 @@ def annotation_root(node: Optional[ast.AST]) -> Optional[str]:
         if head in ("Optional", "Union"):
             return _unwrap_optional(node.slice) or head
         return head
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+        # PEP 604 union: ``str | None`` is the same as ``Optional[str]`` -- the
+        # payload type is what matters (``str | None`` is a scalar string, not a
+        # collection). Resolve to the first non-``None`` operand.
+        for side in (node.left, node.right):
+            root = annotation_root(side)
+            if root not in (None, "None", "NoneType"):
+                return root
+        return None
     if isinstance(node, ast.Attribute):
         return node.attr
     if isinstance(node, ast.Name):

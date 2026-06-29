@@ -29,7 +29,7 @@ from .discovery import (
 )
 from .model import FileImports, Finding, FuncInfo, Registry
 from .report import report
-from .summary import compute_summaries
+from .summary import compute_summaries, mark_databag_accessors
 from .taint import TaintEngine
 from .traversal import FunctionAnalyzer
 
@@ -114,6 +114,7 @@ class Analyzer:
             file_imports=file_imports,
         )
         analyzer = FunctionAnalyzer(engine)
+        mark_databag_accessors(functions, registry)
         compute_summaries(functions, analyzer)
         findings = report(functions, analyzer, suppressed)
 

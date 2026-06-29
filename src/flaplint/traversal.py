@@ -14,7 +14,13 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Set
 
 from . import astutils
-from .constants import FILE_WRITE_DESCS, HASH_CALLS, RENDER_SERIALIZERS
+from .constants import (
+    BUILTIN_COLLECTION_METHODS,
+    FILE_WRITE_DESCS,
+    HASH_CALLS,
+    MAPPING_WRITE_METHODS,
+    RENDER_SERIALIZERS,
+)
 from .handlers import Handler
 from .model import FuncInfo, Origin, Registry
 from .taint import TaintEngine
@@ -68,6 +74,14 @@ class FunctionAnalyzer:
                 matched = [fi for fi in candidates if fi.class_name == cls]
                 if matched:
                     return matched
+            # A builtin collection method (``subnets.update(...)``) on a receiver of
+            # unknown class must NOT fall back to a same-named user method -- that is
+            # a cross-class collision (e.g. the charm's own ``update``). Without a
+            # known class, treat it as the builtin and resolve to nothing.
+            if name in BUILTIN_COLLECTION_METHODS:
+                recv = call.func.value
+                if not (isinstance(recv, ast.Name) and recv.id in ("self", "cls")):
+                    return []
         return candidates
 
     def _record_type(self, target: ast.AST, value: ast.AST, ctx: Context) -> None:
@@ -85,10 +99,33 @@ class FunctionAnalyzer:
         """Track ``b = relation.data[app]`` so later ``b.update(...)`` is a sink."""
         if not isinstance(target, ast.Name):
             return
-        if astutils.databag_expr(value):
+        if self._is_databag_object(value, ctx):
             ctx.databags.add(target.id)
         else:
             ctx.databags.discard(target.id)
+
+    def _is_databag_accessor_ref(self, node: ast.AST, ctx: Context) -> bool:
+        """``self.<prop>`` where ``<prop>`` is a databag-returning accessor here."""
+        if not (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id in ("self", "cls")
+            and ctx.cls
+        ):
+            return False
+        return any(
+            fi.class_name == ctx.cls and fi.returns_databag
+            for fi in self.registry.get(node.attr, [])
+        )
+
+    def _is_databag_object(self, node: ast.AST, ctx: Context) -> bool:
+        """True if ``node`` *is* a relation databag: the literal ``.data[entity]``
+        shape, a local aliased to one, or ``self.<databag-accessor-property>``."""
+        if astutils.databag_expr(node):
+            return True
+        if isinstance(node, ast.Name) and node.id in ctx.databags:
+            return True
+        return self._is_databag_accessor_ref(node, ctx)
 
     def _ctor_field_taint(self, value: ast.AST, ctx: Context) -> Set[Origin]:
         """Taint a value object inherits from its constructor fields.
@@ -203,6 +240,15 @@ class FunctionAnalyzer:
                         "file",
                     )
             margs = astutils.databag_mutation_args(sub, ctx.databags)
+            if (
+                margs is None
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr in MAPPING_WRITE_METHODS
+                and self._is_databag_object(sub.func.value, ctx)
+            ):
+                # ``self.<databag-accessor>.update(...)`` -- a mutation of a databag
+                # reached through a property, which the pure shape-matcher misses.
+                margs = list(sub.args)
             if margs is not None:
                 origins = set()
                 for arg in margs:
@@ -339,7 +385,11 @@ class FunctionAnalyzer:
         self._scan_expr(stmt.value, ctx, handler)
         taint = self._eval(stmt.value, ctx) | self._ctor_field_taint(stmt.value, ctx)
         for tgt in stmt.targets:
-            if astutils.is_databag_target(tgt, ctx.databags) and taint:
+            is_bag = astutils.is_databag_target(tgt, ctx.databags) or (
+                isinstance(tgt, ast.Subscript)
+                and self._is_databag_object(tgt.value, ctx)
+            )
+            if is_bag and taint:
                 handler.sink(stmt, taint, "direct", "relation databag", stmt.value)
         for tgt in stmt.targets:
             if isinstance(tgt, ast.Name):

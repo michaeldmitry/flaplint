@@ -202,6 +202,29 @@ MAPPING_WRITE_METHODS: Set[str] = {"update", "setdefault"}
 #: These names must therefore bypass user-summary resolution.
 BUILTIN_VIEW_METHODS: Set[str] = {"items", "keys", "values"}
 
+#: Builtin collection *mutator* methods (``set.update`` / ``list.append`` / ...).
+#: Same cross-class collision risk as the views: ``subnets.update(...)`` on a local
+#: set would otherwise resolve, by bare name, to a charm's own ``update`` method and
+#: inherit its (databag-writing) summary -- flagging the set as if it reached a sink.
+#: So on a receiver whose class isn't known, these never resolve to a user method.
+#: (``relation.data[...].update(...)`` is still caught as a databag write by the
+#: separate, receiver-anchored mapping-write detection.)
+BUILTIN_MUTATOR_METHODS: Set[str] = {
+    "update",
+    "setdefault",
+    "add",
+    "append",
+    "extend",
+    "insert",
+    "discard",
+    "remove",
+    "pop",
+}
+
+#: Builtin collection method names (views + mutators) that must never resolve to a
+#: same-named *user* method on a receiver of unknown class.
+BUILTIN_COLLECTION_METHODS: Set[str] = BUILTIN_VIEW_METHODS | BUILTIN_MUTATOR_METHODS
+
 #: On-disk file / workload-config emission APIs (the ``file`` sink). Order-
 #: unstable (or volatile) content reaching one of these writes a byte-unstable
 #: file to a workload container or the charm container's disk. Like a content

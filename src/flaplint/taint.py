@@ -14,7 +14,7 @@ from typing import Dict, Optional, Set
 
 from . import astutils
 from .constants import (
-    BUILTIN_VIEW_METHODS,
+    BUILTIN_COLLECTION_METHODS,
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
     PROPAGATE_CALLS,
@@ -448,7 +448,7 @@ class TaintEngine:
             own = [fi for fi in candidates if fi.class_name == cls_ctx]
             if own:
                 return own
-        if name in BUILTIN_VIEW_METHODS and isinstance(call.func, ast.Attribute):
+        if name in BUILTIN_COLLECTION_METHODS and isinstance(call.func, ast.Attribute):
             recv = call.func.value
             is_self = isinstance(recv, ast.Name) and recv.id in ("self", "cls")
             if not is_self:
