@@ -122,6 +122,28 @@ def _volatile_name(node: Optional[ast.AST]) -> str:
 
 
 
+def _resolve_field_origin(o: Origin, fi: FuncInfo):
+    """Resolve a returned field origin's born-site to the callee's file/name.
+
+    A field origin computed in the callee carries ``None`` placeholders (== "this
+    file / this function"). When the field is read back by a caller in *another*
+    file, those placeholders must already point at the callee, so a finding blames
+    the ``set()`` in the helper, not the caller's serializer. Param-flavored origins
+    are dropped: they can't be remapped to the caller without the call's arg
+    mapping, and a value-object field is rarely a bare parameter.
+    """
+    if o == "volatile":
+        return o
+    if not isinstance(o, tuple):
+        return None
+    tag = o[0]
+    if tag in ("local", "element"):
+        return (tag, o[1] or fi.path, o[2], o[3] or fi.name)
+    if tag == "itercaller":
+        return (tag, o[1] or fi.path, o[2], o[3])
+    return None  # param / iterparam: not cross-function-resolvable here
+
+
 class Handler:
     """Callbacks invoked by the traversal at sinks and returns.
 
@@ -142,6 +164,9 @@ class Handler:
 
     def ret(self, origins: Set[Origin]) -> None:
         """Called for each ``return <value>`` with the value's taint."""
+
+    def ret_fields(self, field_map: "dict[str, Set[Origin]]") -> None:
+        """Called for each ``return <value object>`` with its per-field taint."""
 
 
 class SummaryHandler(Handler):
@@ -254,6 +279,25 @@ class SummaryHandler(Handler):
                 if origin[1] not in self.fi.returns_params:
                     self.fi.returns_params.add(origin[1])
                     self.changed = True
+
+    def ret_fields(self, field_map) -> None:
+        # A returned value object's per-field taint becomes this function's
+        # ``returns_field_origins`` summary, so a caller can read an unstable field
+        # back off the object. Born-sites are resolved to this function so the
+        # finding points into the helper. Monotone union -> fixed-point safe.
+        for fld, origins in field_map.items():
+            resolved = set()
+            for o in origins:
+                r = _resolve_field_origin(o, self.fi)
+                if r is not None:
+                    resolved.add(r)
+            if not resolved:
+                continue
+            prev = self.fi.returns_field_origins.get(fld, set())
+            merged = prev | resolved
+            if merged != prev:
+                self.fi.returns_field_origins[fld] = merged
+                self.changed = True
 
 
 class ReportHandler(Handler):

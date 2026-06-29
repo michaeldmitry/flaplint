@@ -110,6 +110,72 @@ class FunctionAnalyzer:
         else:
             ctx.databag_kinds.pop(target.id, None)
 
+    def _clear_field_taint(self, name: str, ctx: Context) -> None:
+        """Drop every ``name.<field>`` compound key (on reassignment of ``name``)."""
+        prefix = name + "."
+        for key in [k for k in ctx.env if k.startswith(prefix)]:
+            del ctx.env[key]
+
+    def _record_field_taint(self, name: str, value: ast.AST, ctx: Context) -> None:
+        """Record the per-field taint of a value object bound to ``name``.
+
+        Value-object field provenance: an unstable collection stashed in a
+        dataclass / pydantic / NamedTuple field survives being read back off the
+        object. The field taint is stored under compound ``env`` keys
+        (``"name.field"``), which the engine reads on ``name.field`` access. Three
+        binding shapes populate it:
+
+        * ``name = Ctor(field=expr, ...)`` -- per-keyword field taint;
+        * ``name = other`` -- alias copy of ``other``'s field keys;
+        * ``name = helper(...)`` -- read the callee's ``returns_field_origins``
+          summary (the cross-function half).
+        """
+        self._clear_field_taint(name, ctx)
+        if isinstance(value, ast.Call) and astutils.ctor_class(value) is not None:
+            for kw in value.keywords:
+                if kw.arg is None or kw.value is None:
+                    continue
+                t = self._eval(kw.value, ctx)
+                if t:
+                    ctx.env[f"{name}.{kw.arg}"] = t
+            return
+        if isinstance(value, ast.Name):
+            prefix = value.id + "."
+            for key, origins in list(ctx.env.items()):
+                if key.startswith(prefix) and origins:
+                    ctx.env[f"{name}.{key[len(prefix):]}"] = set(origins)
+            return
+        if isinstance(value, ast.Call):
+            for fi in self._resolve_methods(value, ctx):
+                for fld, origins in fi.returns_field_origins.items():
+                    if origins:
+                        ctx.env[f"{name}.{fld}"] = set(
+                            ctx.env.get(f"{name}.{fld}", ())
+                        ) | set(origins)
+
+    def _returned_field_map(self, value: ast.AST, ctx: Context):
+        """Per-field taint of a returned value object: ``{field -> origins}``.
+
+        Mirrors :meth:`_record_field_taint` for the two return shapes that escape a
+        function -- ``return obj`` (collect its field keys) and the inline
+        ``return Ctor(field=expr)`` -- so a callee's value-object fields become its
+        ``returns_field_origins`` summary.
+        """
+        out = {}
+        if isinstance(value, ast.Name):
+            prefix = value.id + "."
+            for key, origins in ctx.env.items():
+                if key.startswith(prefix) and origins:
+                    out[key[len(prefix):]] = set(origins)
+        elif isinstance(value, ast.Call) and astutils.ctor_class(value) is not None:
+            for kw in value.keywords:
+                if kw.arg is None or kw.value is None:
+                    continue
+                t = self._eval(kw.value, ctx)
+                if t:
+                    out[kw.arg] = t
+        return out
+
     def _accessor_kind(self, attr: str, ctx: Context):
         """Return kind of ``self.<attr>`` resolved against this class's accessors."""
         if not ctx.cls:
@@ -392,6 +458,7 @@ class FunctionAnalyzer:
                         "file",
                     )
             handler.ret(self._eval(stmt.value, ctx))
+            handler.ret_fields(self._returned_field_map(stmt.value, ctx))
             return
 
         if isinstance(stmt, ast.For):
@@ -420,13 +487,23 @@ class FunctionAnalyzer:
                 ctx.env[tgt.id] = set(taint)
                 self._record_type(tgt, stmt.value, ctx)
                 self._record_databag_alias(tgt, stmt.value, ctx)
-            elif taint and not self._is_databag_target(tgt, ctx):
+                self._record_field_taint(tgt.id, stmt.value, ctx)
+            elif self._is_databag_target(tgt, ctx):
+                continue  # the databag write is reported as a sink above
+            else:
+                # ``obj.attr = expr`` records the field's taint under the compound
+                # ``obj.attr`` key (set even when clean, to clear a stale value), so
+                # a later read-back of that field is field-sensitive.
+                path = astutils.attr_path(tgt)
+                if path is not None:
+                    ctx.env[path] = set(taint)
                 # ``container[k] = <unordered>`` / ``obj.attr = <unordered>``: the
-                # element write taints the enclosing container, so a later
-                # serialization of the whole container is order-unstable.
-                base = astutils.root_name(tgt)
-                if base is not None and base not in ("self", "cls"):
-                    ctx.env[base] = set(ctx.env.get(base, ())) | set(taint)
+                # element write also taints the enclosing container, so a later
+                # serialization of the *whole* container is order-unstable.
+                if taint:
+                    base = astutils.root_name(tgt)
+                    if base is not None and base not in ("self", "cls"):
+                        ctx.env[base] = set(ctx.env.get(base, ())) | set(taint)
 
     def _visit_ann_assign(
         self, stmt: ast.AnnAssign, ctx: Context, handler: Handler
@@ -442,6 +519,7 @@ class FunctionAnalyzer:
             )
             self._record_type(stmt.target, stmt.value, ctx)
             self._record_databag_alias(stmt.target, stmt.value, ctx)
+            self._record_field_taint(stmt.target.id, stmt.value, ctx)
 
     def _visit_expr_stmt(self, stmt: ast.Expr, ctx: Context, handler: Handler) -> None:
         call = stmt.value

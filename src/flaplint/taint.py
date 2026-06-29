@@ -260,6 +260,14 @@ class TaintEngine:
             # ``relation.units`` and friends are unordered ops collections.
             if node.attr in UNORDERED_ATTRS:
                 return {("local", None, node, None)}
+            # Value-object field read-back: ``attrs.sans_dns`` where a per-field
+            # taint was recorded at construction / field write (stored under the
+            # compound ``env`` key ``"attrs.sans_dns"``). This is what lets an
+            # unstable collection survive being stashed in a dataclass/pydantic
+            # field and read back out -- the field-insensitivity barrier.
+            path = astutils.attr_path(node)
+            if path is not None and path in env:
+                return set(env[path])
             # ``self.<prop>`` / ``self.<member>.<prop>``: consult the summary.
             return self._property_taint(node, cls_ctx)
 

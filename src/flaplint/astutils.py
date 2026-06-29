@@ -29,6 +29,20 @@ def final_attr(func: ast.AST) -> Optional[str]:
     return None
 
 
+def attr_path(node: ast.AST) -> Optional[str]:
+    """Access-path key for a single-level field read/write, else ``None``.
+
+    ``attrs.sans_dns`` (an ``Attribute`` on a plain ``Name``) -> ``"attrs.sans_dns"``.
+    Used as a compound ``env`` key so a value object's *per-field* taint can be
+    stored and read back without modelling the heap (see the value-object field
+    provenance in :mod:`flaplint.traversal`). Deeper chains (``a.b.c``) and
+    subscripts return ``None`` -- only the common one-level field idiom is tracked.
+    """
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return f"{node.value.id}.{node.attr}"
+    return None
+
+
 def root_name(node: ast.AST) -> Optional[str]:
     """Root variable of an access chain: ``d.get('g', {})`` / ``d[k]`` -> ``d``."""
     cur = node

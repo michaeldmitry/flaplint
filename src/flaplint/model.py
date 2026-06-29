@@ -246,6 +246,13 @@ class FuncInfo:
     itercaller_site: Optional[Tuple[str, ast.AST, str]] = None
     #: parameter indices whose taint flows through to the return value.
     returns_params: Set[int] = field(default_factory=set)
+    #: for a function that returns a *value object* (a constructed dataclass /
+    #: pydantic model / NamedTuple), the per-field taint of that object: ``field
+    #: name -> origins``. Lets a caller read an unstable field back off the returned
+    #: object (``ctx = self._build(); ctx.targets``) -- the cross-function half of
+    #: value-object field provenance. Born-sites in these origins are resolved to
+    #: this function's file/name so a caller's finding can point into the helper.
+    returns_field_origins: Dict[str, Set["Origin"]] = field(default_factory=dict)
     #: parameter index -> ``(path, node)`` iteration site for params iterated
     #: unsorted into an order-dependent sequence that escapes the function (a
     #: ``[... for x in param.items()]`` whose list reaches a ``return`` or a

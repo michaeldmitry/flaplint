@@ -2,13 +2,13 @@
 
 > **Keep your charm's databags steady, your reconcilers quiet.**
 
-`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a `set`, a `glob`, a `uuid4()`, …) reaches a *churn-sensitive sink*: a relation databag, an on-disk file, a pebble plan, or a content-hash change-detector.
+`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a set, a glob, a uuid4(), …) reaches a churn-sensitive sink: a relation databag, an on-disk file, a pebble plan, or a content-hash change-detector.
 
-The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* instability also flaps an on-disk file (a rendered config or any file used as a change-detector), a pebble plan (an unstable layer makes `replan()` restart the workload), and content-hash change-detectors — all of which gate a restart / replan / re-sync. So `flaplint` checks all four.
+The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* unstable value also reshuffles a file on disk (a rendered config, or any file used to detect change), a pebble plan (an unstable layer makes `replan()` restart the workload), and a content hash — all of which then trigger a restart / replan / re-sync. So `flaplint` checks all four.
 
-> **Want the internals?** This README is the overview. For how the analysis
-> actually works — the taint model, sink discovery, the inter-procedural pass —
-> see **[docs/](docs/README.md)**.
+> **Want the details?** This README is the overview. For how it actually works —
+> how a value is judged unstable, where it's dangerous to write one, and how
+> values are followed across function calls — see **[docs/](docs/README.md)**.
 
 ---
 
@@ -20,7 +20,7 @@ Charms talk through relation databags. Juju has one rule that makes ordering mat
 
 It compares bytes, not meaning. So if your charm serialises a `set` (or a `dict`/list
 *built from* a set, a `glob`, `os.listdir`, set algebra, …) without sorting, the bytes
-come out in a different order each reconcile:
+come out in a different order each hook/reconcile:
 
 ```json
 ["alice", "bob"]      (reconcile 1)
@@ -53,8 +53,7 @@ The bug is a *latent* property of the code: a value's order is unstable whether 
 test ever exercises that relation. Reading the source means every code path is in
 scope, including the relations, branches and error handlers a test suite never drives.
 
-The trade-off is honesty about uncertainty. When a value's true origin can't be traced (it arrives as an untyped parameter from far away), the tool can't be sure. So it is a
-*flagger*: it ranks findings by confidence and leaves the final call to you.
+The trade-off is honesty about uncertainty. When where a value really came from can't be traced (it arrives as an unhinted parameter from far away), the tool can't be sure. So it doesn't claim certainty: it ranks findings by confidence and leaves the final call to you.
 
 ---
 
@@ -144,34 +143,33 @@ relation.data[self.app]["priorities"] = json.dumps(items)  # databag-order: igno
 
 ## c. How it works
 
-`flaplint` is a small **taint analysis**. It tracks values that have no stable
-byte-order from where they're *born* to where they're *written*, across function
-boundaries, and flags the writes.
+`flaplint` follows values whose text isn't always in the same order from where
+they're *created* to where they're *written*, across function calls, and flags the
+writes.
 
 ```mermaid
 flowchart LR
-    S["source<br/>(set / glob / uuid4 / …)"] --> P["propagation<br/>(list(), json.dumps, calls)"]
+    S["starts as<br/>(set / glob / uuid4 / …)"] --> P["followed through<br/>(list(), json.dumps, calls)"]
     P --> K{still unstable<br/>at the write?}
     K -- yes --> F["finding"]
-    K -- "no (sorted / laundered)" --> OK["stable ✓"]
+    K -- "no (sorted / made safe)" --> OK["stable ✓"]
 ```
 
-The pieces, each with a dedicated deep-dive in **[docs/](docs/README.md)**:
+The pieces, each with its own page in **[docs/](docs/README.md)**:
 
-- **A taint model** decides whether an expression is order-unstable and *why* —
-  labelling it with one of six **origins** (`local`, `element`, `itercaller`,
-  `iterparam`, `volatile`, `param`). The crucial distinction is which fix applies:
-  a bare `set` is laundered by a key-sorting serializer, but a `list(set)` is not.
+- **Judging a value** decides whether an expression is unstable and *why* — giving it
+  one of six labels. The key distinction is which fix works: a bare `set` is made safe
+  by a serializer that sorts keys, but a `list(set)` is not.
   → **[docs/taint-model.md](docs/taint-model.md)**
-- **Sink discovery** recognises the four churn-sensitive write shapes —
-  `databag`, `file`, `plan` (pebble), and `hash` change-detectors. → **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#sink-discovery)**
-- **Inter-procedural summaries** let it see across calls: the unordered value is
-  usually created in your charm and written by a library helper several calls
-  deep. A fixed-point pass computes a summary per function so a call site can be
+- **Where it's dangerous to write one** — the four kinds of write target:
+  `databag`, `file`, `plan` (pebble), and `hash`. → **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#the-four-kinds-of-write-target)**
+- **Following values across function calls** — the unstable value is usually created
+  in your charm and written by a library helper several calls deep. flaplint records,
+  for each function, what it does to the values passing through, so a call can be
   flagged even when the write lives in another file. → **[docs/architecture.md](docs/architecture.md)**
-- **Findings** carry a *vantage* (`caller` = a concrete bug here; `sink` = a helper
-  that trusts callers to pass ordered data) and one of four *failure modes*. →
-  **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#from-taint-to-finding)**
+- **Findings** say *whose code to fix* (`caller` = a real bug here; `sink` = a helper
+  that trusts its callers to pass ordered data) and *what went wrong* (one of four
+  types). → **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#from-an-unstable-value-to-a-finding)**
 
 ---
 
@@ -217,7 +215,7 @@ Each finding's first line reads `mark line:col  <failure mode> · <variable> →
 | `[confidence]` | `high` / `medium` / `low` confidence that this is a real bug |
 
 The indented lines explain *why* it flaps, the concrete *fix*, and — when the value
-is born elsewhere — a `↳ born at …` provenance trail back to its origin.
+is created elsewhere — a `↳ born at …` trail back to where it was created.
 
 ### Machine-readable / editor output
 
@@ -235,23 +233,23 @@ Each line is `path:line:col:` followed by an optional `[warning]` marker and fou
 fields: `type=` (the failure mode), `severity=` (confidence), `sink=`
 (`databag`/`file`/`hash`), and `var=` (the affected identifier).
 
-### The four failure modes & vantage — in brief
+### The four problem types & whose-code-to-fix — in brief
 
-Every finding names a **failure mode** (`type=`, *how to fix it*) and a **vantage**
-(`kind=`, *whose code to fix*). The short version:
+Every finding names a **problem type** (`type=`, *how to fix it*) and **whose code to
+fix** (`kind=`). The short version:
 
-| `type=` | root cause | the fix |
+| `type=` | what went wrong | the fix |
 |---------|------------|---------|
 | `unordered-collection` | a whole `set`/`dict` serialised unsorted | `sorted(...)` / `sort_keys=True` |
-| `unordered-pick` | one element chosen by **position** (`addrs[0]`) | `sorted(addrs)[0]` |
-| `unordered-iteration` | a **sequence built from an unordered source** (`list(some_set)` / `[… for … in …]`) | `sorted(...)` before the sequence |
-| `nondeterministic` | a **regenerated** value (`uuid4()`/`time()`) | make it stable/persistent |
+| `unordered-pick` | one item chosen by **position** (`addrs[0]`) | `sorted(addrs)[0]` |
+| `unordered-iteration` | a **list built from something unordered** (`list(some_set)` / `[… for … in …]`) | `sorted(...)` before the list |
+| `nondeterministic` | a **different-every-run** value (`uuid4()`/`time()`) | make it stable/persistent |
 
-`kind=caller` is a value born unstable in this function (fix it here);
-`kind=sink` is a helper that writes a *parameter* unsorted (the contract boundary).
-The full grading rules, the confirmed-vs-precautionary `unordered-iteration` split,
-and the `level` (error vs warning) ownership model are documented in
-**[docs/sinks-and-findings.md](docs/sinks-and-findings.md#from-taint-to-finding)**.
+`kind=caller` is a value created unstable in this function (fix it here);
+`kind=sink` is a helper that writes a *parameter* unsorted — it trusts its caller to
+pass ordered data. The full grading rules, the confirmed-vs-just-in-case
+`unordered-iteration` split, and the error-vs-warning ownership rule are in
+**[docs/sinks-and-findings.md](docs/sinks-and-findings.md#from-an-unstable-value-to-a-finding)**.
 
 ### Errors vs warnings — *who can fix it*
 
@@ -265,10 +263,10 @@ survives the confidence threshold. Full details in
 
 ---
 
-## Internals
+## How it works (the details)
 
-The deep documentation lives in **[docs/](docs/README.md)**:
+The full documentation lives in **[docs/](docs/README.md)**:
 [architecture](docs/architecture.md) ·
-[the taint model](docs/taint-model.md) ·
-[sinks & findings](docs/sinks-and-findings.md) ·
-[resolving dependencies](docs/resolving-dependencies.md).
+[judging a value](docs/taint-model.md) ·
+[where it lands & what's reported](docs/sinks-and-findings.md) ·
+[finding dependencies](docs/resolving-dependencies.md).

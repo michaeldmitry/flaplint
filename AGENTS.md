@@ -114,11 +114,19 @@ Full reference (with the survival matrix and propagation rules):
 
 ## Gotchas & known limitations
 
-- **The dataclass-field-taint barrier.** Taint does *not* flow through an unstable
-  collection that is buried in a dict, stored in a dataclass field, and rebuilt by a
-  method downstream (the cos-proxy `ScrapeJobContext` shape). A plain string-valued
-  dataclass field *does* propagate (the alertmanager `ConfigSuite` shape). If a
-  cross-function trace "should" connect but doesn't, suspect this.
+- **The dataclass-field-taint barrier (partially lifted).** Value-object **field
+  provenance** now tracks an unstable collection through a one-level field: stored at
+  construction (`Ctor(field=set(...))`) or a field write (`obj.field = set(...)`),
+  read back on `obj.field`, carried across an alias (`a = obj`) and across a function
+  via the `returns_field_origins` summary (`ctx = self._build(); ctx.targets`). It
+  stays field-*sensitive* — a clean field of a partly-unstable object is not flagged.
+  Stored as compound `env` keys (`"obj.field"`); see `attr_path` and
+  `_record_field_taint` in `traversal.py`. **Still not tracked:** taint *buried in a
+  dict* then stashed in a field, or a field *rebuilt by a method* downstream (the
+  cos-proxy `ScrapeJobContext` shape), and deeper-than-one-level paths (`a.b.c`).
+  When the consuming code is an opaque library (it reads `obj.field` and writes the
+  bag itself), the taint reaches the boundary but produces no concrete finding —
+  there's no in-repo sink to pin it to.
 - **Confirmed vs. precautionary `unordered-iteration`.** A traced unstable caller
   yields `kind=caller` (high); an untraced helper that iterates a param yields a
   precautionary `kind=sink` (medium). The caller finding *supersedes* the
