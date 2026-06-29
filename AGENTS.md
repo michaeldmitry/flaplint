@@ -20,23 +20,8 @@ package lives in `src/flaplint/`.
 - **Stdlib-only.** No runtime dependencies (`pyproject.toml` `dependencies = []`).
   Do **not** add third-party runtime deps — the analyser must run anywhere with a
   bare interpreter. `pytest` is the only dev dependency.
-- **There is no bare `python` on PATH in this environment** — it errors with
-  "command not found". Use `python3`, or the workspace venv that has `flaplint`
-  installed editable (Python 3.14):
-  `/home/michael.dmitry@canonical.com/Work/.venv/bin/python`.
-- **Run the test suite** (118 tests, fast — ~0.6s) from the project root:
-  ```bash
-  cd charm-databag-linter
-  /home/michael.dmitry@canonical.com/Work/.venv/bin/pytest tests/ -q
-  ```
-- **Run the linter** via the `flaplint` console script or the module — both work:
-  ```bash
-  /home/michael.dmitry@canonical.com/Work/.venv/bin/flaplint <path/to/charm/src>
-  /home/michael.dmitry@canonical.com/Work/.venv/bin/python -m flaplint <path/to/charm/src>
-  ```
-  ⚠️ A legacy `databag-order-lint` shim from the package's previous name also sits in
-  the venv and is **broken** (it imports the old `databag_order_lint` module). Use
-  `flaplint` / `python -m flaplint`, never `databag-order-lint`.
+- **Run the test suite** (118 tests, fast — ~0.6s) from the project root
+- **Run the linter** via the `flaplint` console script or the module — both work.
 
 ## Architecture (orientation)
 
