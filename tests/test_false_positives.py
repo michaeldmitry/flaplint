@@ -94,3 +94,70 @@ def test_set_comprehension_joined_into_databag_is_still_flagged(lint_source):
     )
     flagged = [f for f in findings if f.rule == "unordered-iteration"]
     assert flagged and flagged[0].confidence == "high"
+
+
+def test_isinstance_list_guard_makes_param_iteration_safe(lint_source):
+    # A normalizer that only iterates a parameter inside `if isinstance(raw, list):`
+    # is provably iterating a list there -- a caller passing a set can't reach it --
+    # so the precautionary contract-boundary "might be unordered" finding is wrong.
+    findings = lint_source(
+        """
+        from typing import Any
+
+        class Charm:
+            def normalize(self, raw: Any):
+                if isinstance(raw, list):
+                    self.relation.data[self.app]["x"] = [str(x).strip() for x in raw]
+        """
+    )
+    assert findings == []
+
+
+def test_isinstance_list_guard_still_flags_concrete_instability(lint_source):
+    # Safety: `isinstance(x, list)` proves the *type*, not the *order*. A genuinely
+    # unstable `list(some_set)` is a list and still flaps, so it must stay flagged
+    # even inside the guard -- the narrowing strips only the parameter uncertainty.
+    findings = lint_source(
+        """
+        from typing import Any
+
+        class Charm:
+            def normalize(self, raw: Any, names):
+                if isinstance(raw, list):
+                    self.relation.data[self.app]["x"] = [n for n in list(set(names))]
+        """
+    )
+    assert any(f.rule == "unordered-iteration" for f in findings)
+
+
+def test_str_split_into_databag_is_deterministic(lint_source):
+    # `s.split(",")` returns a list ordered by string content, not by any collection
+    # iteration -- iterating it is deterministic, so an `Any`/unannotated source that
+    # is split must not raise a contract-boundary iteration finding.
+    findings = lint_source(
+        """
+        from typing import Any
+
+        class Charm:
+            def normalize(self, raw: Any):
+                s = str(raw).strip()
+                self.relation.data[self.app]["x"] = [p.strip() for p in s.split(",")]
+        """
+    )
+    assert findings == []
+
+
+def test_split_of_volatile_string_still_flagged(lint_source):
+    # Splitting launders *ordering*, not *content* volatility: a uuid split into
+    # parts and written to a databag still differs every reconcile.
+    findings = lint_source(
+        """
+        import uuid
+
+        class Charm:
+            def h(self):
+                parts = str(uuid.uuid4()).split("-")
+                self.relation.data[self.app]["id"] = parts
+        """
+    )
+    assert any(f.rule == "nondeterministic" for f in findings)

@@ -18,6 +18,7 @@ from .constants import (
     BUILTIN_COLLECTION_METHODS,
     FILE_WRITE_DESCS,
     HASH_CALLS,
+    ISINSTANCE_ORDERED_TYPES,
     MAPPING_WRITE_METHODS,
     PLAN_WRITE_DESC,
     RENDER_SERIALIZERS,
@@ -397,6 +398,10 @@ class FunctionAnalyzer:
             self._visit_for(stmt, ctx, handler)
             return
 
+        if isinstance(stmt, ast.If):
+            self._visit_if(stmt, ctx, handler)
+            return
+
         for guard in astutils.guards(stmt):
             self._scan_expr(guard, ctx, handler)
         for inner in astutils.child_bodies(stmt):
@@ -464,6 +469,28 @@ class FunctionAnalyzer:
             if argtaint:
                 ctx.env[recv] = set(ctx.env.get(recv, ())) | argtaint
         self._scan_expr(stmt.value, ctx, handler)
+
+    def _visit_if(self, stmt: ast.If, ctx: Context, handler: Handler) -> None:
+        """Walk an ``if``, applying ``isinstance``-to-ordered narrowing to the body.
+
+        ``if isinstance(raw, list): return [x for x in raw]`` only iterates ``raw``
+        when it is provably a list, so a caller passing a set never reaches it -- the
+        contract-boundary "might be unordered" worry is resolved. Inside the guarded
+        body we therefore drop ``raw``'s *parameter* taint (the caller-uncertainty),
+        but keep any concrete instability: ``isinstance(x, list)`` proves the *type*,
+        not the order, so a genuinely unstable ``list(some_set)`` must still flag.
+        """
+        self._scan_expr(stmt.test, ctx, handler)
+        narrowed = astutils.isinstance_ordered_name(stmt.test, ISINSTANCE_ORDERED_TYPES)
+        if narrowed is not None and narrowed in ctx.env:
+            saved = ctx.env[narrowed]
+            kept = {o for o in saved if not (isinstance(o, tuple) and o[0] == "param")}
+            ctx.env[narrowed] = kept
+            self._visit_body(stmt.body, ctx, handler)
+            ctx.env[narrowed] = saved
+        else:
+            self._visit_body(stmt.body, ctx, handler)
+        self._visit_body(stmt.orelse, ctx, handler)
 
     def _visit_for(self, stmt: ast.For, ctx: Context, handler: Handler) -> None:
         iter_taint = self._eval(stmt.iter, ctx)

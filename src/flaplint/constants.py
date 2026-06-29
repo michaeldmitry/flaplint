@@ -60,6 +60,15 @@ SEQUENCE_MATERIALIZERS: Set[str] = {"list", "tuple", "reversed"}
 #: Callables that neutralize ordering taint.
 SANITIZER_CALLS: Set[str] = {"sorted"}
 
+#: String-splitting methods (``str.split``/``rsplit``/``splitlines``). They return
+#: a list whose element order is fixed by the *content* of the string -- left to
+#: right -- not by any collection's iteration order. So iterating their result is
+#: deterministic: a string parameter's "might be an unordered collection" worry is
+#: laundered (you cannot ``.split()`` a set), and they introduce no order
+#: instability. Any *content* volatility of the receiver (``str(uuid4()).split()``)
+#: still passes through; only ordering/parameter taint is dropped.
+STR_SPLIT_METHODS: Set[str] = {"split", "rsplit", "splitlines"}
+
 #: Attribute accesses whose value is an unordered ops collection.
 #: ``relation.units`` is a ``Set[Unit]`` whose iteration order is not stable
 #: across reconciles, so a value built by iterating it inherits that instability.
@@ -175,6 +184,25 @@ ORDERED_ANNOTATIONS: Set[str] = {
     "Mapping",
     "MutableMapping",
     "OrderedDict",
+}
+
+#: Runtime types that an ``isinstance(x, T)`` guard narrows ``x`` to an *ordered*
+#: value. Inside such a guard the parameter's caller-uncertainty is resolved -- it
+#: is provably one of these, all of which a serializer can keep stable (a mapping's
+#: only disorder is key order, which key-sorting fixes) -- so the contract-boundary
+#: "a caller might pass a set" worry no longer applies. The runtime twin of
+#: :data:`ORDERED_ANNOTATIONS`. ``set``/``frozenset`` are deliberately absent: a
+#: branch guarded by ``isinstance(x, set)`` is exactly the unordered case.
+ISINSTANCE_ORDERED_TYPES: Set[str] = {
+    "list",
+    "tuple",
+    "str",
+    "bytes",
+    "bytearray",
+    "dict",
+    "int",
+    "float",
+    "bool",
 }
 
 #: Names of the attribute-mutation methods that accumulate values in iteration

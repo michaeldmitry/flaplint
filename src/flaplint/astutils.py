@@ -280,6 +280,32 @@ def guards(stmt: ast.stmt) -> List[ast.expr]:
     return result
 
 
+def isinstance_ordered_name(test: ast.expr, ordered_types: Set[str]) -> Optional[str]:
+    """Name narrowed to an ordered type by ``isinstance(<Name>, <ordered>)``, else None.
+
+    Recognises ``isinstance(raw, list)`` and ``isinstance(raw, (list, tuple))`` and
+    returns ``"raw"`` -- but only when *every* checked type is in ``ordered_types``,
+    so a ``set``/``frozenset`` (or unknown) branch never narrows. Used to suppress
+    the contract-boundary "a caller might pass an unordered collection" finding
+    inside a block where the parameter is provably ordered.
+    """
+    if not (
+        isinstance(test, ast.Call)
+        and isinstance(test.func, ast.Name)
+        and test.func.id == "isinstance"
+        and len(test.args) == 2
+    ):
+        return None
+    target, types = test.args
+    if not isinstance(target, ast.Name):
+        return None
+    type_nodes = types.elts if isinstance(types, ast.Tuple) else [types]
+    names = [final_attr(t) for t in type_nodes]
+    if names and all(n in ordered_types for n in names):
+        return target.id
+    return None
+
+
 def child_bodies(stmt: ast.stmt) -> List[List[ast.stmt]]:
     """Every nested statement list of a compound statement."""
     bodies: List[List[ast.stmt]] = []

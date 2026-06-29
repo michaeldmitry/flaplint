@@ -20,6 +20,7 @@ from .constants import (
     PROPAGATE_CALLS,
     SANITIZER_CALLS,
     SEQUENCE_MATERIALIZERS,
+    STR_SPLIT_METHODS,
     TEMPLATE_RENDER_METHODS,
     UNORDERED_ATTRS,
     UNORDERED_CALLS,
@@ -320,6 +321,16 @@ class TaintEngine:
             return _survives_stringify(
                 self.eval(call.func.value, env, cls_ctx, depth + 1)
             )
+        if name in STR_SPLIT_METHODS and isinstance(call.func, ast.Attribute):
+            # ``s.split(",")`` / ``rsplit`` / ``splitlines`` return a list ordered by
+            # the string's content, not by any collection's iteration order -- so the
+            # result carries no ordering/parameter instability (you cannot split a
+            # set). Only the receiver's *content* volatility passes through.
+            return {
+                o
+                for o in self.eval(call.func.value, env, cls_ctx, depth + 1)
+                if o == "volatile"
+            }
 
         # Serialization: byte-stability of the output follows that of the input.
         if name == "dumps":  # json.dumps(X) / yaml.dump-like .dumps

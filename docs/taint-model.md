@@ -129,6 +129,19 @@ text lives in the template, so a plain dataflow check would go blind here.)
 the `local` kind of instability (it sorts the keys), but — as the matrix shows — not
 the others.
 
+Two more things clear the *contract-boundary* uncertainty of a `param` — the "this
+argument might be an unordered collection" worry:
+
+- **`str.split` / `rsplit` / `splitlines`.** Splitting a string returns a list
+  ordered by the string's content, left to right — never by a collection's iteration
+  order (you can't `.split()` a set). So iterating `s.split(",")` is deterministic;
+  only the string's *content* volatility (a `uuid4()` inside it) carries through.
+- **An `isinstance(x, <ordered type>)` guard.** Inside `if isinstance(raw, list):`
+  the parameter is provably a list — a caller passing a set can't reach that branch —
+  so its caller-uncertainty is dropped there. It's the runtime twin of annotating the
+  parameter `list`. Only `param` taint is cleared: `isinstance` proves the *type*, not
+  the *order*, so a genuinely unstable `list(some_set)` inside the guard still flags.
+
 ### Things that change which kind it is
 
 Three operations move a value from one kind of instability to another, because they
