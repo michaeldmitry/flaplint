@@ -205,11 +205,13 @@ class FuncInfo:
     is_property: bool = False
     class_name: Optional[str] = None
     primary: bool = False  # report findings for this function?
-    #: True if this function/property *returns a relation databag* -- its body
-    #: returns ``relation.data[app|unit]`` / ``relation.data.get(entity)`` (or
-    #: chains to another such accessor). Lets a write through the accessor
-    #: (``self.unit_databag.update(...)``) be recognised as a databag sink.
-    returns_databag: bool = False
+    #: databag-provenance kind this function/property *returns* -- one of
+    #: ``"relation"`` / ``"relation_data"`` / ``"databag"`` (see
+    #: :mod:`flaplint.databag`), or ``None``. Lets a write through an accessor
+    #: (``self.unit_databag.update(...)``) be recognised as a databag sink, however
+    #: many property/alias hops -- ``get_relation`` -> ``.data`` -> ``[entity]`` --
+    #: separate the producer from the write.
+    returns_databag_kind: Optional[str] = None
 
     # --- summary (computed by fixed point) ---
     #: parameter index -> "direct" (written to a sink here) | "via" (forwarded

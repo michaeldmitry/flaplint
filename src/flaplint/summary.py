@@ -11,9 +11,9 @@ within a finite domain.
 from __future__ import annotations
 
 import ast
-from typing import List
+from typing import List, Optional
 
-from . import astutils
+from . import databag as dbg
 from .handlers import SummaryHandler
 from .model import FuncInfo, Registry
 from .traversal import FunctionAnalyzer
@@ -48,37 +48,41 @@ def _own_returns(node: ast.AST) -> List[ast.expr]:
     return out
 
 
-def _returns_a_databag(fi: FuncInfo, registry: Registry) -> bool:
-    """True if ``fi`` returns a relation databag (directly or via another accessor)."""
+def _returns_databag_kind(fi: FuncInfo, registry: Registry) -> Optional[str]:
+    """Strongest databag-provenance kind ``fi`` returns (``None`` if not databag-y).
+
+    Resolves ``self.<accessor>`` references against the (still-converging) kinds of
+    same-class accessors, so a chain ``unit_data`` -> ``all_data`` -> ``_peers`` ->
+    ``get_relation`` falls out over the fixed point.
+    """
+
+    def accessor_kind(attr: str) -> Optional[str]:
+        for other in registry.get(attr, []):
+            if other.class_name == fi.class_name and other.returns_databag_kind:
+                return other.returns_databag_kind
+        return None
+
+    best: Optional[str] = None
     for value in _own_returns(fi.node):
-        # direct: relation.data[entity] / relation.data.get(entity)
-        if astutils.databag_expr(value) or astutils.databag_get_call(value):
-            return True
-        # chain: ``return self.<accessor>`` / ``return self.<accessor>(...)`` where
-        # the named property/method is itself a databag accessor of this class.
-        target = value.func if isinstance(value, ast.Call) else value
-        if (
-            isinstance(target, ast.Attribute)
-            and isinstance(target.value, ast.Name)
-            and target.value.id in ("self", "cls")
-        ):
-            for other in registry.get(target.attr, []):
-                if other.class_name == fi.class_name and other.returns_databag:
-                    return True
-    return False
+        best = dbg.stronger(best, dbg.databag_kind(value, {}, accessor_kind))
+    return best
 
 
 def mark_databag_accessors(functions: List[FuncInfo], registry: Registry) -> None:
-    """Set ``returns_databag`` on every property/method that returns a databag.
+    """Set ``returns_databag_kind`` on every property/method that returns a databag
+    object (a Relation, its RelationData, or a single databag).
 
-    A small fixed point so a chain of accessors (``unit_data`` -> ``_peer_data`` ->
-    ``relation.data[entity]``) all resolve. Runs before the taint summaries so the
-    traversal can treat ``self.<accessor>.update(...)`` as a databag write.
+    A small fixed point so a chain of accessors resolves: each pass can only
+    *strengthen* a kind (``None`` -> ``relation`` -> ``relation_data`` -> ``databag``)
+    as the accessors it depends on become known, so it terminates. Runs before the
+    taint summaries, so the traversal can treat ``self.<accessor>.update(...)`` as a
+    databag write.
     """
     changed = True
     while changed:
         changed = False
         for fi in functions:
-            if not fi.returns_databag and _returns_a_databag(fi, registry):
-                fi.returns_databag = True
+            kind = _returns_databag_kind(fi, registry)
+            if dbg.stronger(fi.returns_databag_kind, kind) != fi.returns_databag_kind:
+                fi.returns_databag_kind = kind
                 changed = True

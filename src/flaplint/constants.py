@@ -25,6 +25,10 @@ UNORDERED_CALLS: Set[str] = {
     "iglob",
     "iterdir",
     "rglob",
+    # ops Container.list_files / pebble list_files: a remote directory listing,
+    # returned in unspecified (readdir) order -- the workload-container analogue of
+    # ``os.listdir``. A config built by iterating it flaps the rendered file.
+    "list_files",
 }
 
 #: Callables that pass through the taint of their first argument. ``dict``/

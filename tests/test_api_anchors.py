@@ -52,3 +52,17 @@ def test_file_sink_anchors():
     # constants.FILE_WRITE_METHODS: the pebble file/layer sinks.
     assert hasattr(ops.Container, "push"), "file sink `container.push`"
     assert hasattr(ops.Container, "add_layer"), "layer sink `container.add_layer`"
+
+
+def test_unordered_source_anchors():
+    # constants.UNORDERED_CALLS: `container.list_files` is a directory listing
+    # (unspecified order), recognised like os.listdir.
+    assert hasattr(ops.Container, "list_files"), "unordered source `container.list_files`"
+
+
+def test_relation_producer_anchors():
+    # databag.py seeds Relation-ness from the ops Model API: `model.get_relation(...)`
+    # produces a Relation, and `model.relations` is the RelationMapping. These are
+    # what let a databag be followed through property layers.
+    assert hasattr(ops.Model, "get_relation"), "Relation producer `model.get_relation`"
+    assert _has_member(ops.Model, "relations"), "Relation mapping `model.relations`"

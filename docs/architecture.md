@@ -72,6 +72,7 @@ flowchart LR
 | `model.py` | the core data types — a finding, a function's summary, an origin |
 | `astutils.py` | small helpers for reading the syntax tree |
 | `taint.py` | given one expression, is it unstable, and why? ([taint-model.md](taint-model.md)) |
+| `databag.py` | given one expression, is it a relation databag (and how)? — Relation/RelationData/databag provenance |
 | `traversal.py` | walk one function's statements and flow taint to its sinks |
 | `handlers.py` | what to do when taint reaches a sink or a return |
 | `summary.py` | the repeat-until-settled loop |
@@ -275,15 +276,25 @@ and names:
 
 | anchor | what flaplint uses it for | how it's matched |
 |---|---|---|
-| `relation.data[app \| unit]` | the databag sink | structural shape (strongest) |
-| `relation.save(...)`, `.update()`/`.setdefault()` | databag writes | shape + name |
+| `model.get_relation(...)` | produces a **Relation** (start of databag provenance) | method name (ops Model API) |
+| `<relation>.data[app \| unit]` | the databag object | structural shape |
+| `.update()`/`.setdefault()`/`[k]=`, `relation.save(...)` | databag writes | shape + name |
 | `relation.units` | an unordered source | attribute name |
 | `container.push`, `container.add_layer` | file / layer sinks | method name |
 | `.render(...)` | a Jinja template render | method name (heuristic) |
 
-That's the whole coupling surface, and it all lives in two files (`constants.py` for
-the names, `astutils.py` for the shapes). Adding a new sink or source is a one-line
-change there, with no change to the engine.
+Databag recognition is **object provenance**, not one fixed shape: a Relation comes
+from `get_relation(...)`; `.data` on a *known Relation* is its mapping; indexing that
+by an `app`/`unit` entity is a databag — and a write to that databag is a sink,
+however many property/alias hops wrap it (see [databag.py](../src/flaplint/databag.py)
+and [sinks-and-findings.md](sinks-and-findings.md#databag--relation-data-writes)).
+Crucially, `.data` only counts on a value *already known to be a Relation*, so a bare
+`.data` attribute on something else is never mistaken for a databag — and no type name
+(`Relation`) is matched, so an unrelated same-named class can't fool it.
+
+The coupling surface lives in `constants.py` (names), `astutils.py` (shapes), and
+`databag.py` (the provenance chain). Adding a new sink or source is a small, local
+change there, with no change to the taint engine.
 
 **Renamed imports are resolved, so the name matching isn't fooled by aliases.**
 Matching is on the *bound* name a call uses, so on its own an `as` rename would hide

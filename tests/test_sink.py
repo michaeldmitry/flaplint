@@ -727,3 +727,21 @@ def test_subscript_receiver_accumulator_returns_unordered(lint_source):
 
 
 
+
+
+def test_container_list_files_is_an_unordered_source(lint_source):
+    # ops Container.list_files is a directory listing (unspecified order), the
+    # workload-container analogue of os.listdir. A config built by iterating it and
+    # pushed to a file flaps -- the traefik dynamic-TLS-config shape.
+    findings = lint_source(
+        """
+        import yaml
+
+        class Traefik:
+            def update_tls(self):
+                cert_files = [f.path for f in self._container.list_files("/certs")]
+                config = yaml.safe_dump({"certs": [{"f": c} for c in cert_files]})
+                self._container.push("/dynamic.yml", config)
+        """
+    )
+    assert any(f.sink == "file" for f in findings)

@@ -93,3 +93,61 @@ def test_bare_data_property_is_not_a_databag(lint_source):
         """
     )
     assert [f for f in findings if f.sink == "databag"] == []
+
+
+# -- ops-anchored provenance: get_relation -> .data -> [entity] -> databag -------
+# A databag reached through `get_relation(...)` and property layers (the
+# postgresql peer-data shape) is recognised without matching any type name.
+
+
+def test_get_relation_chain_through_properties_is_a_sink(lint_source):
+    # _peers -> get_relation; all_data -> _peers.data; unit_data -> all_data.get(unit).
+    # A write through self.unit_data must be a databag sink (3 property hops deep).
+    findings = lint_source(
+        """
+        class Charm:
+            @property
+            def _peers(self):
+                return self.model.get_relation("peer")
+            @property
+            def all_data(self):
+                return self._peers.data
+            @property
+            def unit_data(self):
+                return self.all_data.get(self.unit, {})
+            def h(self, values):
+                self.unit_data.update({v for v in values})
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_get_relation_local_chain_is_a_sink(lint_source):
+    # The same chain through local variables rather than properties.
+    findings = lint_source(
+        """
+        class Charm:
+            def h(self, values):
+                rel = self.model.get_relation("peer")
+                rd = rel.data
+                bag = rd[self.unit]
+                bag.update({v for v in values})
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_non_relation_data_chain_is_not_a_databag(lint_source):
+    # `.data` on something that is NOT a known Relation must not be treated as a
+    # databag -- this is the safety boundary that keeps `.data` from over-matching.
+    findings = lint_source(
+        """
+        class Charm:
+            @property
+            def client_data(self):
+                return self._http_client.data
+            def h(self, values):
+                self.client_data.get(self.unit).update({v for v in values})
+        """
+    )
+    assert [f for f in findings if f.sink == "databag"] == []

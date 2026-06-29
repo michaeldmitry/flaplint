@@ -21,6 +21,7 @@ from .constants import (
     MAPPING_WRITE_METHODS,
     RENDER_SERIALIZERS,
 )
+from . import databag
 from .handlers import Handler
 from .model import FuncInfo, Origin, Registry
 from .taint import TaintEngine
@@ -33,7 +34,8 @@ class Context:
     env: Dict[str, Set[Origin]]
     types: Dict[str, str] = field(default_factory=dict)  # variable -> class name
     cls: Optional[str] = None  # enclosing class of the analyzed function
-    databags: Set[str] = field(default_factory=set)  # locals aliased to a databag
+    #: local variable -> its databag-provenance kind (relation/relation_data/databag)
+    databag_kinds: Dict[str, str] = field(default_factory=dict)
 
 
 class FunctionAnalyzer:
@@ -96,36 +98,40 @@ class FunctionAnalyzer:
     def _record_databag_alias(
         self, target: ast.AST, value: ast.AST, ctx: Context
     ) -> None:
-        """Track ``b = relation.data[app]`` so later ``b.update(...)`` is a sink."""
+        """Track ``b = relation.data[app]`` (or ``r = get_relation(...)``) so a later
+        write through ``b`` -- or ``b.data[app].update(...)`` -- is still a sink."""
         if not isinstance(target, ast.Name):
             return
-        if self._is_databag_object(value, ctx):
-            ctx.databags.add(target.id)
+        kind = self._databag_kind_of(value, ctx)
+        if kind is not None:
+            ctx.databag_kinds[target.id] = kind
         else:
-            ctx.databags.discard(target.id)
+            ctx.databag_kinds.pop(target.id, None)
 
-    def _is_databag_accessor_ref(self, node: ast.AST, ctx: Context) -> bool:
-        """``self.<prop>`` where ``<prop>`` is a databag-returning accessor here."""
-        if not (
-            isinstance(node, ast.Attribute)
-            and isinstance(node.value, ast.Name)
-            and node.value.id in ("self", "cls")
-            and ctx.cls
-        ):
-            return False
-        return any(
-            fi.class_name == ctx.cls and fi.returns_databag
-            for fi in self.registry.get(node.attr, [])
+    def _accessor_kind(self, attr: str, ctx: Context):
+        """Return kind of ``self.<attr>`` resolved against this class's accessors."""
+        if not ctx.cls:
+            return None
+        for fi in self.registry.get(attr, []):
+            if fi.class_name == ctx.cls and fi.returns_databag_kind:
+                return fi.returns_databag_kind
+        return None
+
+    def _databag_kind_of(self, node: ast.AST, ctx: Context):
+        """The databag-provenance kind of ``node`` in this context (or ``None``)."""
+        return databag.databag_kind(
+            node, ctx.databag_kinds, lambda attr: self._accessor_kind(attr, ctx)
         )
 
     def _is_databag_object(self, node: ast.AST, ctx: Context) -> bool:
-        """True if ``node`` *is* a relation databag: the literal ``.data[entity]``
-        shape, a local aliased to one, or ``self.<databag-accessor-property>``."""
-        if astutils.databag_expr(node):
-            return True
-        if isinstance(node, ast.Name) and node.id in ctx.databags:
-            return True
-        return self._is_databag_accessor_ref(node, ctx)
+        """True if ``node`` *is* a single relation databag (the thing writes land on)."""
+        return self._databag_kind_of(node, ctx) == databag.DATABAG
+
+    def _is_databag_target(self, tgt: ast.AST, ctx: Context) -> bool:
+        """True if ``tgt`` is an item-assignment into a databag: ``<databag>[k] = …``."""
+        return isinstance(tgt, ast.Subscript) and self._is_databag_object(
+            tgt.value, ctx
+        )
 
     def _ctor_field_taint(self, value: ast.AST, ctx: Context) -> Set[Origin]:
         """Taint a value object inherits from its constructor fields.
@@ -159,13 +165,11 @@ class FunctionAnalyzer:
         """
         out: Set[Origin] = set()
         for arg in call.args:
-            if isinstance(arg, ast.Starred) or astutils.is_databag_value(
-                arg, ctx.databags
-            ):
+            if isinstance(arg, ast.Starred) or self._is_databag_object(arg, ctx):
                 continue
             out |= self._eval(arg, ctx)
         for kw in call.keywords:
-            if kw.value is None or astutils.is_databag_value(kw.value, ctx.databags):
+            if kw.value is None or self._is_databag_object(kw.value, ctx):
                 continue
             out |= self._eval(kw.value, ctx)
         if isinstance(call.func, ast.Attribute):
@@ -192,13 +196,11 @@ class FunctionAnalyzer:
         the unstable value, so it is deliberately excluded here.
         """
         for arg in call.args:
-            if isinstance(arg, ast.Starred) or astutils.is_databag_value(
-                arg, ctx.databags
-            ):
+            if isinstance(arg, ast.Starred) or self._is_databag_object(arg, ctx):
                 continue
             return arg
         for kw in call.keywords:
-            if kw.value is None or astutils.is_databag_value(kw.value, ctx.databags):
+            if kw.value is None or self._is_databag_object(kw.value, ctx):
                 continue
             return kw.value
         if isinstance(call.func, ast.Attribute):
@@ -239,15 +241,15 @@ class FunctionAnalyzer:
                         fwargs[0],
                         "file",
                     )
-            margs = astutils.databag_mutation_args(sub, ctx.databags)
+            margs = None
             if (
-                margs is None
-                and isinstance(sub.func, ast.Attribute)
+                isinstance(sub.func, ast.Attribute)
                 and sub.func.attr in MAPPING_WRITE_METHODS
                 and self._is_databag_object(sub.func.value, ctx)
             ):
-                # ``self.<databag-accessor>.update(...)`` -- a mutation of a databag
-                # reached through a property, which the pure shape-matcher misses.
+                # ``<databag>.update(...)`` / ``.setdefault(...)`` -- the databag may
+                # be the literal ``relation.data[entity]``, a tracked local, or a
+                # property/accessor that resolves to one (see flaplint.databag).
                 margs = list(sub.args)
             if margs is not None:
                 origins = set()
@@ -263,7 +265,7 @@ class FunctionAnalyzer:
                         "databag",
                     )
             elif any(
-                astutils.is_databag_value(a, ctx.databags)
+                self._is_databag_object(a, ctx)
                 for a in (*sub.args, *(kw.value for kw in sub.keywords))
             ):
                 # A databag handed to a writer call (``model.dump(bag)``): the bag
@@ -385,18 +387,14 @@ class FunctionAnalyzer:
         self._scan_expr(stmt.value, ctx, handler)
         taint = self._eval(stmt.value, ctx) | self._ctor_field_taint(stmt.value, ctx)
         for tgt in stmt.targets:
-            is_bag = astutils.is_databag_target(tgt, ctx.databags) or (
-                isinstance(tgt, ast.Subscript)
-                and self._is_databag_object(tgt.value, ctx)
-            )
-            if is_bag and taint:
+            if self._is_databag_target(tgt, ctx) and taint:
                 handler.sink(stmt, taint, "direct", "relation databag", stmt.value)
         for tgt in stmt.targets:
             if isinstance(tgt, ast.Name):
                 ctx.env[tgt.id] = set(taint)
                 self._record_type(tgt, stmt.value, ctx)
                 self._record_databag_alias(tgt, stmt.value, ctx)
-            elif taint and not astutils.is_databag_target(tgt, ctx.databags):
+            elif taint and not self._is_databag_target(tgt, ctx):
                 # ``container[k] = <unordered>`` / ``obj.attr = <unordered>``: the
                 # element write taints the enclosing container, so a later
                 # serialization of the whole container is order-unstable.
@@ -408,7 +406,7 @@ class FunctionAnalyzer:
         self, stmt: ast.AnnAssign, ctx: Context, handler: Handler
     ) -> None:
         self._scan_expr(stmt.value, ctx, handler)
-        if astutils.is_databag_target(stmt.target, ctx.databags):
+        if self._is_databag_target(stmt.target, ctx):
             origins = self._eval(stmt.value, ctx)
             if origins:
                 handler.sink(stmt, origins, "direct", "relation databag", stmt.value)

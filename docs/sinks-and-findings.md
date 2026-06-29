@@ -22,7 +22,23 @@ relation.save(obj, entity)                      # the ops typed-databag API
 ```
 
 What matters is that the thing being written to *is a databag*, not the exact method
-name — so these are recognised by structure, not by a fragile name match.
+name. flaplint recognises the databag **object by provenance**, not one fixed shape,
+so it follows the databag through property layers and `.get(entity)` access:
+
+```
+model.get_relation(...)   → a Relation          (the only way databag-ness enters)
+        <relation>.data   → its RelationData mapping   (only on a known Relation)
+        <data>[entity] / .get(entity)   → a databag
+        <databag>.update(…) / [k]=… / .setdefault(…)   → a write = sink
+```
+
+So a write reaches a sink even when it's wrapped several properties deep —
+`self.unit_databag.update(...)` where `unit_databag` resolves, through accessors,
+back to a `get_relation(...)`. This is anchored entirely on the **ops Model API**
+(`get_relation`), never on a type name like `Relation` (which a same-named user class
+could fool), and `.data` is treated as a databag mapping **only** on a value already
+known to be a Relation — a bare `.data` on anything else is never mistaken for one.
+The provenance evaluator lives in [databag.py](../src/flaplint/databag.py).
 
 ### `file` — on-disk / workload-config writes
 

@@ -97,7 +97,8 @@ Full reference (with the survival matrix and propagation rules):
   `constants.py` and, if it has new survival semantics, the `_call` handling in
   `taint.py`.
 - **New sink** (a databag/file/hash API): `FILE_WRITE_METHODS` / `HASH_CALLS` in
-  `constants.py`, or the databag-shape detection in `astutils.py` / `traversal.py`.
+  `constants.py`; databag recognition is **object provenance** in `databag.py`
+  (Relation→RelationData→databag, seeded by `get_relation`), used by `traversal.py`.
 - **A new origin flavor or a flavor change**: this touches several files in lockstep
   — the predicate in `model.py`, both survival filters in `taint.py`
   (`_survives_stringify` **and** `_key_sort_survivors`), the `SummaryHandler.ret`
