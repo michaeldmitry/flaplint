@@ -44,6 +44,9 @@ class FunctionAnalyzer:
 
     def analyze(self, fi: FuncInfo, handler: Handler) -> None:
         """Walk ``fi`` seeding each parameter with its own ``("param", idx)``."""
+        # Select this function's file's import aliases so name-matching in the
+        # engine resolves any renamed imports. One function is walked at a time.
+        self.engine.enter(fi.path)
         env: Dict[str, Set[Origin]] = {
             pname: {("param", idx)} for idx, pname in enumerate(fi.params)
         }

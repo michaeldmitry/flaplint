@@ -9,8 +9,8 @@ description = "Static interprocedural taint linter for Juju relation-databag ord
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
-authors = [{ name = "Canonical Observability" }]
-keywords = ["juju", "charm", "linter", "static-analysis", "ast", "relation-data"]
+authors = [{ name = "michaeldmitry", email = "michael.dmitry98@gmail.com" }]
+keywords = ["juju", "charm", "linter", "static-analysis", "ast"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Console",
@@ -23,13 +23,17 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=7.0"]
+# ``ops`` is a *test-only* dependency, used solely by tests/test_api_anchors.py to
+# guard against drift in the ops/pebble API surface flaplint anchors on. The
+# analyzer itself never imports it (it reads source as text). The anchor test
+# skips when ops is absent, so this only needs installing to exercise that guard.
+dev = ["pytest>=7.0", "ops"]
 
 [project.scripts]
 flaplint = "flaplint.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/canonical/observability"
+Homepage = "https://github.com/michaeldmitry/flaplint"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flaplint"]

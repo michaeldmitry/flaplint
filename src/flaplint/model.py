@@ -32,6 +32,27 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 #: * ``"volatile"`` -- a nondeterministic value (``uuid4()``, ``time()``, ...);
 #: * ``("param", index)`` -- the value carries the instability of parameter
 #:   ``index`` of the enclosing function.
+#: * ``("iterparam", index, path, node)`` -- a *sequence* built by iterating
+#:   parameter ``index`` (``[f(x) for x in param.items()]``). The resulting list's
+#:   *element order* mirrors the parameter's iteration order, which a key-sorting
+#:   serializer cannot launder (only ``sorted()`` on the source can), so -- like
+#:   ``element`` -- it survives ``yaml.dump`` / ``json.dumps(sort_keys=True)``.
+#:   It is reported as a contract-boundary finding *at the iteration site*
+#:   (``node`` in file ``path``; ``path`` may be ``None`` == the current file).
+#:   Distinct from ``("param", index)`` so the iteration site is locatable.
+#: * ``("itercaller", path, node, None)`` -- a *confirmed* sequence-iteration
+#:   instability, reported as ``unordered-iteration`` (``kind=caller``, high
+#:   confidence) pointing at ``node`` in file ``path`` (``path`` may be ``None``
+#:   == the current file). Arises two ways, both meaning "a sequence whose
+#:   element order derives from a genuinely-unordered source, and that order
+#:   survives a key-sorting serializer":
+#:     1. a call-site argument with known-unstable taint was passed to a callee
+#:        that iterates that parameter unsorted into a sequence (recorded in the
+#:        callee's ``FuncInfo.iter_params``) -- the *traced-parameter* case; or
+#:     2. a locally-born unordered collection is *materialized into a sequence*
+#:        in this function -- ``list(some_set)`` / ``tuple(relation.units)`` /
+#:        ``[x for x in some_set]`` -- converting dict-key disorder into
+#:        list-element disorder. The fix (``sorted()``) lands at ``node``.
 #:
 #: An empty origin set means the value is order-stable.
 Origin = Union[str, Tuple[str, int], Tuple[str, Optional[str], ast.AST, Optional[str]]]
@@ -50,6 +71,26 @@ def has_element(origins: "Set[Origin]") -> bool:
 def is_local(o: "Origin") -> bool:
     """True if ``o`` is a locally-born unordered-collection origin tuple."""
     return isinstance(o, tuple) and len(o) == 4 and o[0] == "local"
+
+
+def is_iterparam(o: "Origin") -> bool:
+    """True if ``o`` is a ``("iterparam", index, path, node)`` origin tuple."""
+    return isinstance(o, tuple) and len(o) == 4 and o[0] == "iterparam"
+
+
+def is_itercaller(o: "Origin") -> bool:
+    """True if ``o`` is a confirmed ``("itercaller", path, node, None)`` origin.
+
+    Emitted at a call site when a known-unstable argument flows into a callee
+    that iterates that parameter unsorted into a sequence. Carries the callee's
+    iteration site so the finding points there instead of at the databag write.
+    """
+    return isinstance(o, tuple) and len(o) == 4 and o[0] == "itercaller"
+
+
+def has_itercaller(origins: "Set[Origin]") -> bool:
+    """True if any origin is a confirmed iteration instability."""
+    return any(is_itercaller(o) for o in origins)
 
 
 def has_local(origins: "Set[Origin]") -> bool:
@@ -186,11 +227,45 @@ class FuncInfo:
     #: ``set()`` / ``glob()`` that births the instability rather than the
     #: blameless serializer. ``None`` until ``returns_unordered`` is set.
     unordered_site: Optional[Tuple[str, ast.AST, str]] = None
+    #: whether the function returns a value whose order derives from a *sequence
+    #: materialized from a locally-born unordered collection* (``list(some_set)``)
+    #: -- a key-sort-resistant ``itercaller`` flavor. Tracked separately from
+    #: ``returns_unordered`` so callers keep treating it as key-sort-resistant
+    #: (a key-sorting serializer must NOT launder it, unlike a bare ``local``).
+    returns_itercaller: bool = False
+    #: provenance ``(path, node, func)`` of the materialized sequence this
+    #: function returns, so a caller's ``unordered-iteration`` finding points at
+    #: the ``list(...)`` / comprehension. ``None`` until ``returns_itercaller``.
+    itercaller_site: Optional[Tuple[str, ast.AST, str]] = None
     #: parameter indices whose taint flows through to the return value.
     returns_params: Set[int] = field(default_factory=set)
+    #: parameter index -> ``(path, node)`` iteration site for params iterated
+    #: unsorted into an order-dependent sequence that escapes the function (a
+    #: ``[... for x in param.items()]`` whose list reaches a ``return`` or a
+    #: sink). Reported as a contract-boundary ``sink`` finding pointing at the
+    #: iteration, so the fix (``sorted()``) lands where the churn is created.
+    iter_params: Dict[int, Tuple[str, ast.AST]] = field(default_factory=dict)
 
 
 #: Function table keyed by *bare* name (``"as_dict"``), since a call site only
 #: knows the callee's final attribute. Same-named methods across classes share a
 #: bucket and are disambiguated by receiver class at the call site.
 Registry = Dict[str, List[FuncInfo]]
+
+
+@dataclass
+class FileImports:
+    """Per-file import aliases, so a renamed import resolves to its canonical name.
+
+    Name-matching is on the *bound* name a call uses, so an ``as`` rename would hide
+    a known source/serializer (``from uuid import uuid4 as gen`` -> ``gen()``). These
+    maps undo the rename before matching.
+
+    * ``names``  -- bound name -> canonical name, from ``from m import x [as y]``
+      (``{"gen": "uuid4", "ddump": "dumps"}``).
+    * ``modules`` -- bound top-name -> real module, from ``import m [as a]``
+      (``{"j": "json", "o": "os"}``), used to resolve ``module_root`` checks.
+    """
+
+    names: Dict[str, str] = field(default_factory=dict)
+    modules: Dict[str, str] = field(default_factory=dict)

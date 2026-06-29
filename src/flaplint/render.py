@@ -75,6 +75,7 @@ class _Palette:
 _RULE_TITLE: Dict[str, str] = {
     "unordered-collection": "unordered collection",
     "unordered-pick": "positional pick from unordered data",
+    "unordered-iteration": "unsorted iteration into a sequence",
     "nondeterministic": "nondeterministic value",
 }
 
@@ -128,6 +129,27 @@ def _describe(f: Finding) -> str:
             f"{subject} is selected by position from unordered data structure before it "
             f"reaches {target}, so the selected element may vary between runs."
         )
+    elif f.rule == "unordered-iteration":
+        if f.kind == "caller":
+            # Confirmed: an unstable value was traced into this iteration.
+            core = (
+                f"a value built from an unordered source is iterated over at "
+                f"{subject} without sorted() to build an order-dependent sequence "
+                f"that reaches {target}. Sort the collection before iterating."
+            )
+        else:
+            # Precautionary contract boundary: we cannot see, from this function,
+            # whether callers pass an unordered collection -- but if any does, the
+            # element order flaps. Say so plainly, and name the escape hatches.
+            core = (
+                f"{subject} is iterated without sorted() to build an order-dependent "
+                f"sequence that can reach {target}. This is a contract boundary: if "
+                "any caller passes an unordered collection (e.g. one built from a "
+                "set or a relation.units frozenset), the sequence's element order "
+                "flaps across reconciles, and key-sorting the serializer cannot fix "
+                f"list-element order. Sort at the iteration (sorted({subject})), or "
+                f"annotate {subject} as Dict/List if callers already guarantee order."
+            )
     elif f.rule == "nondeterministic":
         if is_detector:
             core = (

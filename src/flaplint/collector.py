@@ -9,10 +9,10 @@ accesses on stored collaborators.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from . import astutils
-from .model import FuncInfo, Registry
+from .model import FileImports, FuncInfo, Registry
 
 
 class Collector(ast.NodeVisitor):
@@ -24,6 +24,7 @@ class Collector(ast.NodeVisitor):
         primary: bool,
         registry: Registry,
         attr_types: Dict[str, Dict[str, str]],
+        file_imports: Optional[Dict[str, FileImports]] = None,
     ) -> None:
         self.path = path
         self.primary = primary
@@ -31,6 +32,22 @@ class Collector(ast.NodeVisitor):
         self.attr_types = attr_types
         self.functions: List[FuncInfo] = []
         self.class_stack: List[str] = []
+        #: this file's import aliases, filled as ``import``/``from`` are visited.
+        self.imports = FileImports()
+        if file_imports is not None:
+            file_imports[path] = self.imports
+
+    def visit_Import(self, node: ast.Import) -> None:
+        # ``import json as j`` -> modules["j"] = "json"; ``import json`` is identity.
+        for alias in node.names:
+            self.imports.modules[alias.asname or alias.name] = alias.name
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        # ``from uuid import uuid4 as gen`` -> names["gen"] = "uuid4". A bare
+        # ``from json import dumps`` records an (harmless) identity mapping.
+        for alias in node.names:
+            if alias.name != "*":
+                self.imports.names[alias.asname or alias.name] = alias.name
 
     def _add_function(self, node: ast.AST) -> None:
         args = node.args  # type: ignore[attr-defined]

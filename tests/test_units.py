@@ -5,7 +5,7 @@ from __future__ import annotations
 import ast
 
 from flaplint import astutils
-from flaplint.model import has_local
+from flaplint.model import has_itercaller, has_local
 from flaplint.taint import TaintEngine
 
 
@@ -78,6 +78,13 @@ def test_engine_relations_opt_in():
 
 def test_engine_propagates_through_dict_and_list_constructors():
     eng = _engine()
-    assert has_local(eng.eval(_expr("list({1, 2})"), {}))
+    # ``list(set)`` materializes a *sequence*: its element order mirrors the set's
+    # hash-seeded iteration order, which a key-sorting serializer cannot launder.
+    # So it is promoted to the key-sort-resistant ``itercaller`` flavor, NOT left
+    # as a bare ``local`` (which key-sorting *would* fix).
+    assert has_itercaller(eng.eval(_expr("list({1, 2})"), {}))
+    assert not has_local(eng.eval(_expr("list({1, 2})"), {}))
+    # ``dict(x)`` preserves a *mapping*: its only instability is key order, which a
+    # key-sorting serializer fixes -- so it stays a bare ``local``.
     seed = {("local", None, _expr("set()"), None)}
     assert has_local(eng.eval(_expr("dict(some)"), {"some": seed}))

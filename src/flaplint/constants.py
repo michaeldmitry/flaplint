@@ -41,6 +41,18 @@ PROPAGATE_CALLS: Set[str] = {
     "deepcopy",
 }
 
+#: Subset of :data:`PROPAGATE_CALLS` that materialize their argument into a
+#: *sequence*. When the argument is a locally-born unordered collection (a
+#: ``set`` / ``frozenset`` / ``relation.units``), the result's *element order*
+#: is the source's hash-seeded iteration order -- value-position instability a
+#: key-sorting serializer (``yaml.dump``, ``json.dumps(sort_keys=True)``) cannot
+#: launder. So unlike the mapping-preserving propagators (``dict``/``copy``),
+#: these promote ``local`` taint to the key-sort-surviving iteration flavor.
+#: ``dict``/``copy``/``deepcopy`` are excluded (they preserve a mapping, whose
+#: key disorder key-sorting *does* fix); ``join`` is excluded to avoid colliding
+#: with ``os.path.join``.
+SEQUENCE_MATERIALIZERS: Set[str] = {"list", "tuple", "reversed"}
+
 #: Callables that neutralize ordering taint.
 SANITIZER_CALLS: Set[str] = {"sorted"}
 
@@ -241,6 +253,15 @@ FILE_WRITE_DESCS: Dict[str, str] = {
 #: very key-sorting the serializer applies, so a return-render sink never fires
 #: on it (the taint engine returns an empty origin set for that case).
 RENDER_SERIALIZERS: Set[str] = {"dump", "safe_dump", "dumps"}
+
+#: Template-render methods (Jinja2 ``template.render(**context)``). The analyzer
+#: cannot see inside a ``.j2`` template, so it treats a render as building text out
+#: of its arguments: if any argument is order-unstable (a set, a volatile value, or
+#: a collection parameter), the rendered text is unstable too. This catches the
+#: common charm pattern of rendering a config from a template and writing it to a
+#: file -- a flow a plain dataflow check goes blind on, because the iteration lives
+#: in the template rather than in the Python.
+TEMPLATE_RENDER_METHODS: Set[str] = {"render"}
 
 #: Inline comment that suppresses a finding on its line.
 SUPPRESS_COMMENT = "databag-order: ignore"

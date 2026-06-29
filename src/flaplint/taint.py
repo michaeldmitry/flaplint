@@ -19,11 +19,13 @@ from .constants import (
     NONSORTING_SERIALIZERS,
     PROPAGATE_CALLS,
     SANITIZER_CALLS,
+    SEQUENCE_MATERIALIZERS,
+    TEMPLATE_RENDER_METHODS,
     UNORDERED_ATTRS,
     UNORDERED_CALLS,
     VOLATILE_CALLS,
 )
-from .model import Origin, Registry, is_element, is_local
+from .model import FileImports, Origin, Registry, has_element, has_itercaller, has_local, is_element, is_itercaller, is_iterparam, is_local
 
 #: Recursion guard for pathological / deeply nested expressions.
 _MAX_DEPTH = 12
@@ -33,10 +35,14 @@ def _survives_stringify(origins: Set[Origin]) -> Set[Origin]:
     """Origins that survive a non-sorting serializer (``str``/``repr``/``encode``).
 
     Stringifying a scalar *parameter* does not make it unstable, but a locally
-    unordered, value-position (``element``) or nondeterministic value stays
-    unstable.
+    unordered, value-position (``element``), sequence-from-parameter
+    (``iterparam``/``itercaller``) or nondeterministic value stays unstable.
     """
-    return {o for o in origins if is_local(o) or o == "volatile" or is_element(o)}
+    return {
+        o
+        for o in origins
+        if is_local(o) or o == "volatile" or is_element(o) or is_iterparam(o) or is_itercaller(o)
+    }
 
 
 def _key_sort_survivors(origins: Set[Origin]) -> Set[Origin]:
@@ -44,9 +50,13 @@ def _key_sort_survivors(origins: Set[Origin]) -> Set[Origin]:
     ``json.dumps(sort_keys=True)``).
 
     Sorting mapping keys fixes dict-key-order instability (``"local"``) but not a
-    value-position pick (``element``) or a nondeterministic value (``"volatile"``).
+    value-position pick (``element``), a sequence-from-parameter (``iterparam`` /
+    ``itercaller``, whose *list element* order key-sorting never reaches) or a
+    nondeterministic value (``"volatile"``).
     """
-    return {o for o in origins if o == "volatile" or is_element(o)}
+    return {
+        o for o in origins if o == "volatile" or is_element(o) or is_iterparam(o) or is_itercaller(o)
+    }
 
 
 def _as_value_position(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
@@ -59,8 +69,30 @@ def _as_value_position(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     ``json.dumps(sort_keys=True)``. Volatility and parameter taint pass through.
     The pick ``node`` is carried as provenance (path ``None`` == current file)
     so a downstream finding can point at the subscript, not the serializer.
+
+    A locally-materialized sequence (``itercaller`` -- ``list(some_set)[0]``) is
+    likewise demoted to a *pick*: subscripting it selects one position-dependent
+    element, which reports as ``unordered-pick`` at the subscript rather than as a
+    whole-sequence ``unordered-iteration``.
     """
-    return {("element", None, node, None) if is_local(o) else o for o in origins}
+    return {
+        ("element", None, node, None) if (is_local(o) or is_itercaller(o)) else o
+        for o in origins
+    }
+
+
+def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
+    """Promote ``"local"`` -> an ``itercaller`` for a sequence materialized from it.
+
+    ``list(some_set)`` / ``tuple(relation.units)`` / ``[x for x in some_set]`` fix
+    the result's *element order* to the source's hash-seeded iteration order. That
+    is value-position instability a key-sorting serializer cannot launder -- so it
+    must survive ``yaml.dump`` / ``json.dumps(sort_keys=True)``, reported as
+    ``unordered-iteration`` pointing at the materialization ``node`` (where the
+    ``sorted()`` fix lands). Everything else passes through unchanged; ``path`` is
+    ``None`` (== the current file), resolved by the consumer (mirrors ``element``).
+    """
+    return {("itercaller", None, node, None) if is_local(o) else o for o in origins}
 
 
 class TaintEngine:
@@ -86,10 +118,23 @@ class TaintEngine:
         class_attr_types: Dict[str, Dict[str, str]],
         *,
         relations_unordered: bool = False,
+        file_imports: Optional[Dict[str, "FileImports"]] = None,
     ) -> None:
         self.registry = registry
         self.class_attr_types = class_attr_types
         self.relations_unordered = relations_unordered
+        #: path -> that file's import aliases (set per-file via ``enter``).
+        self.file_imports = file_imports or {}
+        self._aliases = FileImports()
+
+    def enter(self, path: str) -> None:
+        """Select ``path``'s import aliases for the function about to be walked.
+
+        Called once before each function's walk. Name-matching in :meth:`_call`
+        then resolves a renamed import (``from uuid import uuid4 as gen``) back to
+        its canonical name. Safe because functions are walked one at a time.
+        """
+        self._aliases = self.file_imports.get(path) or FileImports()
 
     # -- public -------------------------------------------------------------
 
@@ -110,10 +155,34 @@ class TaintEngine:
         if isinstance(node, (ast.Set, ast.SetComp)):
             return {("local", None, node, None)}
 
-        if isinstance(node, (ast.ListComp, ast.GeneratorExp, ast.DictComp)):
+        if isinstance(node, ast.DictComp):
+            # A dict comprehension's only ordering instability is *key* order,
+            # which a key-sorting serializer launders -- so it inherits the
+            # source's taint unchanged (no sequence-element promotion).
             out: Set[Origin] = set()
             for gen in node.generators:
                 out |= self.eval(gen.iter, env, cls_ctx, _depth + 1)
+            return out
+
+        if isinstance(node, (ast.ListComp, ast.GeneratorExp)):
+            # Building a *list* by iterating a source fixes its element order to
+            # the source's iteration order. Two cases survive a key-sorting
+            # serializer (it is list order, not dict-key order):
+            #  * source is a *parameter* -> the order is the caller's to control,
+            #    flagged as a contract boundary (``iterparam``) anchored at the
+            #    ``for ... in <iter>``;
+            #  * source is a locally-born *unordered* collection (``set`` /
+            #    ``relation.units``) -> a concrete bug here, promoted ``local`` ->
+            #    ``itercaller`` (via :func:`_as_local_sequence`).
+            # Other concrete instability (element/volatile/itercaller) propagates
+            # unchanged.
+            out = set()
+            for gen in node.generators:
+                inner = self.eval(gen.iter, env, cls_ctx, _depth + 1)
+                out |= _as_local_sequence(inner, gen.iter)
+                for o in inner:
+                    if isinstance(o, tuple) and o[0] == "param":
+                        out.add(("iterparam", o[1], None, gen.iter))
             return out
 
         if isinstance(node, ast.Dict):
@@ -192,6 +261,12 @@ class TaintEngine:
         depth: int,
     ) -> Set[Origin]:
         name = astutils.final_attr(call.func)
+        # Undo an ``as`` rename so a renamed import matches its canonical name
+        # (``from uuid import uuid4 as gen`` -> ``gen()`` resolves to ``uuid4``).
+        # A module alias (``import json as j``) leaves the final attribute intact,
+        # so only the ``module_root`` checks below need the module map.
+        if name in self._aliases.names:
+            name = self._aliases.names[name]
         if name in SANITIZER_CALLS:
             return set()
         if name in UNORDERED_CALLS:
@@ -224,7 +299,8 @@ class TaintEngine:
                 return _key_sort_survivors(inner)
             return inner
         if name in ("dump", "safe_dump"):
-            if astutils.module_root(call.func) == "json":
+            mod = astutils.module_root(call.func)
+            if self._aliases.modules.get(mod, mod) == "json":
                 return set()  # json.dump(obj, fp) writes a file, not a databag value
             inner = self.eval(call.args[0], env, cls_ctx, depth + 1) if call.args else set()
             # PyYAML sorts mapping keys by default (sort_keys=True), which fixes
@@ -236,7 +312,30 @@ class TaintEngine:
             return _key_sort_survivors(inner)
 
         if name in PROPAGATE_CALLS and call.args:
-            return self.eval(call.args[0], env, cls_ctx, depth + 1)
+            inner = self.eval(call.args[0], env, cls_ctx, depth + 1)
+            if name in SEQUENCE_MATERIALIZERS:
+                # ``list(some_set)`` / ``tuple(relation.units)`` fixes the result's
+                # element order to the source's iteration order -- key-sort-proof,
+                # so promote ``local`` -> ``itercaller`` at this call.
+                return _as_local_sequence(inner, call)
+            return inner
+
+        if name in TEMPLATE_RENDER_METHODS and not self.registry.get("render"):
+            # ``template.render(x=..., **ctx)`` -- a Jinja2 render. We can't see the
+            # template, so the output is treated as text built from the arguments:
+            # as unstable as the most-unstable one. An unstable value rendered into
+            # the text and then written to a sink (config file / databag) flaps.
+            # Parameter taint is kept (not dropped like a scalar ``str()``) so a
+            # helper that renders one of its *collection* parameters is caught at
+            # the contract boundary -- the report stage grades it by annotation.
+            # Gated on there being no user-defined ``render`` so a real method of
+            # that name still uses its own summary instead of this heuristic.
+            rendered: Set[Origin] = set()
+            for arg in call.args:
+                rendered |= self.eval(arg, env, cls_ctx, depth + 1)
+            for kw in call.keywords:
+                rendered |= self.eval(kw.value, env, cls_ctx, depth + 1)
+            return rendered
 
         # User-defined function: consult its return summary.
         out: Set[Origin] = set()
@@ -269,12 +368,45 @@ class TaintEngine:
                     )
                 else:
                     out.add(("local", fi.path, call, fi.name))
-            if fi.returns_params:
+            if fi.returns_itercaller:
+                # The helper returns a sequence materialized from a locally-born
+                # unordered collection (``return list(some_set)``). Carry its
+                # materialization site so the finding points at the ``list(...)``
+                # inside the helper, and keep it key-sort-resistant.
+                if fi.itercaller_site is not None:
+                    out.add(
+                        (
+                            "itercaller",
+                            fi.itercaller_site[0],
+                            fi.itercaller_site[1],
+                            None,
+                        )
+                    )
+                else:
+                    out.add(("itercaller", fi.path, call, None))
+            if fi.returns_params or fi.iter_params:
                 mapping = astutils.map_call_args(call, fi)
                 for idx in fi.returns_params:
                     arg = mapping.get(idx)
                     if arg is not None:
                         out |= self.eval(arg, env, cls_ctx, depth + 1)
+                # Confirmed iteration instability: when a known-unstable argument
+                # flows into a parameter the callee iterates unsorted into a
+                # sequence that escapes via return (iter_params[idx] with idx in
+                # returns_params), emit an ``itercaller`` origin carrying the
+                # callee's iteration site. This replaces the heuristic ``sink``
+                # finding (which fires regardless of caller taint) with a
+                # confirmed ``caller`` finding that fires only here, only when the
+                # actual argument is demonstrably unstable.
+                for idx, (ipath, inode) in fi.iter_params.items():
+                    if idx not in fi.returns_params:
+                        continue  # direct-sink case: handled by report.py
+                    arg = mapping.get(idx)
+                    if arg is None:
+                        continue
+                    arg_origins = self.eval(arg, env, cls_ctx, depth + 1)
+                    if has_local(arg_origins) or "volatile" in arg_origins or has_element(arg_origins):
+                        out.add(("itercaller", ipath, inode, None))
 
         # Method call on an order-tainted receiver: any view/render of an
         # unordered object (``d.keys()``, ``data[role].add(...)`` then a

@@ -27,7 +27,7 @@ from .discovery import (
     sibling_libs,
     sink_dep_roots,
 )
-from .model import Finding, FuncInfo, Registry
+from .model import FileImports, Finding, FuncInfo, Registry
 from .report import report
 from .summary import compute_summaries
 from .taint import TaintEngine
@@ -94,18 +94,24 @@ class Analyzer:
 
         registry: Registry = {}
         class_attr_types: Dict[str, Dict[str, str]] = {}
+        file_imports: Dict[str, FileImports] = {}
         functions: List[FuncInfo] = []
         suppressed: Dict[str, Set[int]] = {}
 
         for path in self.primary_files:
-            self._ingest(path, True, registry, class_attr_types, functions, suppressed)
+            self._ingest(
+                path, True, registry, class_attr_types, file_imports, functions, suppressed
+            )
         for path in self.secondary_files:
-            self._ingest(path, False, registry, class_attr_types, functions, suppressed)
+            self._ingest(
+                path, False, registry, class_attr_types, file_imports, functions, suppressed
+            )
 
         engine = TaintEngine(
             registry,
             class_attr_types,
             relations_unordered=self.relations_unordered,
+            file_imports=file_imports,
         )
         analyzer = FunctionAnalyzer(engine)
         compute_summaries(functions, analyzer)
@@ -193,6 +199,7 @@ class Analyzer:
         primary: bool,
         registry: Registry,
         class_attr_types: Dict[str, Dict[str, str]],
+        file_imports: Dict[str, FileImports],
         functions: List[FuncInfo],
         suppressed: Dict[str, Set[int]],
     ) -> None:
@@ -210,7 +217,9 @@ class Analyzer:
             if SUPPRESS_COMMENT in line
         }
         report_here = primary or self.report_deps
-        collector = Collector(path, report_here, registry, class_attr_types)
+        collector = Collector(
+            path, report_here, registry, class_attr_types, file_imports
+        )
         collector.visit(tree)
         functions.extend(collector.functions)
         # Module-level code is its own (parameterless) scope.

@@ -20,8 +20,11 @@ from .model import (
     FuncInfo,
     Origin,
     has_element,
+    has_itercaller,
     has_local,
     is_element,
+    is_itercaller,
+    is_iterparam,
     is_local,
     local_site,
 )
@@ -157,6 +160,18 @@ class SummaryHandler(Handler):
             self.fi.dangerous[idx] = "direct"
             self.changed = True
 
+    def _mark_iter(self, idx: int, origin: Origin) -> None:
+        """Record the iteration site of a sequence-from-parameter (``iterparam``).
+
+        Keeps the earliest (by location) site so the finding points at the first
+        offending iteration. ``None`` placeholders resolve to this function.
+        """
+        site = (origin[2] or self.fi.path, origin[3])
+        prev = self.fi.iter_params.get(idx)
+        if prev is None or _loc_key(site) < _loc_key(prev):
+            self.fi.iter_params[idx] = site
+            self.changed = True
+
     def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
         # Hash sinks are reported only at concrete local-origin sites, not folded
         # into parameter summaries (which describe relation-data writes).
@@ -166,6 +181,10 @@ class SummaryHandler(Handler):
         for origin in origins:
             if isinstance(origin, tuple) and origin[0] == "param":
                 self._mark(origin[1], marker)
+            elif is_iterparam(origin):
+                # A sequence built from a parameter reaches a relation-data write:
+                # the strongest evidence that the iteration order escapes.
+                self._mark_iter(origin[1], origin)
 
     def ret(self, origins) -> None:
         for origin in origins:
@@ -206,6 +225,31 @@ class SummaryHandler(Handler):
                 if not self.fi.returns_element:
                     self.fi.returns_element = True
                     self.changed = True
+            elif is_itercaller(origin):
+                # A sequence materialized from a locally-born unordered collection
+                # (``return list(some_set)``) escapes via return. Remember the
+                # materialization site so callers blame the ``list(...)`` rather
+                # than their own serializer, and mark the return key-sort-resistant
+                # (a key-sorting serializer must NOT launder it). ``None``
+                # placeholders resolve to this function's file/name.
+                site = (origin[1] or self.fi.path, origin[2], self.fi.name)
+                if self.fi.itercaller_site is None or _loc_key(
+                    site
+                ) < _loc_key(self.fi.itercaller_site):
+                    self.fi.itercaller_site = site
+                    self.changed = True
+                if not self.fi.returns_itercaller:
+                    self.fi.returns_itercaller = True
+                    self.changed = True
+            elif is_iterparam(origin):
+                # A sequence built by iterating a parameter escapes via return.
+                # Record the iteration site (contract-boundary finding) and keep
+                # the param flowing to callers so the eventual concrete sink is
+                # still reported at its write site.
+                self._mark_iter(origin[1], origin)
+                if origin[1] not in self.fi.returns_params:
+                    self.fi.returns_params.add(origin[1])
+                    self.changed = True
             elif isinstance(origin, tuple) and origin[0] == "param":
                 if origin[1] not in self.fi.returns_params:
                     self.fi.returns_params.add(origin[1])
@@ -229,9 +273,16 @@ class ReportHandler(Handler):
         # Only locally-born unstable values are concrete bugs at this site;
         # parameter-only flows are reported on the helper that owns the sink.
         # ``element`` is value-position order instability (a pick) and reports
-        # like ``local``.
+        # like ``local``. ``itercaller`` is a confirmed iteration instability
+        # traced from a concrete unstable argument through a callee's unsorted
+        # iteration.
         volatile = "volatile" in origins
-        if not has_local(origins) and not has_element(origins) and not volatile:
+        if (
+            not has_local(origins)
+            and not has_element(origins)
+            and not volatile
+            and not has_itercaller(origins)
+        ):
             return
         # A builtin ``hash()`` inside a value-object dunder (``__hash__`` /
         # ``__eq__``) is in-process object hashing -- consistent only within one
@@ -276,6 +327,35 @@ class ReportHandler(Handler):
                     site_node,
                     "high",
                     "unordered-pick",
+                    sink_type,
+                    _variable(site_node),
+                    site_path,
+                    None,
+                )
+            )
+            return
+        if has_itercaller(origins):
+            # Confirmed iteration instability: either a traced unstable argument
+            # through a callee's unsorted parameter iteration, or a locally-born
+            # unordered collection materialized into a sequence (``list(some_set)``).
+            # Point the finding at the iteration / materialization site (where
+            # ``sorted()`` belongs), not at the databag write here (the blameless
+            # sink). Any co-occurring ``local`` taint is suppressed: ``itercaller``
+            # is strictly more informative (it pinpoints the fix location). A
+            # ``None`` path means "born in this function's file".
+            site_path, site_node = min(
+                (
+                    (o[1] or self.fi.path, o[2])
+                    for o in origins
+                    if is_itercaller(o)
+                ),
+                key=_loc_key,
+            )
+            self.out.append(
+                (
+                    site_node,
+                    "high",
+                    "unordered-iteration",
                     sink_type,
                     _variable(site_node),
                     site_path,
