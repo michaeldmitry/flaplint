@@ -95,6 +95,22 @@ def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     return {("itercaller", None, node, None) if is_local(o) else o for o in origins}
 
 
+def _is_str_join(call: ast.Call) -> bool:
+    """True for a ``<sep>.join(<iterable>)`` string join (not ``os.path.join``).
+
+    ``str.join`` takes exactly one argument -- the iterable whose element order is
+    baked into the result string. ``os.path.join(a, b, ...)`` shares the final
+    attribute name but takes several path components, so the single-positional-arg
+    shape distinguishes them; the ``os`` module root is excluded as belt-and-braces.
+    """
+    if not isinstance(call.func, ast.Attribute) or call.keywords:
+        return False
+    args = [a for a in call.args if not isinstance(a, ast.Starred)]
+    if len(args) != 1 or len(call.args) != 1:
+        return False
+    return astutils.module_root(call.func) != "os"
+
+
 class TaintEngine:
     """Evaluate the ordering/volatility taint of expressions.
 
@@ -126,6 +142,21 @@ class TaintEngine:
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
         self._aliases = FileImports()
+
+    @staticmethod
+    def survives_structural_compare(origins: Set[Origin]) -> Set[Origin]:
+        """Origins that survive a *structural* (key-order-insensitive) comparison.
+
+        The pebble daemon compares parsed plan structs, not the layer's raw YAML:
+        mapping fields (``environment``, ...) are order-insensitive, so dict-key
+        disorder (``"local"``) is laundered exactly as a key-sorting serializer
+        would. Order-sensitive instability -- a value-position ``element`` pick, a
+        sequence built from an unordered source (``itercaller``/``iterparam``), or
+        a nondeterministic ``volatile`` -- still flaps the plan and survives. This
+        is the same filter a ``yaml.dump`` / ``json.dumps(sort_keys=True)`` applies,
+        exposed for the plan sink in :mod:`flaplint.traversal`.
+        """
+        return _key_sort_survivors(origins)
 
     def enter(self, path: str) -> None:
         """Select ``path``'s import aliases for the function about to be walked.
@@ -313,10 +344,15 @@ class TaintEngine:
 
         if name in PROPAGATE_CALLS and call.args:
             inner = self.eval(call.args[0], env, cls_ctx, depth + 1)
-            if name in SEQUENCE_MATERIALIZERS:
+            if name in SEQUENCE_MATERIALIZERS or _is_str_join(call):
                 # ``list(some_set)`` / ``tuple(relation.units)`` fixes the result's
-                # element order to the source's iteration order -- key-sort-proof,
-                # so promote ``local`` -> ``itercaller`` at this call.
+                # element order to the source's iteration order; ``sep.join(some_set)``
+                # likewise bakes that order into the result *string*. Both are
+                # key-sort-proof (a key-sorting serializer never reaches list-element
+                # or in-string order), so promote ``local`` -> ``itercaller`` here.
+                # ``join`` is matched only as a single-argument ``<sep>.join(iter)``
+                # so it does not collide with ``os.path.join(a, b, ...)`` (which takes
+                # several path components and merely propagates their taint).
                 return _as_local_sequence(inner, call)
             return inner
 

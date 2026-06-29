@@ -280,7 +280,8 @@ and names:
 | `<relation>.data[app \| unit]` | the databag object | structural shape |
 | `.update()`/`.setdefault()`/`[k]=`, `relation.save(...)` | databag writes | shape + name |
 | `relation.units` | an unordered source | attribute name |
-| `container.push`, `container.add_layer` | file / layer sinks | method name |
+| `container.push` | on-disk file sink (byte-diffed) | method name |
+| `container.add_layer` | pebble plan sink (structural compare) | method name |
 | `.render(...)` | a Jinja template render | method name (heuristic) |
 
 Databag recognition is **object provenance**, not one fixed shape: a Relation comes

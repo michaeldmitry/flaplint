@@ -49,9 +49,17 @@ def test_databag_entity_anchors():
 
 
 def test_file_sink_anchors():
-    # constants.FILE_WRITE_METHODS: the pebble file/layer sinks.
+    # constants.FILE_WRITE_METHODS: the workload-container file sink.
     assert hasattr(ops.Container, "push"), "file sink `container.push`"
-    assert hasattr(ops.Container, "add_layer"), "layer sink `container.add_layer`"
+
+
+def test_plan_sink_anchors():
+    # constants.PLAN_WRITE_METHODS: `container.add_layer` feeds the pebble plan,
+    # and `container.replan` is what compares the plan and restarts services -- the
+    # churn the plan sink guards against. (replan carries no content, so it is not
+    # itself a sink, but the anchor documents the mechanism.)
+    assert hasattr(ops.Container, "add_layer"), "plan sink `container.add_layer`"
+    assert hasattr(ops.Container, "replan"), "plan-compare trigger `container.replan`"
 
 
 def test_unordered_source_anchors():

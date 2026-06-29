@@ -13,6 +13,7 @@ from .constants import (
     ACCUMULATOR_METHODS,
     FILE_WRITE_METHODS,
     MAPPING_WRITE_METHODS,
+    PLAN_WRITE_METHODS,
     PROPAGATE_CALLS,
     UNORDERED_CALLS,
 )
@@ -338,7 +339,7 @@ def file_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
     """``(method, content exprs)`` written by a known on-disk file call.
 
     Recognises the workload/charm file writers in :data:`FILE_WRITE_METHODS` --
-    ``container.push(path, source)``, ``container.add_layer(label, layer)``,
+    ``container.push(path, source)``,
     ``Path.write_text``/``write_bytes`` (also ``charmlibs.pathops``), open-handle
     ``f.write(data)`` / ``f.writelines(lines)``, and ``os.write(fd, data)`` --
     and returns the method key plus the argument(s) carrying the *content* (so an
@@ -358,7 +359,35 @@ def file_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
     key = attr
     if attr == "write" and module_root(call.func) == "os":
         key = "os_write"  # os.write(fd, data) -- content is the 2nd positional
-    spec = FILE_WRITE_METHODS.get(key)
+    return _content_args(call, FILE_WRITE_METHODS, key)
+
+
+def plan_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
+    """``(method, content exprs)`` written by a pebble-plan call (the ``plan`` sink).
+
+    Recognises ``container.add_layer(label, layer)`` (and the lower-level
+    ``pebble.Client.add_layer``) from :data:`PLAN_WRITE_METHODS` and returns the
+    method key plus the *layer* argument(s). Separate from :func:`file_write_args`
+    because a pebble layer is compared *structurally* by the daemon, not byte-
+    diffed, so the caller applies key-sort (not raw-byte) survival to the content.
+    Returns ``None`` when ``call`` is not a plan write.
+    """
+    if not isinstance(call.func, ast.Attribute):
+        return None
+    return _content_args(call, PLAN_WRITE_METHODS, call.func.attr)
+
+
+def _content_args(
+    call: ast.Call,
+    table: "Dict[str, Tuple[int, Tuple[str, ...]]]",
+    key: str,
+) -> Optional[Tuple[str, List[ast.expr]]]:
+    """Shared extraction: the content expr(s) for ``key`` in a sink ``table``.
+
+    Returns ``(key, content exprs)`` -- the positional at the table's index plus
+    any keyword-aliased content -- or ``None`` if ``key`` is not in the table.
+    """
+    spec = table.get(key)
     if spec is None:
         return None
     idx, kw_aliases = spec

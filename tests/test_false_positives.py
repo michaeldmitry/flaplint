@@ -80,6 +80,9 @@ def test_str_or_none_param_iterated_is_not_flagged(lint_source):
 def test_set_comprehension_joined_into_databag_is_still_flagged(lint_source):
     # The genuine bug at db.py:295 must still be caught: a set comprehension joined
     # into a string and written to a databag has non-deterministic word order.
+    # ``sep.join(<set>)`` bakes the iteration order into the result string -- that is
+    # *iteration* instability (a key-sorting serializer cannot fix in-string order),
+    # so the right fix is sorted() before the join.
     findings = lint_source(
         """
         class Charm:
@@ -89,4 +92,5 @@ def test_set_comprehension_joined_into_databag_is_still_flagged(lint_source):
                 })
         """
     )
-    assert any(f.rule == "unordered-collection" for f in findings)
+    flagged = [f for f in findings if f.rule == "unordered-iteration"]
+    assert flagged and flagged[0].confidence == "high"

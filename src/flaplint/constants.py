@@ -247,7 +247,6 @@ BUILTIN_COLLECTION_METHODS: Set[str] = BUILTIN_VIEW_METHODS | BUILTIN_MUTATOR_ME
 FILE_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
     # ops.Container (workload container).
     "push": (1, ("source",)),  # Container.push(path, source, ...)
-    "add_layer": (1, ("layer",)),  # Container.add_layer(label, layer)
     # pathlib.Path AND charmlibs.pathops (ContainerPath / LocalPath share the
     # same names + content-first signature): write_text(data)/write_bytes(data).
     "write_text": (0, ("data",)),
@@ -263,13 +262,37 @@ FILE_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
 #: method name, used in the finding message.
 FILE_WRITE_DESCS: Dict[str, str] = {
     "push": "container push (file change-detector: replan / restart)",
-    "add_layer": "pebble layer (change-detector: replan / restart)",
     "write_text": "on-disk file write (change-detector gate)",
     "write_bytes": "on-disk file write (change-detector gate)",
     "write": "on-disk file write (change-detector gate)",
     "writelines": "on-disk file write (change-detector gate)",
     "os_write": "on-disk file write (change-detector gate)",
 }
+
+#: Pebble-plan emission APIs (the ``plan`` sink): ``Container.add_layer(label,
+#: layer)`` (and the lower-level ``pebble.Client.add_layer``). Unstable content in
+#: a layer can make ``replan()`` see a changed plan and restart services for no
+#: real reason -- the same spurious-churn problem as a databag write.
+#:
+#: It is *deliberately not* a byte-diffed :data:`FILE_WRITE_METHODS` entry. Pebble
+#: does not diff the layer's YAML bytes: it parses the layer into plan structs,
+#: merges them, and compares the merged service definitions to decide what to
+#: restart. That comparison is **structural** -- mapping fields (``environment``,
+#: ...) are order-insensitive, exactly as a key-sorting serializer would launder
+#: them, while order-sensitive fields (a ``command`` string built by joining an
+#: unordered set, a list-valued field) and nondeterministic values still flap. So
+#: a plan write uses *key-sort* survival (see
+#: ``TaintEngine.survives_structural_compare``), not raw-byte file survival: a bare
+#: ``set``/dict-key-order in a layer is laundered by pebble and must not be flagged.
+#:
+#: Maps the method name to the ``(positional index, keyword aliases)`` of the
+#: *layer* argument. ``replan()`` itself carries no content and is not a sink.
+PLAN_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
+    "add_layer": (1, ("layer",)),  # Container.add_layer(label, layer)
+}
+
+#: Human-readable sink description for a pebble-plan write.
+PLAN_WRITE_DESC = "pebble plan (replan / service-restart gate)"
 
 #: Serializers whose *return value* is a rendered config/data blob. A function
 #: that ``return``s ``yaml.dump(x)`` / ``json.dumps(x)`` is a config-render

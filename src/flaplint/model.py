@@ -154,7 +154,7 @@ class Finding:
     confidence: str  # criticality: "low" | "medium" | "high"
     rule: str  # failure mode: nondeterministic | unordered-collection |
     #            unordered-pick
-    sink: str  # where the value lands: "databag" | "file" | "hash"
+    sink: str  # where the value lands: "databag" | "file" | "hash" | "plan"
     variable: str  # offending variable / collection name ("" if anonymous)
     level: str = "error"  # blocking status: "error" (charm-owned fix) | "warning"
     #: provenance pointer: where the unstable value is *born* -- the ``set()`` /

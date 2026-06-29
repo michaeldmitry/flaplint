@@ -20,7 +20,7 @@ package lives in `src/flaplint/`.
 - **Stdlib-only.** No runtime dependencies (`pyproject.toml` `dependencies = []`).
   Do **not** add third-party runtime deps — the analyser must run anywhere with a
   bare interpreter. `pytest` is the only dev dependency.
-- **Run the test suite** (118 tests, fast — ~0.6s) from the project root
+- **Run the test suite** (fast — ~0.5s) from the project root
 - **Run the linter** via the `flaplint` console script or the module — both work.
 
 ## Architecture (orientation)
@@ -63,6 +63,8 @@ The subtlety that trips up naive linters and was the subject of recent work:
 **`set` is laundered by key-sorting, but `list(set)` is not** — materializing a set
 into a sequence converts mapping-key disorder into list-element disorder, which
 key-sorting never touches. That is why `list(set)` is *promoted* `local → itercaller`.
+The same promotion applies to `" ".join(some_set)`: joining bakes the element order
+into the result *string*, which key-sorting can't reach either.
 
 Full reference (with the survival matrix and propagation rules):
 [docs/taint-model.md](docs/taint-model.md). Sinks and how origins become findings:
@@ -96,9 +98,13 @@ Full reference (with the survival matrix and propagation rules):
 - **New serializer** the engine should understand: extend the relevant set in
   `constants.py` and, if it has new survival semantics, the `_call` handling in
   `taint.py`.
-- **New sink** (a databag/file/hash API): `FILE_WRITE_METHODS` / `HASH_CALLS` in
-  `constants.py`; databag recognition is **object provenance** in `databag.py`
-  (Relation→RelationData→databag, seeded by `get_relation`), used by `traversal.py`.
+- **New sink** (a databag/file/hash/plan API): `FILE_WRITE_METHODS` / `HASH_CALLS`
+  / `PLAN_WRITE_METHODS` in `constants.py`; databag recognition is **object
+  provenance** in `databag.py` (Relation→RelationData→databag, seeded by
+  `get_relation`), used by `traversal.py`. A `file` sink is byte-diffed (flags any
+  origin); a `plan`/`hash`/`databag` sink is compared structurally / key-sorted, so
+  it uses **key-sort survival** (`TaintEngine.survives_structural_compare`) — a bare
+  `set` is laundered there, a `list(set)`/`join(set)`/volatile is not.
 - **A new origin flavor or a flavor change**: this touches several files in lockstep
   — the predicate in `model.py`, both survival filters in `taint.py`
   (`_survives_stringify` **and** `_key_sort_survivors`), the `SummaryHandler.ret`

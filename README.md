@@ -2,9 +2,9 @@
 
 > **Keep your charm's databags steady, your reconcilers quiet.**
 
-`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a `set`, a `glob`, a `uuid4()`, …) reaches a *churn-sensitive sink*: a relation databag, an on-disk file, or a content-hash change-detector.
+`flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order (a `set`, a `glob`, a `uuid4()`, …) reaches a *churn-sensitive sink*: a relation databag, an on-disk file, a pebble plan, or a content-hash change-detector.
 
-The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* instability also flaps an on-disk file (a rendered config, pebble layer, or any file used as a change-detector) and content-hash change-detectors — both of which gate a restart / replan / re-sync. So `flaplint` checks all three.
+The classic case is a relation-databag write: Juju fires endless `relation-changed` events and sends two charms into a reconcile ping-pong. But the *same* instability also flaps an on-disk file (a rendered config or any file used as a change-detector), a pebble plan (an unstable layer makes `replan()` restart the workload), and content-hash change-detectors — all of which gate a restart / replan / re-sync. So `flaplint` checks all four.
 
 > **Want the internals?** This README is the overview. For how the analysis
 > actually works — the taint model, sink discovery, the inter-procedural pass —
@@ -163,8 +163,8 @@ The pieces, each with a dedicated deep-dive in **[docs/](docs/README.md)**:
   `iterparam`, `volatile`, `param`). The crucial distinction is which fix applies:
   a bare `set` is laundered by a key-sorting serializer, but a `list(set)` is not.
   → **[docs/taint-model.md](docs/taint-model.md)**
-- **Sink discovery** recognises the three churn-sensitive write shapes —
-  `databag`, `file`, and `hash` change-detectors. → **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#sink-discovery)**
+- **Sink discovery** recognises the four churn-sensitive write shapes —
+  `databag`, `file`, `plan` (pebble), and `hash` change-detectors. → **[docs/sinks-and-findings.md](docs/sinks-and-findings.md#sink-discovery)**
 - **Inter-procedural summaries** let it see across calls: the unordered value is
   usually created in your charm and written by a library helper several calls
   deep. A fixed-point pass computes a summary per function so a call site can be
@@ -213,7 +213,7 @@ Each finding's first line reads `mark line:col  <failure mode> · <variable> →
 | `line:col` | **where to fix it** — for `unordered-pick` this is the pick itself, not the blameless serialiser |
 | failure mode | one of the four root causes; tells you *how to fix it* (see below) |
 | `· <variable>` | the **affected identifier** to go look at (`peers`, `scheduler_addrs`, or the volatile call `uuid4`) |
-| `→ <sink>` | where the value lands: `databag`, an `on-disk file`, or a `content hash` (both change-detectors) |
+| `→ <sink>` | where the value lands: `databag`, an `on-disk file`, a `pebble plan`, or a `content hash` (all change-detectors) |
 | `[confidence]` | `high` / `medium` / `low` confidence that this is a real bug |
 
 The indented lines explain *why* it flaps, the concrete *fix*, and — when the value

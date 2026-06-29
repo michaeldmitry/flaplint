@@ -421,7 +421,11 @@ def test_container_push_of_unordered_is_a_config_sink(lint_source):
     assert callers[0].sink == "file"
 
 
-def test_pebble_add_layer_with_unordered_value_is_a_config_sink(lint_source):
+def test_pebble_add_layer_unordered_command_is_a_plan_sink(lint_source):
+    # A ``command`` string built by joining an unordered set flaps the pebble plan:
+    # pebble compares the command (a string) by value, so a reshuffled command means
+    # a "changed" service and a spurious restart on replan(). This is the single most
+    # common real pebble flap, and it must survive pebble's structural plan compare.
     findings = lint_source(
         """
         class Charm:
@@ -433,6 +437,42 @@ def test_pebble_add_layer_with_unordered_value_is_a_config_sink(lint_source):
     callers = [f for f in findings if f.kind == "caller"]
     assert len(callers) == 1
     assert callers[0].confidence == "high"
+    assert callers[0].sink == "plan"
+
+
+def test_pebble_add_layer_bare_set_in_mapping_field_is_laundered(lint_source):
+    # Pebble compares plans *structurally*, not byte-for-byte: mapping fields
+    # (``environment``, ...) are order-insensitive, so a bare set / dict-key-order
+    # whose only instability is key order is laundered by the daemon exactly as a
+    # key-sorting serializer would. It must NOT be flagged at the plan sink (that
+    # would be the over-report a plain byte-diffed file sink produces).
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self, container, names):
+                layer = {"services": {"app": {"environment": set(names)}}}
+                container.add_layer("app", layer)
+        """
+    )
+    assert [f for f in findings if f.sink == "plan"] == []
+
+
+def test_pebble_add_layer_volatile_value_is_a_plan_sink(lint_source):
+    # A nondeterministic value in a layer regenerates every reconcile -> the plan
+    # differs every time -> a restart on every replan(). Survives structural compare.
+    findings = lint_source(
+        """
+        import uuid
+
+        class Charm:
+            def reconcile(self, container):
+                layer = {"services": {"app": {"environment": {"ID": str(uuid.uuid4())}}}}
+                container.add_layer("app", layer)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller" and f.sink == "plan"]
+    assert len(callers) == 1
+    assert callers[0].rule == "nondeterministic"
 
 
 def test_path_write_text_of_unordered_is_a_config_sink(lint_source):

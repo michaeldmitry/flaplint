@@ -84,6 +84,7 @@ _SINK_TARGET: Dict[str, str] = {
     "databag": "the relation databag",
     "file": "an on-disk file",
     "hash": "a content hash",
+    "plan": "a pebble plan",
 }
 
 
@@ -93,6 +94,7 @@ _SINK_LABEL: Dict[str, str] = {
     "databag": "databag",
     "file": "on-disk file",
     "hash": "content hash",
+    "plan": "pebble plan",
 }
 
 
@@ -111,7 +113,7 @@ def _describe(f: Finding) -> str:
     # behind them has no stable byte-order, the detector differs every reconcile
     # and the gate trips spuriously -- so the *feeding of unstable content into
     # them* is the sink, not any single downstream use.
-    is_detector = f.sink in ("hash", "file")
+    is_detector = f.sink in ("hash", "file", "plan")
 
     if f.rule == "unordered-collection":
         if is_detector:

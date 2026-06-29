@@ -49,6 +49,11 @@ plainly:
 So `list(some_set)` is treated differently from a bare `set` precisely because it
 changes whether a key-sorting serializer can save you.
 
+`" ".join(some_set)` is the same story in disguise: joining bakes the set's
+iteration order into the result *string*, and a key-sorting serializer can't reach
+inside a string any more than it can reorder a list's elements. So a join of an
+unordered collection is also `itercaller`, not `local` — sort *before* the join.
+
 ## The key-sort survival matrix
 
 Serializers come in two kinds:

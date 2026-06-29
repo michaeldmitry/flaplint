@@ -19,6 +19,7 @@ from .constants import (
     FILE_WRITE_DESCS,
     HASH_CALLS,
     MAPPING_WRITE_METHODS,
+    PLAN_WRITE_DESC,
     RENDER_SERIALIZERS,
 )
 from . import databag
@@ -240,6 +241,26 @@ class FunctionAnalyzer:
                         FILE_WRITE_DESCS.get(fmethod, "on-disk file write"),
                         fwargs[0],
                         "file",
+                    )
+            pwrite = astutils.plan_write_args(sub)
+            if pwrite is not None:
+                _, pwargs = pwrite
+                origins = set()
+                for content in pwargs:
+                    origins |= self._eval(content, ctx)
+                # A pebble layer is compared structurally by the daemon, not byte-
+                # diffed: mapping-key disorder is laundered (like a key-sorting
+                # serializer), so only order-sensitive / volatile instability flaps
+                # the plan. Filter the content taint accordingly before reporting.
+                origins = self.engine.survives_structural_compare(origins)
+                if origins:
+                    handler.sink(
+                        sub,
+                        origins,
+                        "direct",
+                        PLAN_WRITE_DESC,
+                        pwargs[0],
+                        "plan",
                     )
             margs = None
             if (

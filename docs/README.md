@@ -13,8 +13,8 @@ Read in order, or jump to the part you're changing:
    instability, which serializers fix which, how a value first becomes unstable, and
    how that changes as it flows through calls. *Everything else builds on this.*
 
-3. **[sinks-and-findings.md](sinks-and-findings.md)** — the three kinds of sink
-   (databag, file, hash), and how an unstable-value-reaches-a-sink flow becomes a
+3. **[sinks-and-findings.md](sinks-and-findings.md)** — the four kinds of sink
+   (databag, file, plan, hash), and how an unstable-value-reaches-a-sink flow becomes a
    finding: who-to-fix vs. how-to-fix, confidence, the four failure modes, and
    errors vs. warnings.
 

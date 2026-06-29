@@ -6,7 +6,7 @@ covers the two ends of the report: **where instability causes trouble** (sinks) 
 
 ## Sink discovery
 
-A *sink* is a place where unstable bytes cause real churn. There are three kinds,
+A *sink* is a place where unstable bytes cause real churn. There are four kinds,
 each shown as `sink=` in the output.
 
 ### `databag` — relation-data writes
@@ -52,7 +52,6 @@ Recognised writes:
 | call | the content argument |
 |---|---|
 | `container.push(path, source)` | `source` |
-| `container.add_layer(label, layer)` | `layer` |
 | `Path.write_text(data)` / `write_bytes(data)` | `data` |
 | `f.write(data)` / `f.writelines(lines)` | `data` / `lines` |
 | `os.write(fd, data)` | `data` |
@@ -60,6 +59,30 @@ Recognised writes:
 There's also one more: a function that **returns** `yaml.dump(...)` or
 `json.dumps(...)`. The rendered text is handed to a caller that diffs it, so an
 unstable value that survives key-sorting flaps the output.
+
+### `plan` — pebble plans
+
+A pebble layer pushed with `container.add_layer(label, layer)`. When the charm
+calls `replan()`, pebble compares the desired plan against the running one and
+restarts any service whose definition changed. Unstable content in a layer
+therefore makes the plan look "changed" every reconcile and restarts the workload
+for no real reason.
+
+The important subtlety: pebble does **not** diff the layer's YAML bytes. It parses
+the layer into plan structs, merges them, and compares the merged *service
+definitions*. That comparison is **structural** — mapping fields like
+`environment` are order-insensitive, exactly as a key-sorting serializer would
+launder them. So a plan write uses **key-sort survival**, not the raw-byte survival
+of a `file`:
+
+- a `command` built by joining an unordered set (`" ".join(peers)`), a list-valued
+  field, a positional pick, or a `uuid4()`/`time()` value → **flaps**, flagged;
+- a bare `set` / dict-key-order in a mapping field → **laundered by pebble**, not
+  flagged (flagging it would be the over-report a plain file sink produces).
+
+This is why `add_layer` is a sink of its own and not a `file` entry: the content is
+compared structurally, so it gets the same survival rules as `databag` and `hash`,
+not the byte-diff rules of an on-disk file.
 
 ### `hash` — content-hash change-detectors
 
