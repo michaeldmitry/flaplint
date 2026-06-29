@@ -18,6 +18,7 @@ from .constants import (
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
     PROPAGATE_CALLS,
+    FILE_READ_METHODS,
     SANITIZER_CALLS,
     SEQUENCE_MATERIALIZERS,
     STR_SPLIT_METHODS,
@@ -339,6 +340,12 @@ class TaintEngine:
                 for o in self.eval(call.func.value, env, cls_ctx, depth + 1)
                 if o == "volatile"
             }
+        if name in FILE_READ_METHODS and isinstance(call.func, ast.Attribute):
+            # ``path.read_text()`` / ``read_bytes()`` / ``f.read()`` return the file's
+            # content -- determined by the file, not by the receiver -- so they
+            # launder ordering taint. A path/handle that arrived as a parameter is a
+            # scalar; reading it does not inherit that "might be unordered" worry.
+            return set()
 
         # Serialization: byte-stability of the output follows that of the input.
         if name == "dumps":  # json.dumps(X) / yaml.dump-like .dumps

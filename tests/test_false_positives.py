@@ -161,3 +161,20 @@ def test_split_of_volatile_string_still_flagged(lint_source):
         """
     )
     assert any(f.rule == "nondeterministic" for f in findings)
+
+
+def test_reading_a_file_into_a_databag_is_not_flagged(lint_source):
+    # `path.read_text()` returns the file's (deterministic) content -- reading a path
+    # parameter is a scalar read, not an ordering source. Writing it to a databag
+    # must not be flagged (if the file's content is itself unstable, that's the fault
+    # of whatever wrote it).
+    findings = lint_source(
+        """
+        from pathlib import Path
+
+        class Charm:
+            def h(self, path: Path):
+                self.relation.data[self.app]["cfg"] = path.read_text()
+        """
+    )
+    assert findings == []

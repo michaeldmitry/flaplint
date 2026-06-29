@@ -139,3 +139,22 @@ def test_volatile_field_read_back_is_flagged(lint_source):
         """
     )
     assert any(f.rule == "nondeterministic" for f in findings)
+
+
+def test_pydantic_json_of_unstable_list_field_is_still_flagged(lint_source):
+    # Regression: a pydantic model whose list field is built from an unordered source,
+    # serialised via `.json()` into a databag, DOES flap -- pydantic emits a list in
+    # element order, so `.json()` must NOT be treated as laundering it (the cos_agent
+    # `_dashboards` shape). The model's *field-name* order is stable; its list field's
+    # *element* order is not.
+    findings = lint_source(
+        """
+        import glob
+
+        class Charm:
+            def publish(self, relation):
+                data = UnitData(dashboards=list(glob.glob("*.json")))
+                relation.data[self.app]["d"] = data.json()
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)

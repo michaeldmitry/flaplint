@@ -113,12 +113,35 @@ VOLATILE_CALLS: Set[str] = {
 #: their input.
 NONSORTING_SERIALIZERS: Set[str] = {"str", "repr"}
 
-#: Pydantic model serializers. A model serializes its fields in *definition*
-#: order, so ``<model>.model_dump_json()`` / ``<model>.model_dump()`` produce a
-#: byte-stable top-level shape regardless of the receiver's iteration order.
-#: They therefore launder the receiver's *ordering* taint rather than inheriting
-#: it -- writing ``param.model_dump_json()`` to a databag is not a raw-unordered
-#: write, so it must not trip the contract-boundary sink heuristic.
+#: File-read methods. ``path.read_text()`` / ``read_bytes()`` / ``f.read()`` return
+#: the file's *content*, which is determined by the file, not by the receiver's
+#: ordering. So they launder ordering taint: a path/handle parameter is a scalar,
+#: and reading it yields a deterministic value (if the file's own content is
+#: unstable, that's the fault of whatever *wrote* it, flagged at that write). This
+#: is also the intended input to a content hash / file change-detector, so reading
+#: a file must not look like an ordering source.
+FILE_READ_METHODS: Set[str] = {
+    "read",
+    "read_text",
+    "read_bytes",
+    "readline",
+    "readlines",
+}
+
+#: Pydantic model serializers. A model serializes its *field names* in definition
+#: order, so ``<model>.model_dump_json()`` / ``<model>.model_dump()`` launder the
+#: model's own key order -- writing ``param.model_dump_json()`` to a databag is not
+#: a raw-unordered write, so it must not trip the contract-boundary sink heuristic.
+#:
+#: NB this launders only the model's *top-level field order*; the order of items
+#: *within* a list-valued field survives (pydantic emits a list in element order).
+#: So a model with an unstable list field (``dashboards: List[str]`` built from a
+#: glob) still flaps through ``.json()`` -- which is exactly why the v1 ``.json()`` /
+#: ``.dict()`` spellings are deliberately *not* listed here: treating them as
+#: launderers would hide that real flap (a value object's list field is the same
+#: field-granularity blind spot as the dataclass barrier). A bare ``.json()`` on a
+#: value object with concrete unstable fields therefore stays caught (its receiver
+#: taint is inherited) and, on an opaque receiver, surfaces under ``--explain-gaps``.
 MODEL_SERIALIZERS: Set[str] = {"model_dump_json", "model_dump"}
 
 #: Digest/hash calls used as change-detectors. A charm hashes some content and

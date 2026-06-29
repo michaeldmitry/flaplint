@@ -129,6 +129,49 @@ def test_gap_is_dropped_when_a_finding_already_covers_the_line(tmp_path):
     assert all((g.path, g.line) not in finding_lines for g in a.gaps)
 
 
+def test_ordered_annotated_param_into_file_is_not_a_gap(tmp_path):
+    # A parameter the caller promises to keep ordered (`data: str`) is the caller's
+    # responsibility, not a blind spot.
+    gaps = _gaps(
+        tmp_path,
+        """
+        class Charm:
+            def _write(self, container, data: str):
+                container.push("/etc/app.conf", data)
+        """,
+    )
+    assert not any("`data`" in g.reason for g in gaps)
+
+
+def test_format_with_kwargs_param_is_not_a_gap(tmp_path):
+    # `template.format(**context)` is ordered by the template, not by `context`'s
+    # dict order — the param's instability never reaches the output, so no gap.
+    gaps = _gaps(
+        tmp_path,
+        """
+        class Charm:
+            def _write(self, dest, context):
+                dest.write_text(TEMPLATE.format(**context))
+        """,
+    )
+    assert not any("context" in g.reason for g in gaps)
+
+
+def test_method_call_receiver_is_not_a_field_gap(tmp_path):
+    # `obj.method()` is a method call, not a field read — must not be reported as an
+    # opaque value-object field.
+    gaps = _gaps(
+        tmp_path,
+        """
+        class Charm:
+            def reconcile(self, container):
+                model = Model(name="x")
+                container.push("/f", model.render())
+        """,
+    )
+    assert not any("`.render`" in g.reason for g in gaps)
+
+
 def test_reading_a_file_is_not_a_gap(tmp_path):
     # Hashing a file's contents (read_bytes) is the intended change-detector input,
     # deterministic given the file — not an ordering blind spot.

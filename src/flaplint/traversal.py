@@ -22,6 +22,7 @@ from .constants import (
     MAPPING_WRITE_METHODS,
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
+    ORDERED_ANNOTATIONS,
     PLAN_WRITE_DESC,
     PROPAGATE_CALLS,
     RENDER_SERIALIZERS,
@@ -90,6 +91,10 @@ class Context:
     cls: Optional[str] = None  # enclosing class of the analyzed function
     #: local variable -> its databag-provenance kind (relation/relation_data/databag)
     databag_kinds: Dict[str, str] = field(default_factory=dict)
+    #: this function's parameter names (by index) and their annotations -- used by
+    #: the ``--explain-gaps`` scan to grade an untraced-parameter blind spot.
+    params: List[str] = field(default_factory=list)
+    param_annotations: Dict[str, Optional[str]] = field(default_factory=dict)
 
 
 class FunctionAnalyzer:
@@ -112,7 +117,13 @@ class FunctionAnalyzer:
         env: Dict[str, Set[Origin]] = {
             pname: {("param", idx)} for idx, pname in enumerate(fi.params)
         }
-        ctx = Context(env=env, types={}, cls=fi.class_name)
+        ctx = Context(
+            env=env,
+            types={},
+            cls=fi.class_name,
+            params=list(fi.params),
+            param_annotations=dict(fi.param_annotations),
+        )
         self._visit_body(getattr(fi.node, "body", []), ctx, handler)
 
     # -- helpers ------------------------------------------------------------
@@ -250,6 +261,14 @@ class FunctionAnalyzer:
 
     def _content_gaps(self, content: ast.AST, sink: str, ctx: Context):
         """Yield ``(node, reason)`` for each untraceable part of ``content``."""
+        # Attributes that are the target of a call (``obj.method(...)``) are method
+        # calls, not field reads -- handled by the call check, never a field gap.
+        called = {
+            c.func
+            for c in ast.walk(content)
+            if isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+        }
+        # Leaf scan: an unresolved call or a field off a value object we don't model.
         for sub in ast.walk(content):
             if isinstance(sub, ast.Call):
                 if not self._call_accounted(sub, ctx):
@@ -259,7 +278,7 @@ class FunctionAnalyzer:
                         "(an external library?) — if it can return unordered data, "
                         "an unstable value here would be missed"
                     )
-            elif isinstance(sub, ast.Attribute):
+            elif isinstance(sub, ast.Attribute) and sub not in called:
                 recv = sub.value
                 if (
                     isinstance(recv, ast.Name)
@@ -271,20 +290,37 @@ class FunctionAnalyzer:
                         "fields flaplint doesn't fully track (e.g. one buried in a "
                         "dict, or rebuilt by a method)"
                     )
-            elif (
-                isinstance(sub, ast.Name)
-                and sink in ("file", "plan", "hash")
-                and sub.id not in ("self", "cls")
-            ):
-                origins = ctx.env.get(sub.id)
-                if origins and any(
-                    isinstance(o, tuple) and o[0] == "param" for o in origins
-                ):
-                    yield sub, (
-                        f"depends on parameter `{sub.id}`, not traced to its callers "
-                        f"(a {sink} write gets no caller-contract check, so an "
-                        "unordered caller would be missed)"
-                    )
+        # Content scan: does the *whole* value depend on an untraced parameter? File/
+        # plan/hash writes get no caller-contract check, so an unordered caller would
+        # slip through. Computed from the content's taint (not a textual name match),
+        # so a parameter that's already neutralised on the way in -- ``template.format(
+        # **ctx)`` (template-ordered) -- is *not* a gap. A parameter the caller already
+        # promises to keep ordered (``data: list``/``str``) is the caller's job, not a
+        # blind spot, so an ordered annotation is skipped.
+        if sink in ("file", "plan", "hash"):
+            origins = self._eval(content, ctx)
+            seen_params = set()
+            for o in origins:
+                if not (isinstance(o, tuple) and o[0] == "param"):
+                    continue
+                idx = o[1]
+                if idx in seen_params or idx >= len(ctx.params):
+                    continue
+                seen_params.add(idx)
+                pname = ctx.params[idx]
+                if pname in ("self", "cls"):
+                    continue
+                if ctx.param_annotations.get(pname) in ORDERED_ANNOTATIONS:
+                    continue
+                hint = (
+                    "" if ctx.param_annotations.get(pname) else
+                    " — add a type hint (e.g. `: list`/`: str` if ordered, `: Set` if not)"
+                )
+                yield content, (
+                    f"depends on parameter `{pname}`, not traced to its callers "
+                    f"(a {sink} write gets no caller-contract check, so an unordered "
+                    f"caller would be missed){hint}"
+                )
 
     def _call_accounted(self, call: ast.Call, ctx: Context) -> bool:
         """True if the engine understands this call (so it's not a blind spot)."""
