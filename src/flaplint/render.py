@@ -17,7 +17,7 @@ import shutil
 import textwrap
 from typing import Dict, List, Sequence
 
-from .model import Finding
+from .model import Finding, Gap
 
 # -- colour ------------------------------------------------------------------
 
@@ -282,6 +282,52 @@ def render_report(
         out.append("")
 
     out.append(_summary(findings, files_scanned, p))
+    out.append("")
+    return "\n".join(out)
+
+
+def render_gaps(gaps: Sequence[Gap], *, colour: bool = True, width: int = 0) -> str:
+    """Render the blind-spot section for ``--explain-gaps`` as a string.
+
+    Gaps are *not* findings -- they're writes whose content flaplint couldn't fully
+    trace, so they're where a missed flap could hide. Grouped by file, marked `?`,
+    each with the un-traced expression and a plain reason. Never affects the exit
+    code; it's a worklist for auditing the tool's own coverage.
+    """
+    p = _Palette(colour)
+    if width <= 0:
+        width = min(shutil.get_terminal_size(fallback=(90, 24)).columns, 100)
+
+    banner = p.bold("flaplint") + "  " + p.dim("· blind spots (writes it couldn't fully trace)")
+    if not gaps:
+        return (
+            "\n" + banner + "\n\n  " + p.green("✔ ")
+            + "Every write's content was fully traced" + "\n"
+        )
+
+    groups: "Dict[str, List[Gap]]" = {}
+    for g in gaps:
+        groups.setdefault(g.path, []).append(g)
+
+    out: List[str] = ["", banner, ""]
+    for path, group in groups.items():
+        out.append(p.bold(p.underline(_relpath(path))))
+        loc_w = max(len(f"{g.line}:{g.col}") for g in group)
+        body_indent = " " * (6 + loc_w)
+        for g in group:
+            loc = f"{g.line}:{g.col}".rjust(loc_w)
+            out.append(
+                f"  {p.yellow('?')} {p.dim(loc)}  {p.bold(g.sink + ' write')} "
+                f"{p.dim('· ' + (g.snippet or ''))}"
+            )
+            out.append(p.dim(_wrap(g.reason, body_indent, width)))
+        out.append("")
+
+    out.append(p.dim("─" * 56))
+    out.append(
+        "  " + p.yellow(f"? {len(gaps)} blind spot(s)")
+        + p.dim("   · not failures — places a missed flap could hide, review each")
+    )
     out.append("")
     return "\n".join(out)
 

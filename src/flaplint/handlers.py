@@ -151,6 +151,13 @@ class Handler:
     callbacks they care about.
     """
 
+    #: When True, the traversal computes and reports blind spots via :meth:`gap`.
+    #: Off by default so a normal run pays nothing for the gap analysis.
+    wants_gaps: bool = False
+
+    def gap(self, node: ast.AST, sink: str, reason: str) -> None:
+        """Called for a write whose content couldn't be fully traced (``--explain-gaps``)."""
+
     def sink(
         self,
         node: ast.AST,
@@ -309,9 +316,36 @@ class ReportHandler(Handler):
     ``(path, line, via)`` born-site pointer (or ``None``).
     """
 
-    def __init__(self, fi: FuncInfo, sink_out: List[Tuple]) -> None:
+    def __init__(self, fi: FuncInfo, sink_out: List[Tuple], gaps_out=None) -> None:
         self.fi = fi
         self.out = sink_out
+        self.gaps_out = gaps_out
+
+    @property
+    def wants_gaps(self) -> bool:
+        return self.gaps_out is not None
+
+    def gap(self, node, sink, reason) -> None:
+        from .model import Gap
+
+        snippet = ""
+        if hasattr(ast, "unparse"):
+            try:
+                snippet = ast.unparse(node)
+            except Exception:
+                snippet = ""
+        if len(snippet) > 70:
+            snippet = snippet[:67] + "…"
+        self.gaps_out.append(
+            Gap(
+                self.fi.path,
+                getattr(node, "lineno", 0),
+                getattr(node, "col_offset", 0) + 1,
+                sink,
+                reason,
+                snippet,
+            )
+        )
 
     def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
         # Only locally-born unstable values are concrete bugs at this site;

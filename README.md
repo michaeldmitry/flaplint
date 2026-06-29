@@ -123,6 +123,7 @@ for f in findings:
 | `--sort {criticality,location}` | finding order: most severe first, or by file location (default `criticality`) |
 | `--format {pretty,concise,json}` | output style: grouped colour report (`pretty`, default), one-line-per-finding for editors/grep (`concise`), or machine `json` |
 | `--json` | alias for `--format json` |
+| `--explain-gaps` | also list **blind spots**: writes whose content flaplint couldn't fully trace (an unresolved library call, a value-object field, an untraced parameter). Not findings, never fail the run — a worklist of where a missed flap could hide |
 
 > Colour in `pretty` mode is emitted only to a terminal; it auto-disables when
 > piped or in CI, and honours the `NO_COLOR` / `FORCE_COLOR` conventions.

@@ -16,7 +16,7 @@ from typing import Dict, List, Set, Tuple
 
 from .constants import ORDERED_ANNOTATIONS, UNORDERED_ANNOTATIONS
 from .handlers import ReportHandler
-from .model import Finding, FuncInfo
+from .model import Finding, FuncInfo, Gap
 from .traversal import FunctionAnalyzer
 
 #: Annotations that name a *concrete object type* whose ordering a caller cannot
@@ -52,9 +52,11 @@ def report(
     functions: List[FuncInfo],
     analyzer: FunctionAnalyzer,
     suppressed: Dict[str, Set[int]],
-) -> List[Finding]:
-    """Produce the deduplicated, suppression-aware list of findings."""
+    explain_gaps: bool = False,
+) -> "Tuple[List[Finding], List[Gap]]":
+    """Produce the deduplicated, suppression-aware findings (and, optionally, gaps)."""
     findings: List[Finding] = []
+    gaps: List[Gap] = []
     seen: Set[Tuple[str, int, int, str]] = set()
 
     def emit(
@@ -106,7 +108,10 @@ def report(
 
         # caller findings: local unordered/volatile value -> sink.
         sink_out: List[Tuple] = []
-        analyzer.analyze(fi, ReportHandler(fi, sink_out))
+        gaps_out: "List[Gap]" = [] if explain_gaps else None
+        analyzer.analyze(fi, ReportHandler(fi, sink_out, gaps_out))
+        if gaps_out:
+            gaps.extend(gaps_out)
         for node, conf, rule, sink, variable, path, origin in sink_out:
             emit(path, node, "caller", conf, rule, sink, variable, origin)
             if rule == "unordered-iteration":
@@ -171,4 +176,20 @@ def report(
             continue  # a traced caller already reported this iteration at high conf
         emit(ipath, inode, "sink", conf, "unordered-iteration", "databag", pname)
 
-    return findings
+    # A gap on a line that already produced a finding is redundant -- the finding
+    # already tells you to look there. Drop those, and de-duplicate the rest.
+    if gaps:
+        finding_lines = {(f.path, f.line) for f in findings}
+        deduped: List[Gap] = []
+        seen_gaps: Set[Tuple[str, int, int, str]] = set()
+        for g in gaps:
+            if (g.path, g.line) in finding_lines:
+                continue
+            key = (g.path, g.line, g.col, g.reason)
+            if key in seen_gaps:
+                continue
+            seen_gaps.add(key)
+            deduped.append(g)
+        gaps = sorted(deduped, key=lambda g: (g.path, g.line, g.col))
+
+    return findings, gaps

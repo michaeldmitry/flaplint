@@ -8,7 +8,7 @@ import sys
 from typing import List, Optional
 
 from .analyzer import Analyzer
-from .render import colour_enabled, render_report
+from .render import colour_enabled, render_gaps, render_report
 
 _DESCRIPTION = (
     "Detect order-unstable values written to Juju relation data, which cause "
@@ -86,6 +86,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--json", action="store_true", help="alias for --format json")
     parser.add_argument(
+        "--explain-gaps",
+        action="store_true",
+        help="also list blind spots: writes whose content flaplint couldn't fully "
+        "trace (an unresolved library call, a value-object field, an untraced "
+        "parameter). These are NOT findings and never fail the run -- they're a "
+        "worklist of where a missed flap could hide.",
+    )
+    parser.add_argument(
         "--relations-unordered",
         action="store_true",
         help="treat model.relations[name] iteration as an unordered source "
@@ -108,21 +116,32 @@ def main(argv: Optional[List[str]] = None) -> int:
         relations_unordered=args.relations_unordered,
         min_confidence=args.min_confidence,
         sort=args.sort,
+        explain_gaps=args.explain_gaps,
     )
     findings = analyzer.run()
+    gaps = analyzer.gaps
 
     fmt = "json" if args.json else args.format
 
     if fmt == "json":
-        print(json.dumps([f.__dict__ for f in findings], indent=2))
+        payload = [f.__dict__ for f in findings]
+        if args.explain_gaps:
+            payload = {
+                "findings": payload,
+                "gaps": [g.__dict__ for g in gaps],
+            }
+        print(json.dumps(payload, indent=2))
     elif fmt == "concise":
         for finding in findings:
             print(finding.format())
+        for gap in gaps:
+            print(gap.format())
         errors = sum(1 for f in findings if f.level == "error")
         warnings = len(findings) - errors
+        gap_note = f", {len(gaps)} blind spot(s)" if args.explain_gaps else ""
         print(
             f"\n{len(findings)} potential issue(s): "
-            f"{errors} error(s), {warnings} warning(s) "
+            f"{errors} error(s), {warnings} warning(s){gap_note} "
             f"in {len(analyzer.primary_files)} file(s).",
             file=sys.stderr,
         )
@@ -133,6 +152,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             colour=colour_enabled(sys.stdout),
         )
         print(report)
+        if args.explain_gaps:
+            print(render_gaps(gaps, colour=colour_enabled(sys.stdout)))
 
     # Only charm-owned (error) findings fail the run; dependency warnings don't.
     return 1 if any(f.level == "error" for f in findings) else 0

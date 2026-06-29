@@ -54,6 +54,7 @@ class Analyzer:
         relations_unordered: bool = False,
         min_confidence: str = "medium",
         sort: str = "criticality",
+        explain_gaps: bool = False,
     ) -> None:
         self.paths = list(paths)
         self.deps = list(deps)
@@ -64,8 +65,10 @@ class Analyzer:
         self.relations_unordered = relations_unordered
         self.min_confidence = min_confidence
         self.sort = sort
+        self.explain_gaps = explain_gaps
         self.primary_files: List[str] = []
         self.secondary_files: List[str] = []
+        self.gaps: List = []
 
     def run(self) -> List[Finding]:
         """Execute every pass and return the filtered, sorted findings."""
@@ -116,7 +119,7 @@ class Analyzer:
         analyzer = FunctionAnalyzer(engine)
         mark_databag_accessors(functions, registry)
         compute_summaries(functions, analyzer)
-        findings = report(functions, analyzer, suppressed)
+        findings, gaps = report(functions, analyzer, suppressed, self.explain_gaps)
 
         threshold = CONFIDENCE_RANK[self.min_confidence]
         findings = [f for f in findings if CONFIDENCE_RANK[f.confidence] >= threshold]
@@ -135,6 +138,10 @@ class Analyzer:
             )
         self._classify_levels(findings)
         self._relativize(findings)
+        cwd = os.getcwd()
+        for g in gaps:
+            g.path = os.path.relpath(os.path.abspath(g.path), cwd)
+        self.gaps = gaps
         return findings
 
     def _classify_levels(self, findings: List[Finding]) -> None:

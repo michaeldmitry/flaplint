@@ -20,13 +20,65 @@ from .constants import (
     HASH_CALLS,
     ISINSTANCE_ORDERED_TYPES,
     MAPPING_WRITE_METHODS,
+    MODEL_SERIALIZERS,
+    NONSORTING_SERIALIZERS,
     PLAN_WRITE_DESC,
+    PROPAGATE_CALLS,
     RENDER_SERIALIZERS,
+    SANITIZER_CALLS,
+    STR_SPLIT_METHODS,
+    TEMPLATE_RENDER_METHODS,
+    UNORDERED_ATTRS,
+    UNORDERED_CALLS,
+    VOLATILE_CALLS,
 )
 from . import databag
 from .handlers import Handler
 from .model import FuncInfo, Origin, Registry
 from .taint import TaintEngine
+
+
+#: Call names that don't introduce ordering/volatility instability, so a call to one
+#: in a write's content is *not* a blind spot. Deterministic string/scalar transforms
+#: and order-independent builtins (``min``/``max``/``sum`` of a set give the same
+#: result whatever the order). Used only by the ``--explain-gaps`` blind-spot scan;
+#: tune freely -- a name missing here only costs a (benign) gap entry, never a finding.
+_BENIGN_CALLS = frozenset(
+    {
+        # string / bytes / scalar transforms
+        "get", "format", "format_map", "strip", "lstrip", "rstrip", "replace",
+        "lower", "upper", "title", "capitalize", "casefold", "swapcase",
+        "removeprefix", "removesuffix", "zfill", "ljust", "rjust", "center",
+        "encode", "decode", "hex", "digest", "hexdigest",
+        "b64encode", "b64decode", "b16encode", "b16decode", "b32encode", "b32decode",
+        "loads", "load", "isoformat", "startswith", "endswith",
+        # reading a file returns its (deterministic) content -- for a hash/file write
+        # that *is* the intended change-detector input, not an ordering source
+        "read", "read_text", "read_bytes", "readline", "readlines",
+        # order-independent builtins
+        "str", "repr", "int", "float", "bool", "bytes", "len", "abs", "round",
+        "min", "max", "sum", "any", "all", "ord", "chr", "getattr", "cast",
+        # path helpers
+        "basename", "dirname", "splitext", "abspath", "expanduser", "as_posix",
+    }
+)
+
+#: Call names the taint engine already understands (sources, sinks-as-content,
+#: sanitisers, serialisers, propagators, …). A call to one of these is fully
+#: accounted for -- never a blind spot.
+_ENGINE_KNOWN_CALLS = (
+    SANITIZER_CALLS
+    | UNORDERED_CALLS
+    | VOLATILE_CALLS
+    | PROPAGATE_CALLS
+    | STR_SPLIT_METHODS
+    | TEMPLATE_RENDER_METHODS
+    | NONSORTING_SERIALIZERS
+    | MODEL_SERIALIZERS
+    | BUILTIN_COLLECTION_METHODS
+    | HASH_CALLS
+    | {"dumps", "dump", "safe_dump"}
+)
 
 
 @dataclass
@@ -176,6 +228,86 @@ class FunctionAnalyzer:
                     out[kw.arg] = t
         return out
 
+    # -- blind-spot (gap) detection (--explain-gaps) ------------------------
+
+    def _gap_check(
+        self, content: ast.AST, sink: str, ctx: Context, handler: Handler
+    ) -> None:
+        """Report parts of a write's ``content`` that flaplint couldn't trace.
+
+        A *gap* is where the analysis gives up -- an unresolved call, a value-object
+        field it doesn't model, an untraced parameter -- so it's where a missed flap
+        could hide. No-ops unless the handler is collecting gaps. See :class:`Gap`.
+        """
+        if not handler.wants_gaps:
+            return
+        seen = set()
+        for node, reason in self._content_gaps(content, sink, ctx):
+            key = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0), reason)
+            if key not in seen:
+                seen.add(key)
+                handler.gap(node, sink, reason)
+
+    def _content_gaps(self, content: ast.AST, sink: str, ctx: Context):
+        """Yield ``(node, reason)`` for each untraceable part of ``content``."""
+        for sub in ast.walk(content):
+            if isinstance(sub, ast.Call):
+                if not self._call_accounted(sub, ctx):
+                    name = astutils.final_attr(sub.func) or "?"
+                    yield sub, (
+                        f"calls `{name}(...)`, which flaplint can't see into "
+                        "(an external library?) — if it can return unordered data, "
+                        "an unstable value here would be missed"
+                    )
+            elif isinstance(sub, ast.Attribute):
+                recv = sub.value
+                if (
+                    isinstance(recv, ast.Name)
+                    and recv.id in ctx.types
+                    and not self._attr_accounted(sub, ctx)
+                ):
+                    yield sub, (
+                        f"reads `.{sub.attr}` off `{recv.id}`, a value object whose "
+                        "fields flaplint doesn't fully track (e.g. one buried in a "
+                        "dict, or rebuilt by a method)"
+                    )
+            elif (
+                isinstance(sub, ast.Name)
+                and sink in ("file", "plan", "hash")
+                and sub.id not in ("self", "cls")
+            ):
+                origins = ctx.env.get(sub.id)
+                if origins and any(
+                    isinstance(o, tuple) and o[0] == "param" for o in origins
+                ):
+                    yield sub, (
+                        f"depends on parameter `{sub.id}`, not traced to its callers "
+                        f"(a {sink} write gets no caller-contract check, so an "
+                        "unordered caller would be missed)"
+                    )
+
+    def _call_accounted(self, call: ast.Call, ctx: Context) -> bool:
+        """True if the engine understands this call (so it's not a blind spot)."""
+        name = astutils.final_attr(call.func) or ""
+        name = self.engine._aliases.names.get(name, name)
+        if name in _ENGINE_KNOWN_CALLS or name in _BENIGN_CALLS:
+            return True
+        return bool(self._resolve_methods(call, ctx))
+
+    def _attr_accounted(self, node: ast.Attribute, ctx: Context) -> bool:
+        """True if a field read resolves to tracked taint or a known property."""
+        if node.attr in UNORDERED_ATTRS:
+            return True
+        path = astutils.attr_path(node)
+        if path is not None and path in ctx.env:
+            return True
+        recv_cls = self.engine._receiver_class(node.value, ctx.cls)
+        if recv_cls is not None:
+            for fi in self.registry.get(node.attr, []):
+                if fi.is_property and fi.class_name == recv_cls:
+                    return True
+        return False
+
     def _accessor_kind(self, attr: str, ctx: Context):
         """Return kind of ``self.<attr>`` resolved against this class's accessors."""
         if not ctx.cls:
@@ -294,6 +426,7 @@ class FunctionAnalyzer:
                         sub.args[0],
                         "hash",
                     )
+                self._gap_check(sub.args[0], "hash", ctx, handler)
             fwrite = astutils.file_write_args(sub)
             if fwrite is not None:
                 fmethod, fwargs = fwrite
@@ -309,6 +442,8 @@ class FunctionAnalyzer:
                         fwargs[0],
                         "file",
                     )
+                if fwargs:
+                    self._gap_check(fwargs[0], "file", ctx, handler)
             pwrite = astutils.plan_write_args(sub)
             if pwrite is not None:
                 _, pwargs = pwrite
@@ -329,6 +464,8 @@ class FunctionAnalyzer:
                         pwargs[0],
                         "plan",
                     )
+                if pwargs:
+                    self._gap_check(pwargs[0], "plan", ctx, handler)
             margs = None
             if (
                 isinstance(sub.func, ast.Attribute)
@@ -352,6 +489,8 @@ class FunctionAnalyzer:
                         margs[0],
                         "databag",
                     )
+                if margs:
+                    self._gap_check(margs[0], "databag", ctx, handler)
             elif any(
                 self._is_databag_object(a, ctx)
                 for a in (*sub.args, *(kw.value for kw in sub.keywords))
@@ -457,6 +596,8 @@ class FunctionAnalyzer:
                         v.args[0] if v.args else v,
                         "file",
                     )
+                if v.args:
+                    self._gap_check(v.args[0], "file", ctx, handler)
             handler.ret(self._eval(stmt.value, ctx))
             handler.ret_fields(self._returned_field_map(stmt.value, ctx))
             return
@@ -480,8 +621,10 @@ class FunctionAnalyzer:
         self._scan_expr(stmt.value, ctx, handler)
         taint = self._eval(stmt.value, ctx) | self._ctor_field_taint(stmt.value, ctx)
         for tgt in stmt.targets:
-            if self._is_databag_target(tgt, ctx) and taint:
-                handler.sink(stmt, taint, "direct", "relation databag", stmt.value)
+            if self._is_databag_target(tgt, ctx):
+                if taint:
+                    handler.sink(stmt, taint, "direct", "relation databag", stmt.value)
+                self._gap_check(stmt.value, "databag", ctx, handler)
         for tgt in stmt.targets:
             if isinstance(tgt, ast.Name):
                 ctx.env[tgt.id] = set(taint)

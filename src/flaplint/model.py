@@ -186,6 +186,32 @@ class Finding:
 
 
 @dataclass
+class Gap:
+    """A blind spot: a write whose content flaplint could not fully trace.
+
+    Emitted only under ``--explain-gaps``. A gap is *not* a finding -- it's a place
+    the analysis gave up, so it's where a missed flap (a false negative) could hide.
+    Each names the write, the kind of target it reaches, and *why* the content
+    couldn't be traced (an unresolved call, a value-object field, an untraced
+    parameter). Diagnostic only: gaps never change the exit code.
+    """
+
+    path: str
+    line: int
+    col: int
+    sink: str  # the write target reached: "databag" | "file" | "plan" | "hash"
+    reason: str  # plain-English description of what couldn't be traced
+    snippet: str = ""  # the un-traced expression, for quick scanning
+
+    def format(self) -> str:
+        """Render as ``path:line:col: gap sink=... reason=...`` structured fields."""
+        return (
+            f"{self.path}:{self.line}:{self.col}: gap sink={self.sink} "
+            f"reason={self.reason}"
+        )
+
+
+@dataclass
 class FuncInfo:
     """A discovered function plus the interprocedural summary computed for it.
 
