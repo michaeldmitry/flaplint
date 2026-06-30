@@ -62,11 +62,14 @@ The trade-off is honesty about uncertainty. When where a value really came from 
 Install the package and a `flaplint` command is put on your `PATH`:
 
 ```bash
-pip install -e .          # or: uv pip install -e .
+uv pip install -e .       # or, with plain pip: pip install -e .
 ```
 
 You can also run it without installing, straight from the source tree, via
 `python -m flaplint`.
+
+To work on flaplint itself, `uv sync` builds a locked `.venv` with the dev group
+(pytest + ops) and `uv run pytest` runs the suite — see [AGENTS.md](AGENTS.md#setup--commands).
 
 ```bash
 # the common case: scan a charm's src/ (its sibling lib/ is auto-included)

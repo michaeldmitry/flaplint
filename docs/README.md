@@ -22,10 +22,16 @@ Read in order, or jump to the part you're changing:
    vendored libraries and installed dependencies, and the `--venv` / `--auto-deps` /
    `--python` flags.
 
+5. **[ops-version-anchoring.md](ops-version-anchoring.md)** — which ops version the
+   ops/pebble anchors are valid for (the supported-Juju-LTS window), why flaplint's
+   verdict is ops-version-invariant, and the labelled-corpus + oracle machinery that
+   turns an ops drift into a loud test failure.
+
 ## Quick orientation
 
 | If you want to… | Read |
 |---|---|
+| know **what technique** the tool is based on, and the standard term for each concept | [architecture.md → Background: this is taint analysis](architecture.md#background-this-is-taint-analysis) |
 | add a new unordered **source** (a new set-like call) | [taint-model.md → Where unstable values come from](taint-model.md#where-unstable-values-come-from) |
 | make the engine recognise a new **serializer** | [taint-model.md → What each serializer does](taint-model.md#what-each-serializer-does) |
 | recognise a new **write target** (a new databag/file call) | [sinks-and-findings.md → The four kinds of write target](sinks-and-findings.md#the-four-kinds-of-write-target) |

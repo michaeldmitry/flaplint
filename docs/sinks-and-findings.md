@@ -6,8 +6,16 @@ write targets) and **how "an unstable value reaches a write" turns into a findin
 
 ## The four kinds of write target
 
-A *write target* (shown as `sink=` in the output) is a place where unstable text
-causes real, repeated work. There are four kinds.
+A *write target* is the **sink** in taint-analysis terms — the place where unstable text
+(the taint) causes real, repeated work if it arrives. It's shown as `sink=` in the
+output, and there are four kinds.
+
+> **One word, two uses.** `sink=` in a finding names *which write target* the value
+> reached (`sink=databag`, `sink=file`, …). That is the taint-analysis *sink*. Later,
+> `kind=sink` names a *different* thing — a finding category meaning "a helper trusts its
+> caller" ([below](#whose-code-to-fix-caller-vs-sink)). The overlap is unfortunate but
+> baked into the output vocabulary; read `sink=` as "the write target" and `kind=sink` as
+> "the trusts-its-caller case".
 
 ### `databag` — writing to relation data
 

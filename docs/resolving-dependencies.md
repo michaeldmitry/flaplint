@@ -75,11 +75,20 @@ narrow it down with two cheap checks:
    outright).
 
 2. **A quick databag-write check:** for each imported package, a fast read of its code
-   keeps it **only if it really writes to a relation databag**. The three shapes that
-   count:
+   keeps it **only if it looks like it writes to a relation databag**. The three shapes
+   that count:
    - `relation.data[entity][key] = …` (assignment)
    - `relation.save(obj, entity)` (the ops typed-databag call)
    - `relation.data[entity].update(…)` / `.setdefault(…)` (mapping writes)
+
+   These are the same write shapes the engine recognises, but matched here by
+   **structure alone** — without the Relation-provenance tracing the engine applies when
+   it actually reports (it does not check that the receiver traces back to a
+   `get_relation(...)`). That makes this a fast, deliberately **loose**
+   over-approximation: a false match only costs reading one extra file (which is then
+   analysed precisely, so it can't produce a false finding), whereas missing a
+   databag-writing dep *would* cause a false negative — so erring toward inclusion is the
+   right bias.
 
 That's why the `charmlibs.interfaces.otlp` requirer, which publishes via
 `relation.save(databag, self._charm.app)`, is correctly picked as a dependency worth

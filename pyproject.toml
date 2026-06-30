@@ -22,11 +22,13 @@ classifiers = [
 # The analyzer is deliberately stdlib-only (ast). No runtime dependencies.
 dependencies = []
 
-[project.optional-dependencies]
-# ``ops`` is a *test-only* dependency, used solely by tests/test_api_anchors.py to
-# guard against drift in the ops/pebble API surface flaplint anchors on. The
-# analyzer itself never imports it (it reads source as text). The anchor test
-# skips when ops is absent, so this only needs installing to exercise that guard.
+[dependency-groups]
+# Dev tooling, installed by ``uv sync`` and on ``uv run`` automatically (no flags).
+# ``pytest`` runs the suite. ``ops`` is a *test-only* dependency, used solely by the
+# drift suite under tests/drift/ (test_api_anchors.py + test_corpus.py's oracle) to
+# guard against drift in the ops/pebble API surface flaplint anchors on. The analyzer
+# itself never imports ops (it reads source as text), and the drift tests skip when ops
+# is absent — so a bare ``uv pip install .`` of the tool itself needs none of this.
 dev = ["pytest>=7.0", "ops"]
 
 [project.scripts]
@@ -40,6 +42,10 @@ packages = ["src/flaplint"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Keep ``tests/`` importable from any subdir (tests/unit/, tests/drift/) so shared
+# helpers like ``from conftest import details`` resolve after the split into
+# categorised subdirectories.
+pythonpath = ["tests"]
 addopts = "-ra"
 
 [tool.ruff]

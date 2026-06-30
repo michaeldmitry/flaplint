@@ -19,9 +19,14 @@ package lives in `src/flaplint/`.
 
 - **Stdlib-only.** No runtime dependencies (`pyproject.toml` `dependencies = []`).
   Do **not** add third-party runtime deps — the analyser must run anywhere with a
-  bare interpreter. `pytest` is the only dev dependency.
-- **Run the test suite** (fast — ~0.5s) from the project root
-- **Run the linter** via the `flaplint` console script or the module — both work.
+  bare interpreter. Dev tooling lives in the `dev` **dependency-group** (`pytest`
+  plus `ops`, the test-only drift dependency), not in runtime deps.
+- **Managed with uv against a committed `uv.lock`.** `uv sync` provisions a locked
+  `.venv` with the dev group; after changing `pyproject.toml` deps, run `uv lock`
+  and commit the updated `uv.lock`.
+- **Run the test suite** (fast — ~0.5s) from the project root: `uv run pytest`.
+- **Run the linter** via `uv run flaplint …`, the installed console script, or the
+  module (`python -m flaplint`) — all work.
 
 ## Architecture (orientation)
 

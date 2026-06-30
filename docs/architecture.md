@@ -9,12 +9,13 @@ change the tool; read [taint-model.md](taint-model.md) and
 `flaplint` follows values from where they're created to where they're written, and
 reports the ones that are still unstable when they get written. Three parts:
 
-- **Where values start** — here, values with no fixed text order, like a `set`, a
-  directory listing, or a `uuid4()`.
-- **Following them** — watching each value as it's copied, transformed, and passed
-  around.
-- **Where they land** — the places that cause trouble: a relation databag, a file, a
-  pebble plan, or a content hash.
+- **Where values start** — the **sources**: values with no fixed text order, like a
+  `set`, a directory listing, or a `uuid4()`.
+- **Following them** — **propagation**: watching each value as it's copied, transformed,
+  and passed around (and noting the **sanitisers**, like `sorted()`, that make it safe).
+- **Where they land** — the **sinks**: the places that cause trouble — a relation
+  databag, a file, a pebble plan, or a content hash.
+
 
 flaplint marks a value where it starts, follows it, and reports a problem when it
 reaches one of those places while still unstable.
@@ -31,11 +32,40 @@ What counts as a starting point, and how following changes a value, is the subje
 [taint-model.md](taint-model.md); where values land is in
 [sinks-and-findings.md](sinks-and-findings.md).
 
-One thing shapes the whole design: a value is usually *created* in one function and
-*written* in another. So flaplint also works out, for each function, what it does to
-the values passing through it — and reuses that instead of re-reading the function on
-every call. That is the [summary loop](#following-values-across-function-calls), and
-it's the bulk of this document.
+
+## Background: this is taint analysis
+
+`flaplint` core analysis is inspired by a standard static-analysis technique called
+**taint analysis** (also *taint tracking* or *information-flow analysis*), pointed at a
+new question.
+
+Classic taint analysis comes from security: mark data from an untrusted **source** (a
+web form), follow it as it flows through the program, and raise an alarm if it reaches a
+dangerous **sink** (a SQL query) without passing through a **sanitiser** (an escaper) on
+the way. flaplint keeps that machinery and changes only what "tainted" *means*: here a
+value is tainted when its **derived from an unordered/volatile source**. A `set` is a source, a databag is a sink, and `sorted()` is a
+sanitiser.
+
+These are the terms the rest of the documentation uses, and where each one is covered:
+
+| term | what it means in flaplint |
+|---|---|
+| **source** | where taint enters: an unordered or volatile value — `set`, `glob`, `uuid4` ([where it comes from](taint-model.md#where-unstable-values-come-from)) |
+| **sink** | where taint causes harm if it arrives: a write target — databag, file, plan, hash ([the four sinks](sinks-and-findings.md)) |
+| **sanitiser** | a step that removes taint: `sorted()`, and a key-sorting serializer for the `local` kind ([what makes it safe](taint-model.md#things-that-make-it-safe-the-sanitisers)) |
+| **propagation** | how taint moves through an operation ([how a value changes as it moves](taint-model.md#how-a-value-changes-as-it-moves)) |
+| **taint label / abstract domain** | *what kind* of taint a value carries ([the six kinds of instability](taint-model.md#the-six-kinds-of-instability)) |
+| **flow-sensitive** | taint tracked per program point, not once per variable ([walking one function](#zooming-in-walking-one-function)) |
+| **interprocedural, with function summaries** | reuse a per-function result instead of re-analysing it at each call ([the summary loop](#following-values-across-function-calls)) |
+| **fixed-point / monotone iteration** | repeat until nothing changes; each pass only adds facts ([why it has to be a loop](#why-it-has-to-be-a-loop-the-fixed-point)) |
+| **forward analysis** | follow values source → sink, not sink → source ([why forward, not backward](#why-the-analysis-runs-forward-not-backward)) |
+| **field-sensitivity** | track taint per object field, not per whole object ([through object fields](#following-values-through-object-fields-and-where-it-stops)) |
+
+What *is* specific to flaplint is the **abstract domain** — the set of taint values. A
+security checker usually carries one bit (tainted or not); flaplint carries one of
+[six labels](taint-model.md#the-six-kinds-of-instability) describing *why* a value is
+unstable, because the right fix differs by kind — and, in particular, whether letting a
+serializer sort the keys is enough.
 
 ## The pipeline
 
@@ -97,8 +127,11 @@ databag a few calls away. To connect the two, flaplint needs to know what each f
 does to the values passing through it — without re-reading that function every time
 it's called.
 
-That knowledge is a **summary**: a few facts stored on each function, answering a fixed
-list of questions.
+That knowledge is a **function summary** — the standard device that makes taint analysis
+*interprocedural*: a few facts stored on each function, computed once and looked up at
+every call instead of re-analysing the callee. (A summary that records the taint of
+*each parameter* separately, as flaplint's does, is the lightweight form of what the
+literature calls a **context-sensitive** summary.)
 
 ### The questions a summary answers
 
@@ -127,7 +160,12 @@ passed in and what comes back out. So for every function, the summary answers:
 Answer those for every function and the report stage never has to re-analyse a callee.
 It just looks up the answers.
 
-### Why it has to be a loop
+### Why it has to be a loop (the fixed point)
+
+This repeat-until-nothing-changes loop is a **fixed-point iteration**, the standard way
+these analyses terminate: because each pass only ever *adds* taint facts and never
+removes one (a **monotone** update), repeating it is guaranteed to settle on a single
+stable answer — the *fixed point* — regardless of the order functions are visited in.
 
 The answers depend on each other. To answer question 1 for function `A`, you often need
 to know whether the helper `A` calls is *itself* unsafe — the answers for `B`. And `B`
@@ -270,6 +308,20 @@ and comprehensions are the language itself. `glob`, `listdir`, `uuid4`, `time`,
 `sorted`, `list`, `json.dumps`, and `sort_keys=True` are standard-library names that
 have been stable for years.
 
+These are matched as **names in the source text**, never resolved against a real
+stdlib — so flaplint isn't bound to any Python version (a charm written for 3.8 or 3.12
+is read the same), and there's no version-drift to track the way the ops anchors need.
+Python's backward-compatibility policy keeps the names frozen, so that surface barely
+moves. The one *semantic* shift that mattered — dicts becoming insertion-ordered in
+3.7 — is already baked in (a dict built in an unstable order flaps even through
+`json.dumps` without `sort_keys`), and every charm runs 3.8+. The residual risks are
+small and *not* about Python versions: a brand-new source/serializer would be missed
+(a false negative, the same slow "new shape" upkeep as the ops edge — most likely a
+third-party serializer like `orjson`, not stdlib), and because matching is on the bare
+final name, a charm's own method that happens to be called `now`/`sample`/`choice`
+could be mistaken for the stdlib one (a rare false positive; renamed *imports* are
+already resolved, but same-named methods can't be told apart).
+
 **Only a small edge is tied to the charm world** — a handful of ops/pebble shapes and
 names:
 
@@ -322,7 +374,7 @@ as long as it uses the same shapes (`relation.data[...]`, `relation.units`,
 invented a new write shape flaplint doesn't know, the result is a *missed* write — a
 false negative — not a crash or a false alarm. That's the gentler failure, but it's
 quiet: you wouldn't notice coverage had dropped. To make it loud,
-`tests/test_api_anchors.py` checks that each ops/pebble anchor still exists; if a
+`tests/drift/test_api_anchors.py` checks that each ops/pebble anchor still exists; if a
 dependency bump removes or renames one, that test fails and points at the anchor to
 update. (The real maintenance task isn't ops renaming stable things — it's adding new
 write shapes as the ecosystem introduces them.)
@@ -388,6 +440,22 @@ object isn't flagged — and is stored as a combined name (`"ctx.targets"`). It 
 construction (`Ctx(field=…)`), a field write (`ctx.field = …`), a simple alias
 (`a = ctx`), and the across-function return (`returns_field_origins`).
 
+**Instance attributes carry across methods too** — the dominant charm idiom of building
+a value in `__init__` and reading it back in a handler:
+
+```python
+# followed (class-level instance-attribute taint)
+def __init__(self): self._hosts = set(self.peers)     # parked on self in one method…
+def reconcile(self): push(",".join(self._hosts))      # …read back in another → flagged
+```
+
+This is a class-level union of every `self.<attr> = <expr>` taint, keyed on
+`(class, attr)`, settled over the same fixed point (a class can't finish until every
+method that assigns the attribute has been seen). It stays field-sensitive (a clean
+`self._ip` isn't tainted by a dirty `self._members`) and respects a later
+`self.x = sorted(self.x)`. Born-sites are pinned to the assigning method, so the finding
+blames the `set()` in `__init__`, not the reader's serializer.
+
 What it still does **not** follow:
 
 ```python
@@ -397,29 +465,60 @@ push(json.dumps(self.render()))                       # …a method rebuilds it 
 a.b.c = set(x)                                         # deeper than one level
 ```
 
+(The instance-attribute union is deliberately conservative — if an attribute is assigned
+*both* a dirty and a clean value in different methods, it stays tainted. That errs toward
+a reviewable finding rather than a silent miss, matching the contract-boundary stance.)
+
 The remaining real-world miss is a value *buried in a dict* before being stored, or one
 *rebuilt by a method* of the object rather than read straight off a field (the cos-proxy
 `ScrapeJobContext` shape). And when the consumer is a library you don't analyse that
 reads the field and writes the bag itself, the value reaches the boundary but has no
 in-repo write to pin a finding to.
 
+#### The subtlest case: a model dump hides a list field's order
+
+The hardest version of this barrier is a Pydantic (or dataclass) **serializer applied to
+the whole object**. flaplint treats `model_dump_json()` / `model_dump()` as a full
+launder: a model writes its fields in a fixed *name* order, so for a model of plain
+scalar and dict fields the dump genuinely removes all ordering instability. But that's
+only true field-name-deep. A model whose *field is itself a list*, built from an
+unordered source, still flaps — the dump writes that list in element order:
+
+```python
+class UnitData(BaseModel):
+    dashboards: list[str]            # built from glob(...) — element order is unstable
+
+data = UnitData(dashboards=list(glob.glob("*.json")))
+relation.data[app]["d"] = data.model_dump_json()   # field NAMES fixed; the list inside is NOT
+```
+
+Deciding this correctly needs the model's **schema** — the type of each field — so
+flaplint could reason "field-name order: fixed; this field is a `list`, its element
+order survives; that field is an `int`, irrelevant." flaplint never reads the model
+definition, so it can't make that per-field call: it treats the whole dump as safe and
+misses the flap. For exactly this reason `.json()` and `.dict()` are deliberately *not*
+on the serializer list — unlike `model_dump*`, they still inherit the receiver's taint,
+so they *catch* the list-field flap. (`tests/unit/test_field_provenance.py` pins that down
+with the real cos-proxy / postgresql `.json()`-of-a-list-field case.)
+
+This is the same wall as the dict-burial case above, one level deeper — and it's why
+**full dataclass / pydantic traversal is a large undertaking, not a small fix.** Doing
+it properly needs three analyses flaplint doesn't have, each substantial on its own:
+
+- a **schema pass** — resolve the model/dataclass definition to learn each field's type,
+  so a serializer can be judged per field instead of all-or-nothing;
+- **alias analysis** — objects are shared, mutable references (`b = a; b.x = …` taints
+  `a.x`; passing a model into an opaque helper may mutate it), which is undecidable in
+  general and only ever approximated;
+- **per-field-type-aware serialization** — the rule that a dump launders field *names*
+  but not a list field's *elements*, applied field by field.
+
+So the tool tracks one shallow field level precisely and reports everything deeper as a
+[blind spot](sinks-and-findings.md) under `--explain-gaps`, rather than guessing and
+risking either a false alarm or (worse, as the `model_dump*` case shows) a silent miss.
+
 This is a limit of what flaplint models, not of which direction it runs: a "start at the
 write and walk back" design would hit the same wall — it would still need to model
-values flowing through dict entries and method-rebuilt object state.
+values flowing through dict entries, method-rebuilt object state, and per-field model
+schemas.
 
-### A "trusts its caller" finding lands on the direct writer, not on forwarders
-
-When a function writes one of its *parameters* somewhere, it gets a just-in-case
-[trusts-its-caller finding](sinks-and-findings.md#when-a-helper-trusts-its-caller)
-graded by that parameter's type hint. But this only applies to the function that does
-the write **directly**. A function that merely passes a parameter *along* to another
-writer doesn't get its own finding.
-
-That means the finding lands on whichever helper does the actual write — often a generic
-one (a `write_to_file(content)` / `set_data(data)`), where the parameter has no hint —
-rather than on the caller that gave the value a meaningful hint
-(`enabled_log_files: Iterable`). So a precise, high-confidence finding on the hinted
-parameter several calls up isn't produced. Surfacing it would mean flagging every
-forwarded parameter, which would be far too noisy, so the tool deliberately doesn't.
-(These trusts-its-caller findings also cover databag writes only, not file or hash
-writes.)

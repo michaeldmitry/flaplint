@@ -8,8 +8,8 @@ the next dependency bump and points at the anchor that needs updating.
 
 Each test names where flaplint relies on the anchor, so a failure is actionable.
 
-Skipped when ops isn't installed (flaplint itself is stdlib-only). Install the dev
-extra (``pip install -e .[dev]``) or run inside a charm venv to exercise it.
+Skipped when ops isn't installed (flaplint itself is stdlib-only). ``uv sync``
+installs the dev group (pytest + ops), or run inside a charm venv to exercise it.
 """
 
 from __future__ import annotations

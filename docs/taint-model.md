@@ -20,7 +20,7 @@ particular, whether it's enough to let a serializer sort the keys for you. (A
 key-sorting serializer is one that puts mapping keys in order as it writes them:
 `yaml.dump`, `json.dumps(sort_keys=True)`, a Pydantic dump.)
 
-| what it is (plain English) | name in the code | the fix |
+| what it is | name in the code | the fix |
 |---|---|---|
 | a whole thing with no fixed order — a `set`, a `glob()` result, `relation.units` | `local` | let a key-sorting serializer handle it, or `sorted()` |
 | one item picked by **position** out of something unordered — `addrs[0]` | `element` | `sorted(addrs)[0]` — sort *before* picking |
@@ -79,6 +79,9 @@ through a serializer that only sorts **keys**.
 
 ## Where unstable values come from
 
+These are the **sources** in taint-analysis terms — the points where instability
+(flaplint's flavour of taint) first enters a value.
+
 ### Things with no fixed order (`local`)
 
 - **Sets**: `set(...)`, `frozenset(...)` with contents (an empty `set()` is fine),
@@ -109,6 +112,10 @@ it (you can't `sorted()` a dataclass).
 
 ## How a value changes as it moves
 
+This is **propagation** — the rules for how taint flows through each operation: what
+passes it through, what clears it (the **sanitisers**), and what changes *which kind* it
+is.
+
 ### Things that pass it through unchanged
 
 `list`, `tuple`, `reversed`, `dict`, `copy`, `deepcopy` carry their input's
@@ -122,7 +129,7 @@ handed in — which catches the common pattern of rendering a config from a Jinj
 template and writing it to a file. (The looping that actually reorders the text lives
 in the template, so a plain read of the Python would miss it.)
 
-### Things that make it safe
+### Things that make it safe (the sanitisers)
 
 `sorted(...)` (and `.sort()`) make a value stable. A key-sorting serializer makes the
 `local` kind safe (it sorts the keys), but — as the table shows — not the others.
@@ -168,14 +175,23 @@ works:
 | `json.dumps(x, sort_keys=True)` | makes the `local` kind safe; the rest survive |
 | `yaml.dump`/`safe_dump(x)` | sorts keys by default (makes `local` safe); `sort_keys=False` passes everything through |
 | `json.dump(obj, fp)` | writes a *file*, not a value — handled as a [file write](sinks-and-findings.md) instead |
-| a Pydantic dump | writes fields in a fixed order, so it makes ordering instability safe |
+| a Pydantic dump (`model_dump_json` / `model_dump`) | writes fields in a fixed *name* order, so it makes ordering instability safe — but only field-name-deep (see the caveat below) |
 
 ### A method call keeps the receiver's instability
 
 Calling a method on an unstable value generally keeps it unstable, even when we can't
 see inside the method — `d.keys()`, or a builder's `.as_dict()` after an unordered
-`.add()`. The one exception is a Pydantic dump, which writes a fixed field order and
-so makes it safe.
+`.add()`. The one exception is a Pydantic dump (`model_dump_json` / `model_dump`), which
+writes a fixed field order and so makes it safe.
+
+**Caveat — a dump only fixes field-*name* order, not a list field's elements.** A model
+whose *field is a list* built from an unordered source still flaps: the dump writes that
+list in element order, so `data.model_dump_json()` is not actually safe when
+`data.dashboards` came from a `glob()`. flaplint can't see this without the model's field
+types, so it treats `model_dump*` as fully safe and misses that case — a known blind
+spot, the deepest form of the [object-field barrier](architecture.md#following-values-through-object-fields-and-where-it-stops).
+(It's also why `.json()` and `.dict()` are *not* treated as dumps: they keep the
+receiver's instability, so they still catch the list-field flap.)
 
 ### Through a value object's field
 
