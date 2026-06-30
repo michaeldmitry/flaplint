@@ -348,3 +348,147 @@ def test_pick_from_list_of_set_is_still_unordered_pick(lint_source):
     assert len(picks) == 1
     assert picks[0].variable == "addrs"
     assert [f for f in findings if f.rule == "unordered-iteration"] == []
+
+
+def test_loop_append_over_set_into_keysorting_serializer_is_flagged(lint_source):
+    # The imperative twin of ``[x for x in set]``: a *list* built by appending while
+    # iterating an unordered source bakes the iteration order into element order, so
+    # it must survive a key-sorting serializer exactly like the comprehension. (Was a
+    # false negative: the accumulator inherited raw ``local``, which yaml laundered.)
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                eps = []
+                for unit in relation.units:
+                    eps.append(relation.data[unit]["endpoint"])
+                relation.data[self.app]["v"] = yaml.safe_dump(eps)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" for f in findings)
+
+
+def test_loop_set_accumulator_into_keysorting_serializer_stays_laundered(lint_source):
+    # Field-sensitivity of the promotion: a *set* accumulator (``s.add(...)``) is not
+    # a sequence -- its disorder is key-order, which a key-sorting serializer fixes.
+    # It must NOT be promoted to itercaller (that would be a false positive).
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                s = set()
+                for unit in relation.units:
+                    s.add(relation.data[unit]["endpoint"])
+                relation.data[self.app]["v"] = yaml.safe_dump(sorted(s))
+        """
+    )
+    assert [f for f in findings if f.rule in ("unordered-iteration", "unordered-collection")] == []
+
+
+def test_loop_dict_accumulator_into_keysorting_serializer_stays_laundered(lint_source):
+    # Same guard for a ``dict`` accumulator (``d[k] = v``): key-order, laundered by a
+    # key-sorting serializer -- must stay un-promoted.
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                d = {}
+                for unit in relation.units:
+                    d[unit.name] = relation.data[unit]["endpoint"]
+                relation.data[self.app]["v"] = yaml.safe_dump(d)
+        """
+    )
+    assert [f for f in findings if f.rule in ("unordered-iteration", "unordered-collection")] == []
+
+
+def test_enumerate_index_keyed_dict_is_flagged(lint_source):
+    # ``{f"k-{idx}": e for idx, e in enumerate(unstable_list)}`` -- enumerate pairs an
+    # element with its index, so the index->element binding flaps even though the keys
+    # sort. ``enumerate`` propagates the list's itercaller taint to the dict values.
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                eps = []
+                for unit in relation.units:
+                    eps.append(relation.data[unit]["endpoint"])
+                sinks = {}
+                for idx, e in enumerate(eps):
+                    sinks[f"loki-{idx}"] = e
+                relation.data[self.app]["v"] = yaml.safe_dump(sinks)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" for f in findings)
+
+
+def test_enumerate_element_keyed_dict_is_not_flagged(lint_source):
+    # FP guard: a dict keyed by the *element* (not the index) has deterministic keys a
+    # serializer sorts -- so ``enumerate`` must propagate (not promote): no finding.
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                d = {}
+                for idx, e in enumerate(sorted(relation.data[self.app])):
+                    d[e] = idx
+                relation.data[self.app]["v"] = yaml.safe_dump(d)
+        """
+    )
+    assert [f for f in findings if f.rule in ("unordered-iteration", "unordered-collection")] == []
+
+
+def test_nested_unordered_loops_flag_both_sources(lint_source):
+    # An accumulator filled inside two nested unordered loops is scrambled by *each*
+    # loop independently, so each is a distinct place a ``sorted()`` is needed --
+    # both must be flagged, not just the outer one (the cos-proxy vector-config shape
+    # with --relations-unordered).
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, rel1, rel2):
+                eps = []
+                for u1 in rel1.units:
+                    for u2 in rel2.units:
+                        eps.append(rel1.data[u1]["e"])
+                self.rel.data[self.app]["v"] = json.dumps(eps, sort_keys=True)
+        """
+    )
+    sources = {f.variable for f in findings if f.rule == "unordered-iteration"}
+    assert sources == {"rel1.units", "rel2.units"}
+
+
+def test_nested_container_element_mutation_taints_root(lint_source):
+    # ``template["sinks"].update(unstable)`` outside a loop writes ``unstable`` into a
+    # nested element, so the root ``template`` is order-unstable and a later
+    # ``yaml.dump(template)`` flaps -- the cos-proxy vector config shape.
+    findings = lint_source(
+        """
+        import yaml
+
+        class Charm:
+            def publish(self, relation):
+                template = {"sinks": {}}
+                eps = []
+                for unit in relation.units:
+                    eps.append(relation.data[unit]["endpoint"])
+                sinks = {}
+                for idx, e in enumerate(eps):
+                    sinks[f"loki-{idx}"] = e
+                template["sinks"].update(sinks)
+                relation.data[self.app]["v"] = yaml.safe_dump(template)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" for f in findings)
+

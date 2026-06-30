@@ -15,6 +15,7 @@ from typing import Dict, List, Optional, Set
 
 from . import astutils
 from .constants import (
+    ACCUMULATOR_METHODS,
     BUILTIN_COLLECTION_METHODS,
     FILE_WRITE_DESCS,
     HASH_CALLS,
@@ -36,7 +37,7 @@ from .constants import (
 from . import databag
 from .handlers import Handler
 from .model import FuncInfo, Origin, Registry
-from .taint import TaintEngine
+from .taint import TaintEngine, _promote_to_sequence
 
 
 #: Call names that don't introduce ordering/volatility instability, so a call to one
@@ -302,16 +303,12 @@ class FunctionAnalyzer:
         read-back is already handled by the ``"self.<attr>"`` env key; this carries
         the same taint to a read in a *different* method of the class.
         """
-        if not (
-            isinstance(tgt, ast.Attribute)
-            and isinstance(tgt.value, ast.Name)
-            and tgt.value.id in ("self", "cls")
-            and ctx.cls
-        ):
+        key = astutils.self_attr_key(tgt) if ctx.cls else None
+        if key is None:
             return
         resolved = {self._resolve_attr_origin(o, ctx) for o in taint}
         self.engine.record_instance_attr(
-            ctx.cls, tgt.attr, {o for o in resolved if o}
+            ctx.cls, key, {o for o in resolved if o}
         )
 
     def _returned_field_map(self, value: ast.AST, ctx: Context):
@@ -863,7 +860,12 @@ class FunctionAnalyzer:
             return
         # Builder mutation: ``obj.add(<unordered>)`` on a locally-constructed
         # object absorbs the argument's instability into the object's state, so a
-        # later ``obj.as_dict()`` / ``obj.render()`` is order-unstable.
+        # later ``obj.as_dict()`` / ``obj.render()`` is order-unstable. Gated to a
+        # *constructed* object (``ctx.types``): broadening to any ``list.append``
+        # pushes a *nested* field's instability up onto the container, which then
+        # mis-fires when that container is iterated through an order-preserving
+        # pass-through (``_dedupe_list``) -- flaplint can't tell element-order
+        # instability from nested-content instability, so both read as itercaller.
         if (
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
@@ -876,6 +878,26 @@ class FunctionAnalyzer:
                 argtaint |= self._eval(arg, ctx)
             if argtaint:
                 ctx.env[recv] = set(ctx.env.get(recv, ())) | argtaint
+        # Nested container-element mutation: ``template["sinks"].update(x)`` /
+        # ``buckets[k].append(x)`` writes ``x`` into an element of the root
+        # container, so the root inherits ``x``'s taint -- a later
+        # ``yaml.dump(template)`` is then order-unstable. The subscript receiver is
+        # what marks this as a container (you can't subscript-then-mutate a scalar),
+        # so no ``ctx.types`` gate is needed; the loop form is already covered by
+        # ``loop_accumulators``, this is the same idiom outside a loop.
+        elif (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in ACCUMULATOR_METHODS
+            and isinstance(call.func.value, ast.Subscript)
+        ):
+            root = astutils.root_name(call.func.value)
+            if root is not None and root not in ("self", "cls"):
+                argtaint = set()
+                for arg in call.args:
+                    argtaint |= self._eval(arg, ctx)
+                if argtaint:
+                    ctx.env[root] = set(ctx.env.get(root, ())) | argtaint
         self._scan_expr(stmt.value, ctx, handler)
 
     def _visit_if(self, stmt: ast.If, ctx: Context, handler: Handler) -> None:
@@ -908,10 +930,19 @@ class FunctionAnalyzer:
         for inner in astutils.child_bodies(stmt):
             self._visit_body(inner, ctx, handler)
         # If the loop iterates an unordered source, every accumulator it fills
-        # inherits that instability for the rest of the function.
+        # inherits that instability for the rest of the function. A *list*
+        # accumulator (``acc.append(x)``) bakes the iteration order into element
+        # order, so it is promoted ``local`` -> ``itercaller`` exactly like the
+        # equivalent comprehension -- otherwise a key-sorting serializer
+        # (``yaml.dump``) would launder the raw ``local`` and miss the flap. A
+        # ``set``/``dict`` accumulator keeps the raw taint (its disorder is
+        # key-order, which key-sorting legitimately launders).
         if iter_taint:
+            seq_taint = _promote_to_sequence(iter_taint, stmt.iter)
+            list_accs = astutils.list_loop_accumulators(stmt)
             for acc in astutils.loop_accumulators(stmt):
-                ctx.env[acc] = set(ctx.env.get(acc, ())) | set(iter_taint)
+                add = seq_taint if acc in list_accs else iter_taint
+                ctx.env[acc] = set(ctx.env.get(acc, ())) | set(add)
         # Loop-variable aliasing: ``for x in c: x[k] = <unordered>`` mutates an
         # element of ``c`` in place, so ``c`` itself becomes order-unstable.
         if container is not None and container not in ("self", "cls"):

@@ -166,6 +166,25 @@ def test_variable_keeps_access_chain_root_for_subscript_and_call():
     assert _variable(_expr("glob('*.json')")) == "glob"
 
 
+def test_variable_names_the_member_for_a_deep_self_subscript():
+    # ``for x in self._charm.model.relations[name]`` -- root_name is the useless
+    # ``self``; name the innermost member collection (what you'd sort), not
+    # <anonymous>. (The cos-proxy vector-config shape.)
+    assert _variable(_expr("self._charm.model.relations[relation_name]")) == "relations"
+    assert _variable(_expr("self.a.b.peers")) == "peers"
+
+
+def test_variable_names_the_method_for_a_self_call():
+    # ``[... for p in self.requested_tracing_protocols()]`` -- root_name gives the
+    # useless ``self``; name the method that produced the value, not <anonymous>
+    # (parallels the free call ``glob(...)`` -> ``glob``).
+    assert _variable(_expr("self.requested_tracing_protocols()")) == (
+        "requested_tracing_protocols()"
+    )
+    # a call on a *named* receiver keeps the informative receiver root, unchanged.
+    assert _variable(_expr("obj.bar()")) == "obj"
+
+
 def test_variable_is_empty_for_a_bare_self_and_an_anonymous_literal():
     assert _variable(_expr("self")) == ""
     assert _variable(_expr("{1, 2, 3}")) == ""  # no named value to point at

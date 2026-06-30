@@ -97,6 +97,23 @@ def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     return {("itercaller", None, node, None) if is_local(o) else o for o in origins}
 
 
+def _promote_to_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
+    """Taint of a *sequence materialized by iterating* ``node``.
+
+    Shared by a list comprehension (``[x for x in src]``) and a loop ``.append``
+    accumulator (``for x in src: acc.append(x)``) -- both bake the source's
+    iteration order into element order. Promotes ``local`` -> ``itercaller``
+    (survives a key-sorting serializer) and a parameter -> ``iterparam`` (the
+    contract-boundary iteration), both anchored at ``node`` where the ``sorted()``
+    fix lands. Every other flavor passes through unchanged.
+    """
+    out = _as_local_sequence(origins, node)
+    for o in origins:
+        if isinstance(o, tuple) and o[0] == "param":
+            out.add(("iterparam", o[1], None, node))
+    return out
+
+
 def _is_str_join(call: ast.Call) -> bool:
     """True for a ``<sep>.join(<iterable>)`` string join (not ``os.path.join``).
 
@@ -171,14 +188,13 @@ class TaintEngine:
     def _instance_attr_taint(
         self, node: ast.Attribute, cls_ctx: Optional[str]
     ) -> Set[Origin]:
-        """Class-level taint of ``self.<attr>`` (cross-method), or empty."""
-        if (
-            cls_ctx
-            and isinstance(node.value, ast.Name)
-            and node.value.id in ("self", "cls")
-        ):
-            return set(self.instance_attr_taint.get(cls_ctx, {}).get(node.attr, ()))
-        return set()
+        """Class-level taint of ``self.<attr>`` / ``self._stored.<attr>`` (cross-method)."""
+        if not cls_ctx:
+            return set()
+        key = astutils.self_attr_key(node)
+        if key is None:
+            return set()
+        return set(self.instance_attr_taint.get(cls_ctx, {}).get(key, ()))
 
     def _instance_attr_subscript_taint(
         self, node: ast.Subscript, cls_ctx: Optional[str]
@@ -272,10 +288,7 @@ class TaintEngine:
             out = set()
             for gen in node.generators:
                 inner = self.eval(gen.iter, env, cls_ctx, _depth + 1)
-                out |= _as_local_sequence(inner, gen.iter)
-                for o in inner:
-                    if isinstance(o, tuple) and o[0] == "param":
-                        out.add(("iterparam", o[1], None, gen.iter))
+                out |= _promote_to_sequence(inner, gen.iter)
             return out
 
         if isinstance(node, ast.Dict):

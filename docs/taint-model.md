@@ -160,7 +160,16 @@ works:
 2. **Building a list from a set → `itercaller`.** `list(some_set)`,
    `tuple(relation.units)`, `[x for x in some_set]`. The list's item order now carries
    the disorder, where sorting the keys won't reach. (`dict`/`copy` are *not* in this
-   group — they keep a mapping, whose key order a serializer does fix.)
+   group — they keep a mapping, whose key order a serializer does fix.) The **imperative
+   form is the same**: a list filled by appending in a loop over an unordered source
+   (`for u in relation.units: eps.append(...)`) is `itercaller` too, reported at the loop
+   where the `sorted()` goes — identical to the comprehension. A `set`/`dict` accumulator
+   (`s.add(...)`, `d[k] = v`) stays `local` (its disorder *is* key-order, which a
+   key-sorting serializer launders). `enumerate` carries the list's taint through, so an
+   **index-keyed dict** (`{f"k-{i}": e for i, e in enumerate(eps)}`) flaps even though the
+   keys sort — the `i`→`e` binding follows `eps`'s order. And mutating a **nested element**
+   (`template["sinks"].update(eps)`) makes the root `template` unstable, so a later
+   `yaml.dump(template)` is caught.
 
 3. **Looping a parameter into a list → `iterparam`.** The order belongs to the
    caller, so this is flagged as a place that trusts its caller, pointing at the loop

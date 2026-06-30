@@ -155,3 +155,42 @@ def test_clean_scalar_attr_is_not_flapped_by_an_unrelated_dirty_attr(lint_source
         """
     )
     assert [f for f in findings if f.kind == "caller"] == []
+
+
+def test_storedstate_two_level_attr_carries_across_handlers(lint_source):
+    # ``self._stored.jobs`` -- the ops StoredState idiom (a *two-level* self attribute)
+    # is the standard way charms carry data across event handlers. An unstable value
+    # parked there in one handler and published in another must stay tracked (the
+    # cos-proxy scrape_jobs / alert_rules pipeline).
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def build(self, relation):
+                self._stored.jobs = list(set(relation.units))
+
+            def publish(self, relation):
+                relation.data[self.app]["jobs"] = json.dumps(self._stored.jobs)
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_storedstate_clean_sibling_attr_is_not_flagged(lint_source):
+    # Field-sensitivity across the two-level key: a clean sibling under the same
+    # StoredState container must not inherit a dirty sibling's taint.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def build(self, relation):
+                self._stored.jobs = list(set(relation.units))
+                self._stored.ready = True
+
+            def publish(self, relation):
+                relation.data[self.app]["ready"] = json.dumps(self._stored.ready)
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)

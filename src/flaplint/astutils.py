@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from .constants import (
     ACCUMULATOR_METHODS,
     FILE_WRITE_METHODS,
+    LIST_ACCUMULATOR_METHODS,
     MAPPING_WRITE_METHODS,
     PLAN_WRITE_METHODS,
     PROPAGATE_CALLS,
@@ -40,6 +41,29 @@ def attr_path(node: ast.AST) -> Optional[str]:
     """
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
         return f"{node.value.id}.{node.attr}"
+    return None
+
+
+def self_attr_key(node: ast.AST) -> Optional[str]:
+    """Class-level key for a ``self``/``cls``-rooted attribute, one or two levels.
+
+    ``self.jobs`` -> ``"jobs"``; ``self._stored.jobs`` -> ``"_stored.jobs"``. The
+    two-level form is the ops **StoredState** idiom (``self._stored.<x>``), the
+    standard way a charm carries data across event handlers -- so an unstable value
+    parked there in one handler and published in another stays tracked. Returns
+    ``None`` for a non-``self`` root or a chain deeper than two levels.
+    """
+    if not isinstance(node, ast.Attribute):
+        return None
+    base = node.value
+    if isinstance(base, ast.Name) and base.id in ("self", "cls"):
+        return node.attr
+    if (
+        isinstance(base, ast.Attribute)
+        and isinstance(base.value, ast.Name)
+        and base.value.id in ("self", "cls")
+    ):
+        return f"{base.attr}.{node.attr}"
     return None
 
 
@@ -401,6 +425,46 @@ def loop_accumulators(node: ast.For) -> set:
             for tgt in sub.targets:
                 if isinstance(tgt, ast.Subscript) and isinstance(tgt.value, ast.Name):
                     names.add(tgt.value.id)  # d[k] = v dict-construction
+    return names
+
+
+def list_loop_accumulators(node: ast.For) -> set:
+    """Local names filled as *list* accumulators in a loop body.
+
+    The list-building subset of :func:`loop_accumulators`: a name mutated by
+    ``.append``/``.extend``/``.insert`` (or ``+= [..]`` with a list literal). Such a
+    list bakes the loop's iteration order into its *element* order, so when the loop
+    iterates an unordered source it inherits *sequence* (``itercaller``) instability
+    that survives a key-sorting serializer -- unlike a ``set``/``dict`` accumulator
+    (``.add``/``.update``/``d[k]=v``), whose disorder is key-order and stays
+    ``local``. Receivers mirror :func:`loop_accumulators` (a ``Name``, or the root of
+    a ``Subscript`` like ``buckets[k].append(v)`` -- a dict whose list values flap).
+    """
+    names: set = set()
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and sub.func.attr in LIST_ACCUMULATOR_METHODS
+        ):
+            recv = sub.func.value
+            if isinstance(recv, ast.Name):
+                names.add(recv.id)
+            elif isinstance(recv, ast.Subscript):
+                rn = root_name(recv)
+                if rn is not None:
+                    names.add(rn)
+        elif (
+            isinstance(sub, ast.AugAssign)
+            and isinstance(sub.op, ast.Add)
+            and isinstance(sub.value, ast.List)
+        ):
+            if isinstance(sub.target, ast.Name):
+                names.add(sub.target.id)  # acc += [v]
+            elif isinstance(sub.target, ast.Subscript) and isinstance(
+                sub.target.value, ast.Name
+            ):
+                names.add(sub.target.value.id)  # acc[k] += [v]
     return names
 
 

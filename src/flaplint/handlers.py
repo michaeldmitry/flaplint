@@ -134,6 +134,25 @@ def _variable(node: ast.AST) -> str:
                 return name
         return ""
     name = astutils.root_name(node)
+    if name in ("self", "cls"):
+        # A deep ``self``/``cls``-rooted access whose root_name is the useless
+        # receiver: name the most specific *member* instead, so an inline
+        # ``[... for x in self.a.b.relations[k]]`` iteration is actionable rather
+        # than ``<anonymous>``.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            # ``self.requested_tracing_protocols()`` -> ``requested_tracing_protocols()``
+            # (parallels the free call ``glob(...)`` -> ``glob``).
+            attr = astutils.final_attr(node.func)
+            if attr:
+                return f"{attr}()"
+        # ``self._charm.model.relations[k]`` -> ``relations``; ``self.a.b.peers`` ->
+        # ``peers`` -- the innermost named collection, what you'd grep for and sort.
+        # Only a *member access* (not a bare ``self``) has a member to name.
+        if isinstance(node, (ast.Attribute, ast.Subscript)):
+            target = node.value if isinstance(node, ast.Subscript) else node
+            attr = astutils.final_attr(target)
+            if attr:
+                return attr
     return name if name and name not in ("self", "cls") else ""
 
 
@@ -455,25 +474,30 @@ class ReportHandler(Handler):
             # sink). Any co-occurring ``local`` taint is suppressed: ``itercaller``
             # is strictly more informative (it pinpoints the fix location). A
             # ``None`` path means "born in this function's file".
-            site_path, site_node = min(
-                (
-                    (o[1] or self.fi.path, o[2])
-                    for o in origins
-                    if is_itercaller(o)
-                ),
-                key=_loc_key,
-            )
-            self.out.append(
-                (
-                    site_node,
-                    "high",
-                    "unordered-iteration",
-                    sink_type,
-                    _variable(site_node),
-                    site_path,
-                    None,
+            #
+            # One finding per *distinct* materialization site: when an accumulator
+            # is filled inside nested unordered loops
+            # (``for a in xs: for b in ys: acc.append(...)``) each loop independently
+            # scrambles the sequence, so each is a place a ``sorted()`` is needed.
+            # Same-site duplicates (the value reaching several sinks) collapse in
+            # report.py's ``(path, line, col, rule)`` dedup.
+            sites = {}
+            for o in origins:
+                if is_itercaller(o):
+                    site = (o[1] or self.fi.path, o[2])
+                    sites.setdefault(_loc_key(site), site)
+            for site_path, site_node in sorted(sites.values(), key=_loc_key):
+                self.out.append(
+                    (
+                        site_node,
+                        "high",
+                        "unordered-iteration",
+                        sink_type,
+                        _variable(site_node),
+                        site_path,
+                        None,
+                    )
                 )
-            )
             return
         self.out.append(
             (

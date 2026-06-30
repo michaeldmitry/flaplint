@@ -35,6 +35,13 @@ UNORDERED_CALLS: Set[str] = {
 #: ``copy``/``deepcopy`` preserve their input's iteration order, so an unordered
 #: value survives them unchanged (``copy.deepcopy(dict(x))`` is exactly as
 #: unordered as ``x``); they must propagate taint rather than launder it.
+#: ``enumerate`` is a *pass-through* (deliberately NOT a sequence materializer): it
+#: pairs each element with its index without changing element order, so iterating
+#: ``enumerate(eps)`` carries ``eps``'s taint to whatever the loop builds -- the
+#: ``{f"loki-{idx}": e for idx, e in enumerate(unstable_list)}`` shape, where the
+#: index→element binding flaps even though the keys sort. It is *not* promoted to
+#: ``itercaller`` (that would false-positive on a dict keyed by the *element*,
+#: ``d[e] = ...``, whose keys a serializer sorts deterministically).
 PROPAGATE_CALLS: Set[str] = {
     "list",
     "tuple",
@@ -43,6 +50,7 @@ PROPAGATE_CALLS: Set[str] = {
     "dict",
     "copy",
     "deepcopy",
+    "enumerate",
 }
 
 #: Subset of :data:`PROPAGATE_CALLS` that materialize their argument into a
@@ -241,6 +249,16 @@ ACCUMULATOR_METHODS: Set[str] = {
     "update",
     "setdefault",
 }
+
+#: The subset of :data:`ACCUMULATOR_METHODS` that build a *list* (sequence). A list
+#: filled by iterating an unordered source bakes the iteration order into its
+#: *element* order -- value-position instability a key-sorting serializer cannot
+#: launder, so it must be promoted ``local`` -> ``itercaller`` (exactly like a list
+#: comprehension). ``add``/``update``/``setdefault`` build a ``set``/``dict`` whose
+#: disorder *is* key-order and stays ``local`` (laundered by key-sorting), so they
+#: are deliberately excluded. ``append``/``insert`` are list-only; ``extend`` is
+#: list/deque (treated as a sequence either way).
+LIST_ACCUMULATOR_METHODS: Set[str] = {"append", "extend", "insert"}
 
 #: Mutating ``MutableMapping`` methods that write *content* into a databag. A
 #: call ``bag.update(x)`` / ``bag.setdefault(k, x)`` on a relation databag is a
