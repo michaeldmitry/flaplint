@@ -43,6 +43,35 @@ def attr_path(node: ast.AST) -> Optional[str]:
     return None
 
 
+def subscript_path(node: ast.AST) -> Optional[str]:
+    """Access-path key for a fixed-string subscript: ``d['k']`` / ``self.cfg['k']``.
+
+    The dict-by-fixed-key analogue of :func:`attr_path`: it lets a dict literal's
+    *per-key* value taint be stored under a compound ``env`` key
+    (``"d['k']"``) and read back on the same ``base['k']`` access, so a value
+    buried under one key is field-sensitive (a clean sibling key stays clean).
+    Returns ``None`` for a non-constant or non-string key -- an integer index is
+    order-*dependent* and handled separately -- and for a base deeper than one
+    attribute level. The base may be a plain ``Name`` (``d``) or a one-level
+    ``self``/``cls`` attribute (``self.cfg``).
+    """
+    if not isinstance(node, ast.Subscript):
+        return None
+    key = node.slice
+    if isinstance(key, ast.Index):  # Python 3.8 wraps the constant in an Index
+        key = key.value
+    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+        return None
+    base = node.value
+    if isinstance(base, ast.Name):
+        base_path: Optional[str] = base.id
+    elif isinstance(base, ast.Attribute) and isinstance(base.value, ast.Name):
+        base_path = f"{base.value.id}.{base.attr}"
+    else:
+        return None
+    return f"{base_path}[{key.value!r}]"
+
+
 def root_name(node: ast.AST) -> Optional[str]:
     """Root variable of an access chain: ``d.get('g', {})`` / ``d[k]`` -> ``d``."""
     cur = node

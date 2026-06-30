@@ -456,33 +456,47 @@ method that assigns the attribute has been seen). It stays field-sensitive (a cl
 `self.x = sorted(self.x)`. Born-sites are pinned to the assigning method, so the finding
 blames the `set()` in `__init__`, not the reader's serializer.
 
+A value **buried in a dict** *is* followed, two ways: serializing the **whole** container
+flaps via its buried element (`json.dumps(self.cfg)`), and pulling the value back out by a
+**fixed key** is tracked field-sensitively (`self.cfg["jobs"]` is unstable, a clean
+sibling `self.cfg["name"]` is not — stored under the compound key `"self.cfg['jobs']"`,
+the subscript analogue of `attr_path`).
+
+The cosl **`DatabagModel.dump(bag)`** idiom is followed even when the model is built in a
+*different* method or function than the dump: `self._data = Model(field=set(x))` then
+`self._data.dump(bag)` in a handler (via instance-attribute provenance), or
+`self._build().dump(bag)` where the builder returns the model (via its
+`returns_field_origins` summary). This is gated to **known value objects** — a constructed
+model on `self`, or a callee that returns one — so a plain list receiver that merely reads
+the bag (`self._acc.extend(bag)`) is never tainted.
+
 What it still does **not** follow:
 
 ```python
 # NOT followed
-self.cfg = {"jobs": list(some_set)}                   # the unstable value is buried in a dict first
-push(json.dumps(self.render()))                       # …a method rebuilds it later
+push(json.dumps(self.render()))                       # a method rebuilds it later
 a.b.c = set(x)                                         # deeper than one level
+cfg[key]                                               # a *variable* key, not a constant
 ```
 
 (The instance-attribute union is deliberately conservative — if an attribute is assigned
 *both* a dirty and a clean value in different methods, it stays tainted. That errs toward
 a reviewable finding rather than a silent miss, matching the contract-boundary stance.)
 
-The remaining real-world miss is a value *buried in a dict* before being stored, or one
-*rebuilt by a method* of the object rather than read straight off a field (the cos-proxy
-`ScrapeJobContext` shape). And when the consumer is a library you don't analyse that
+The remaining real-world miss is a value *rebuilt by a method* of the object rather than
+read straight off a field (the cos-proxy `ScrapeJobContext` shape), a dict reached through
+a *variable* key or an alias, or a path *deeper than one level*. And when the consumer is
+a library you don't analyse that
 reads the field and writes the bag itself, the value reaches the boundary but has no
 in-repo write to pin a finding to.
 
 #### The subtlest case: a model dump hides a list field's order
 
-The hardest version of this barrier is a Pydantic (or dataclass) **serializer applied to
-the whole object**. flaplint treats `model_dump_json()` / `model_dump()` as a full
-launder: a model writes its fields in a fixed *name* order, so for a model of plain
-scalar and dict fields the dump genuinely removes all ordering instability. But that's
-only true field-name-deep. A model whose *field is itself a list*, built from an
-unordered source, still flaps — the dump writes that list in element order:
+A Pydantic (or dataclass) **serializer applied to the whole object** is the subtlest
+case. A model writes its fields in a fixed *name* order, so `model_dump_json()` /
+`model_dump()` genuinely launder that field-name order. But the launder is only
+field-name-deep: a model whose *field is itself a list*, built from an unordered source,
+still flaps — the dump writes that list in element order:
 
 ```python
 class UnitData(BaseModel):
@@ -492,30 +506,29 @@ data = UnitData(dashboards=list(glob.glob("*.json")))
 relation.data[app]["d"] = data.model_dump_json()   # field NAMES fixed; the list inside is NOT
 ```
 
-Deciding this correctly needs the model's **schema** — the type of each field — so
-flaplint could reason "field-name order: fixed; this field is a `list`, its element
-order survives; that field is an `int`, irrelevant." flaplint never reads the model
-definition, so it can't make that per-field call: it treats the whole dump as safe and
-misses the flap. For exactly this reason `.json()` and `.dict()` are deliberately *not*
-on the serializer list — unlike `model_dump*`, they still inherit the receiver's taint,
-so they *catch* the list-field flap. (`tests/unit/test_field_provenance.py` pins that down
-with the real cos-proxy / postgresql `.json()`-of-a-list-field case.)
+flaplint **catches this** without reading the model's schema, because the
+distinction is already in the taint **flavor**. A dump only ever reorders field *names*,
+never content *within* a field; so `model_dump*` inherits the receiver's *concrete*
+content taint (`local`/`element`/`itercaller`/`volatile`) and launders only the
+field-name-order / opaque-param flavors (`param`/`iterparam`). The `itercaller` from
+`list(glob(...))` therefore survives the dump and trips the databag sink. The pydantic v1
+`.json()` / `.dict()` spellings stay even more conservative — they inherit *all* receiver
+taint, including the param-boundary precaution — so they catch it too.
+(`tests/unit/test_field_provenance.py` pins the `model_dump_json` / `model_dump` / `.json()`
+cases, plus a negative that the opaque-*param* dump is still laundered.)
 
-This is the same wall as the dict-burial case above, one level deeper — and it's why
-**full dataclass / pydantic traversal is a large undertaking, not a small fix.** Doing
-it properly needs three analyses flaplint doesn't have, each substantial on its own:
+What flaplint still **cannot** see without a schema pass is a set→list promotion that
+happens *inside* the model's `__init__`: the call site sees only a bare `set` (a `local`
+flavor), which a key-sorting databag sink then legitimately launders, so the eventual
+list-element flap is missed *at that sink*. Judging this needs the model's **schema** —
+the declared type of each field — to know the field is a `list` whose elements survive.
+That, with **alias analysis** (shared mutable references — `b = a; b.x = …` taints `a.x`;
+undecidable in general) and full **per-field-type-aware serialization**, is why
+*complete* dataclass / pydantic traversal stays out of scope. The narrow, flavor-based
+slice closes the common case without any of that.
 
-- a **schema pass** — resolve the model/dataclass definition to learn each field's type,
-  so a serializer can be judged per field instead of all-or-nothing;
-- **alias analysis** — objects are shared, mutable references (`b = a; b.x = …` taints
-  `a.x`; passing a model into an opaque helper may mutate it), which is undecidable in
-  general and only ever approximated;
-- **per-field-type-aware serialization** — the rule that a dump launders field *names*
-  but not a list field's *elements*, applied field by field.
-
-So the tool tracks one shallow field level precisely and reports everything deeper as a
-[blind spot](sinks-and-findings.md) under `--explain-gaps`, rather than guessing and
-risking either a false alarm or (worse, as the `model_dump*` case shows) a silent miss.
+So the tool tracks one shallow field level precisely and reports anything deeper as a
+[blind spot](sinks-and-findings.md) under `--explain-gaps`, rather than guessing.
 
 This is a limit of what flaplint models, not of which direction it runs: a "start at the
 write and walk back" design would hit the same wall — it would still need to model

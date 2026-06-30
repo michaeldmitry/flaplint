@@ -180,6 +180,31 @@ class TaintEngine:
             return set(self.instance_attr_taint.get(cls_ctx, {}).get(node.attr, ()))
         return set()
 
+    def _instance_attr_subscript_taint(
+        self, node: ast.Subscript, cls_ctx: Optional[str]
+    ) -> Set[Origin]:
+        """Class-level taint of ``self.<attr>['key']`` (cross-method), or empty.
+
+        The dict-by-fixed-key analogue of :meth:`_instance_attr_taint`: a value
+        parked under ``self.cfg['jobs']`` in one method and read in another. The
+        key is stored class-wide under the compound attr name ``"cfg['jobs']"``.
+        """
+        base = node.value
+        if not (
+            cls_ctx
+            and isinstance(base, ast.Attribute)
+            and isinstance(base.value, ast.Name)
+            and base.value.id in ("self", "cls")
+        ):
+            return set()
+        key = node.slice
+        if isinstance(key, ast.Index):  # Python 3.8
+            key = key.value
+        if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+            return set()
+        attr = f"{base.attr}[{key.value!r}]"
+        return set(self.instance_attr_taint.get(cls_ctx, {}).get(attr, ()))
+
     @staticmethod
     def survives_structural_compare(origins: Set[Origin]) -> Set[Origin]:
         """Origins that survive a *structural* (key-order-insensitive) comparison.
@@ -276,6 +301,18 @@ class TaintEngine:
             # not contractually sorted. Opt-in only.
             if self.relations_unordered and astutils.final_attr(node.value) == "relations":
                 return {("local", None, node, None)}
+            # Dict-by-fixed-key read-back: ``d['jobs']`` where a per-key taint was
+            # recorded at the dict literal (stored under the compound ``env`` key
+            # ``"d['jobs']"``, or class-wide for ``self.cfg['jobs']``). A fixed-key
+            # lookup is field-sensitive -- it returns *that* key's taint, so the
+            # unstable value buried under one key is caught while a clean sibling
+            # key stays clean. A fixed-key lookup with no recorded per-key taint is
+            # order-independent (clean); only an int index / slice propagates below.
+            path = astutils.subscript_path(node)
+            if path is not None:
+                if path in env:
+                    return set(env[path])
+                return self._instance_attr_subscript_taint(node, cls_ctx)
             # Sequence indexing/slicing picks an *order-dependent* element of an
             # unstable collection: ``unordered_list[0]`` is a different element
             # across reconciles (the classic "pick the first address" churn bug).
@@ -517,16 +554,24 @@ class TaintEngine:
         # The receiver may itself be an expression -- a chained call
         # (``cluster.gather_addresses_by_role().get(role)``) or a subscript -- so
         # evaluate it rather than only reading a plain name's environment taint.
-        # A Pydantic serializer (``<model>.model_dump_json()``) is the exception:
-        # it emits fields in definition order, so the receiver's iteration order
-        # never reaches the output -- it launders ordering taint, it doesn't
-        # inherit it.
-        if isinstance(call.func, ast.Attribute) and name not in MODEL_SERIALIZERS:
+        if isinstance(call.func, ast.Attribute):
             recv = call.func.value
             if isinstance(recv, ast.Name):
-                out |= set(env.get(recv.id, ()))
+                recv_taint = set(env.get(recv.id, ()))
             else:
-                out |= self.eval(recv, env, cls_ctx, depth + 1)
+                recv_taint = self.eval(recv, env, cls_ctx, depth + 1)
+            if name in MODEL_SERIALIZERS:
+                # A Pydantic dump emits fields in *definition* order, so it launders
+                # the model's own field-NAME order and the contract-boundary
+                # uncertainty about an *opaque model param* (the ``param`` /
+                # ``iterparam`` flavors) -- ``param.model_dump_json()`` to a databag
+                # is not a raw-unordered write. But it does NOT launder a concrete
+                # field's *value* order: a list field built from an unordered source
+                # is still emitted in element order (the cos_agent ``_dashboards``
+                # shape). So keep concrete content taint and drop only the
+                # field-name-order / param-boundary flavors.
+                recv_taint = {o for o in recv_taint if o[0] not in ("param", "iterparam")}
+            out |= recv_taint
         return out
 
     def _resolve_summary_candidates(self, call, name, cls_ctx):

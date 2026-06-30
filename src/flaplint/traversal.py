@@ -222,6 +222,55 @@ class FunctionAnalyzer:
                             ctx.env.get(f"{name}.{fld}", ())
                         ) | set(origins)
 
+    def _record_dict_key_taint(
+        self, base_path: str, value: ast.AST, ctx: Context
+    ) -> None:
+        """Record the per-key taint of a dict literal bound to ``base_path``.
+
+        Dict-by-fixed-key provenance: a value buried under a constant
+        string key survives being read back on ``base_path['key']``, *field-
+        sensitively* -- a clean sibling key is not tainted. Stored under compound
+        ``env`` keys (``"base['key']"``), which the engine reads on a fixed-key
+        subscript. Only a direct ``base_path = {...}`` dict literal populates it
+        (the common shape); every ``base_path[...]`` key is cleared first so a
+        stale entry can't linger across a rebinding.
+        """
+        prefix = base_path + "["
+        for key in [k for k in ctx.env if k.startswith(prefix)]:
+            del ctx.env[key]
+        if not isinstance(value, ast.Dict):
+            return
+        for key, val in zip(value.keys, value.values):
+            if isinstance(key, ast.Constant) and isinstance(key.value, str) and val:
+                t = self._eval(val, ctx)
+                if t:
+                    ctx.env[f"{base_path}[{key.value!r}]"] = t
+
+    def _record_instance_attr_dict_keys(
+        self, tgt: ast.AST, value: ast.AST, ctx: Context
+    ) -> None:
+        """For ``self.<attr> = {<const-key>: <expr>}``, carry each key's taint into
+        the class map under the compound attr ``"<attr>['key']"`` -- the cross-
+        method half of dict-by-fixed-key provenance (build in ``__init__``, read on
+        ``self.<attr>['key']`` in a handler)."""
+        if not (
+            isinstance(tgt, ast.Attribute)
+            and isinstance(tgt.value, ast.Name)
+            and tgt.value.id in ("self", "cls")
+            and ctx.cls
+            and isinstance(value, ast.Dict)
+        ):
+            return
+        for key, val in zip(value.keys, value.values):
+            if not (isinstance(key, ast.Constant) and isinstance(key.value, str) and val):
+                continue
+            resolved = {self._resolve_attr_origin(o, ctx) for o in self._eval(val, ctx)}
+            origins = {o for o in resolved if o}
+            if origins:
+                self.engine.record_instance_attr(
+                    ctx.cls, f"{tgt.attr}[{key.value!r}]", origins
+                )
+
     @staticmethod
     def _resolve_attr_origin(o: Origin, ctx: Context):
         """Resolve a ``self.<attr>`` taint origin's born-site to the assigning method.
@@ -468,7 +517,41 @@ class FunctionAnalyzer:
                 # Inline ``Model(field=<unordered>).dump(bag)``: attribute the
                 # constructed object's field taint directly.
                 out |= self._ctor_field_taint(recv, ctx)
+                # A model built in a *different* method/function than the dump
+                # still carries its fields' instability to the bag.
+                out |= self._cross_boundary_receiver_taint(recv, ctx)
         return out
+
+    def _cross_boundary_receiver_taint(
+        self, recv: ast.AST, ctx: Context
+    ) -> Set[Origin]:
+        """Taint of a ``<recv>.dump(bag)`` receiver built in another method/function.
+
+        Bridges the construct-here / dump-there separation for the ``DatabagModel``
+        idiom, gated to *known value objects* so a plain list/dict receiver that
+        merely reads the bag is never tainted:
+
+        * ``self.<attr>.dump(bag)`` where ``self.<attr> = Model(...)`` was recorded
+          elsewhere -- consult instance-attribute provenance (the attr is known to
+          hold a constructed model via ``class_attr_types``);
+        * ``self._build().dump(bag)`` where the builder returns a value object --
+          union its ``returns_field_origins`` summary.
+        """
+        if (
+            isinstance(recv, ast.Attribute)
+            and isinstance(recv.value, ast.Name)
+            and recv.value.id in ("self", "cls")
+            and ctx.cls
+            and recv.attr in self.engine.class_attr_types.get(ctx.cls, {})
+        ):
+            return self._eval(recv, ctx)
+        if isinstance(recv, ast.Call):
+            out: Set[Origin] = set()
+            for fi in self._resolve_methods(recv, ctx):
+                for origins in fi.returns_field_origins.values():
+                    out |= set(origins)
+            return out
+        return set()
 
     def _writer_content_node(self, call: ast.Call, ctx: Context) -> ast.AST:
         """The node that *names* the content a writer puts into a databag.
@@ -716,6 +799,7 @@ class FunctionAnalyzer:
                 self._record_type(tgt, stmt.value, ctx)
                 self._record_databag_alias(tgt, stmt.value, ctx)
                 self._record_field_taint(tgt.id, stmt.value, ctx)
+                self._record_dict_key_taint(tgt.id, stmt.value, ctx)
             elif self._is_databag_target(tgt, ctx):
                 continue  # the databag write is reported as a sink above
             else:
@@ -725,10 +809,14 @@ class FunctionAnalyzer:
                 path = astutils.attr_path(tgt)
                 if path is not None:
                     ctx.env[path] = set(taint)
+                    # ``obj.attr = {const-key: expr}`` -- per-key provenance, so a
+                    # later ``obj.attr['key']`` read is field-sensitive.
+                    self._record_dict_key_taint(path, stmt.value, ctx)
                 # ``self.<attr> = expr``: also carry the taint class-wide, so a read
                 # in another method (the build-in-__init__, read-in-handler idiom)
                 # stays field-sensitive across the method boundary.
                 self._record_instance_attr(tgt, taint, ctx)
+                self._record_instance_attr_dict_keys(tgt, stmt.value, ctx)
                 # ``container[k] = <unordered>`` / ``obj.attr = <unordered>``: the
                 # element write also taints the enclosing container, so a later
                 # serialization of the *whole* container is order-unstable.
@@ -752,13 +840,16 @@ class FunctionAnalyzer:
             self._record_type(stmt.target, stmt.value, ctx)
             self._record_databag_alias(stmt.target, stmt.value, ctx)
             self._record_field_taint(stmt.target.id, stmt.value, ctx)
+            self._record_dict_key_taint(stmt.target.id, stmt.value, ctx)
         elif stmt.value is not None:
             path = astutils.attr_path(stmt.target)
             if path is not None:
                 ctx.env[path] = self._eval(stmt.value, ctx)
+                self._record_dict_key_taint(path, stmt.value, ctx)
             self._record_instance_attr(
                 stmt.target, self._eval(stmt.value, ctx), ctx
             )
+            self._record_instance_attr_dict_keys(stmt.target, stmt.value, ctx)
 
     def _visit_expr_stmt(self, stmt: ast.Expr, ctx: Context, handler: Handler) -> None:
         call = stmt.value

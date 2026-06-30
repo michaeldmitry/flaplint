@@ -245,6 +245,72 @@ def test_model_dump_escape_propagates_param_taint(lint_source):
     assert sinks[0].confidence == "high"
 
 
+# -- cross-boundary model dump: built in one method, dumped in another -----------
+
+
+def test_model_built_in_init_dumped_in_handler_is_a_sink(lint_source):
+    # ``self._data = Model(field=<unordered>)`` in __init__, ``self._data.dump(bag)``
+    # in a handler -- construction and dump live in different methods. The dump must
+    # carry the field taint via instance-attribute provenance (the DatabagModel
+    # idiom split build/publish across methods).
+    findings = lint_source(
+        """
+        class Charm:
+            def __init__(self):
+                self._data = ProviderApplicationData(members=set(self._units))
+            def publish(self, relation):
+                self._data.dump(relation.data[self.app])
+        """
+    )
+    assert len([f for f in findings if f.kind == "caller" and f.sink == "databag"]) == 1
+
+
+def test_model_from_builder_method_dumped_is_a_sink(lint_source):
+    # ``self._build().dump(bag)`` -- the model is returned by a builder, then dumped.
+    # The dump must carry the builder's returned-field taint (returns_field_origins).
+    findings = lint_source(
+        """
+        class Charm:
+            def _build(self):
+                return ProviderApplicationData(members=set(self._units))
+            def publish(self, relation):
+                self._build().dump(relation.data[self.app])
+        """
+    )
+    assert len([f for f in findings if f.kind == "caller" and f.sink == "databag"]) == 1
+
+
+def test_clean_model_built_in_init_dumped_is_not_flagged(lint_source):
+    # Monotonicity guard: a *sorted* field built in __init__ and dumped in a handler
+    # must stay clean -- the cross-boundary carry must not invent taint.
+    findings = lint_source(
+        """
+        class Charm:
+            def __init__(self):
+                self._data = ProviderApplicationData(members=sorted(self._units))
+            def publish(self, relation):
+                self._data.dump(relation.data[self.app])
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_list_receiver_reading_bag_is_not_flagged(lint_source):
+    # Field-sensitivity / FP guard: a plain list attribute that *reads* the bag
+    # (``self._acc.extend(bag)``) is not a constructed value object, so the gate
+    # must not taint it.
+    findings = lint_source(
+        """
+        class Charm:
+            def __init__(self):
+                self._acc = []
+            def publish(self, relation):
+                self._acc.extend(relation.data[self.app])
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
 def test_optional_scalar_param_is_not_a_sink(lint_source):
     # ``Optional[str]`` is a scalar string -- its serialization is deterministic.
     # The wrapper must be unwrapped to ``str`` (ordered), so dumping it through a

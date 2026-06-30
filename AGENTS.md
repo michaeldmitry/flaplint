@@ -13,7 +13,9 @@ fire spurious `relation-changed` events (or trip a restart/replan gate), so the 
 exists to catch the missing `sorted()`.
 
 It is a **taint analysis with inter-procedural function summaries**. The whole
-package lives in `src/flaplint/`.
+package lives in `src/flaplint/`. How the analysis works — and the boundaries of what it
+follows through object fields, dict keys, and model dumps — is documented in
+[docs/](docs/README.md); keep those docs current when you change the analysis.
 
 ## Setup & commands
 
@@ -85,8 +87,10 @@ Full reference (with the survival matrix and propagation rules):
   returns `Finding`s. Prefer adding a snippet test that asserts on
   `f.rule` / `f.kind` / `f.confidence` / `f.variable` over white-box assertions.
   Engine-level unit tests (origins from a bare expression) live in
-  `tests/test_units.py`. Files are grouped by concern (`test_iteration.py`,
-  `test_sink.py`, `test_volatile.py`, `test_ownership.py`, …).
+  `tests/unit/test_units.py`. Unit tests are grouped by concern under `tests/unit/`
+  (`test_iteration.py`, `test_sink.py`, `test_volatile.py`, `test_ownership.py`, …);
+  the ops-drift/corpus suite lives separately under `tests/drift/` (see
+  `tests/drift/README.md`).
 - A finding has a **`rule`** (failure mode — *how to fix*: `unordered-collection`,
   `unordered-pick`, `unordered-iteration`, `nondeterministic`) and a **`kind`**
   (vantage — *whose code*: `caller` = concrete bug here; `sink` = a helper that
@@ -120,18 +124,22 @@ Full reference (with the survival matrix and propagation rules):
 ## Gotchas & known limitations
 
 - **The dataclass-field-taint barrier (partially lifted).** Value-object **field
-  provenance** now tracks an unstable collection through a one-level field: stored at
+  provenance** tracks an unstable collection through a one-level field: stored at
   construction (`Ctor(field=set(...))`) or a field write (`obj.field = set(...)`),
   read back on `obj.field`, carried across an alias (`a = obj`) and across a function
   via the `returns_field_origins` summary (`ctx = self._build(); ctx.targets`). It
   stays field-*sensitive* — a clean field of a partly-unstable object is not flagged.
   Stored as compound `env` keys (`"obj.field"`); see `attr_path` and
-  `_record_field_taint` in `traversal.py`. **Still not tracked:** taint *buried in a
-  dict* then stashed in a field, or a field *rebuilt by a method* downstream (the
-  cos-proxy `ScrapeJobContext` shape), and deeper-than-one-level paths (`a.b.c`).
-  When the consuming code is an opaque library (it reads `obj.field` and writes the
-  bag itself), the taint reaches the boundary but produces no concrete finding —
-  there's no in-repo sink to pin it to.
+  `_record_field_taint` in `traversal.py`. A value **buried in a dict** is also tracked:
+  dumping the whole container flaps, and a fixed-key read (`d["jobs"]`) is field-sensitive
+  — see `subscript_path` / `_record_dict_key_taint`. A **`Model(...).dump(bag)`** built in
+  a different method/function than the dump carries its field taint via instance-attribute
+  / `returns_field_origins` provenance (`_cross_boundary_receiver_taint`), gated to known
+  value objects. **Still not tracked:** a field *rebuilt by a method* downstream (the
+  cos-proxy `ScrapeJobContext` shape), a dict via a *variable* key or an alias, and
+  deeper-than-one-level paths (`a.b.c`). When the consuming code is
+  an opaque library (it reads `obj.field` and writes the bag itself), the taint reaches
+  the boundary but produces no concrete finding — there's no in-repo sink to pin it to.
 - **Confirmed vs. precautionary `unordered-iteration`.** A traced unstable caller
   yields `kind=caller` (high); an untraced helper that iterates a param yields a
   precautionary `kind=sink` (medium). The caller finding *supersedes* the

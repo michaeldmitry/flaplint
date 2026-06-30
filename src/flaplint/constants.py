@@ -130,18 +130,21 @@ FILE_READ_METHODS: Set[str] = {
 
 #: Pydantic model serializers. A model serializes its *field names* in definition
 #: order, so ``<model>.model_dump_json()`` / ``<model>.model_dump()`` launder the
-#: model's own key order -- writing ``param.model_dump_json()`` to a databag is not
-#: a raw-unordered write, so it must not trip the contract-boundary sink heuristic.
+#: model's own field-name order -- and the contract-boundary uncertainty about an
+#: *opaque model param* (``param.model_dump_json()`` to a databag is not a raw
+#: unordered write). Membership here is what triggers that launder in
+#: ``TaintEngine._call``.
 #:
-#: NB this launders only the model's *top-level field order*; the order of items
-#: *within* a list-valued field survives (pydantic emits a list in element order).
-#: So a model with an unstable list field (``dashboards: List[str]`` built from a
-#: glob) still flaps through ``.json()`` -- which is exactly why the v1 ``.json()`` /
-#: ``.dict()`` spellings are deliberately *not* listed here: treating them as
-#: launderers would hide that real flap (a value object's list field is the same
-#: field-granularity blind spot as the dataclass barrier). A bare ``.json()`` on a
-#: value object with concrete unstable fields therefore stays caught (its receiver
-#: taint is inherited) and, on an opaque receiver, surfaces under ``--explain-gaps``.
+#: But the launder is *flavor-scoped*, NOT total: the dump fixes only the
+#: top-level field-name order, never the order *within* a field value. A model with
+#: an unstable list field (``dashboards: List[str]`` built from a glob) still flaps
+#: -- pydantic emits a list in element order. So ``_call`` inherits the receiver's
+#: *concrete* content taint (``local``/``element``/``itercaller``/``volatile``) and
+#: drops only the field-name-order/param-boundary flavors (``param``/``iterparam``).
+#: The v1 ``.json()`` / ``.dict()`` spellings are deliberately *not* listed here:
+#: they inherit *all* receiver taint (including the param-boundary precaution), so
+#: they stay even more conservative; on a fully opaque receiver the gap surfaces
+#: under ``--explain-gaps``.
 MODEL_SERIALIZERS: Set[str] = {"model_dump_json", "model_dump"}
 
 #: Digest/hash calls used as change-detectors. A charm hashes some content and

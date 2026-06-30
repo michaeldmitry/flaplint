@@ -175,23 +175,26 @@ works:
 | `json.dumps(x, sort_keys=True)` | makes the `local` kind safe; the rest survive |
 | `yaml.dump`/`safe_dump(x)` | sorts keys by default (makes `local` safe); `sort_keys=False` passes everything through |
 | `json.dump(obj, fp)` | writes a *file*, not a value — handled as a [file write](sinks-and-findings.md) instead |
-| a Pydantic dump (`model_dump_json` / `model_dump`) | writes fields in a fixed *name* order, so it makes ordering instability safe — but only field-name-deep (see the caveat below) |
+| a Pydantic dump (`model_dump_json` / `model_dump`) | launders the model's *field-name* order (and an opaque model param's boundary uncertainty), but **not** a concrete field's value order — see the caveat below |
 
 ### A method call keeps the receiver's instability
 
 Calling a method on an unstable value generally keeps it unstable, even when we can't
 see inside the method — `d.keys()`, or a builder's `.as_dict()` after an unordered
-`.add()`. The one exception is a Pydantic dump (`model_dump_json` / `model_dump`), which
-writes a fixed field order and so makes it safe.
+`.add()`. A Pydantic dump (`model_dump_json` / `model_dump`) is a *partial* exception: it
+launders the model's fixed field-*name* order, but not the order *within* a field value.
 
-**Caveat — a dump only fixes field-*name* order, not a list field's elements.** A model
-whose *field is a list* built from an unordered source still flaps: the dump writes that
-list in element order, so `data.model_dump_json()` is not actually safe when
-`data.dashboards` came from a `glob()`. flaplint can't see this without the model's field
-types, so it treats `model_dump*` as fully safe and misses that case — a known blind
-spot, the deepest form of the [object-field barrier](architecture.md#following-values-through-object-fields-and-where-it-stops).
-(It's also why `.json()` and `.dict()` are *not* treated as dumps: they keep the
-receiver's instability, so they still catch the list-field flap.)
+**A dump fixes field-*name* order, not a list field's elements.** A model whose *field is
+a list* built from an unordered source still flaps: the dump writes that list in element
+order, so `data.model_dump_json()` is not safe when `data.dashboards` came from a
+`glob()`. flaplint **catches this** without reading the model's schema: a dump only
+reorders field *names*, so it inherits the
+receiver's *concrete* content taint (`itercaller`/`element`/`local`/`volatile`) and drops
+only the field-name-order / opaque-param flavors (`param`/`iterparam`). The v1 `.json()` /
+`.dict()` spellings stay even more conservative (they inherit *all* receiver taint), so
+they catch it too. What remains a blind spot is a set→list promotion *inside* the model's
+`__init__` — the deepest form of the [object-field barrier](architecture.md#following-values-through-object-fields-and-where-it-stops),
+which would need the model's field types to resolve.
 
 ### Through a value object's field
 

@@ -158,3 +158,133 @@ def test_pydantic_json_of_unstable_list_field_is_still_flagged(lint_source):
         """
     )
     assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_pydantic_model_dump_json_of_unstable_list_field_is_flagged(lint_source):
+    # ``model_dump_json()`` (pydantic v2 idiom) launders the model's
+    # *field-name* order, but a list field built from an unordered source still
+    # flaps -- pydantic emits a list in element order. The dump must inherit the
+    # field's concrete content taint, not launder it. (Was a silent false negative;
+    # the v1 ``.json()`` spelling above was the only one that caught it.)
+    findings = lint_source(
+        """
+        import glob
+
+        class Charm:
+            def publish(self, relation):
+                data = UnitData(dashboards=list(glob.glob("*.json")))
+                relation.data[self.app]["d"] = data.model_dump_json()
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_pydantic_model_dump_of_unstable_list_field_is_flagged(lint_source):
+    # Same as above for the dict-producing ``model_dump()`` spelling.
+    findings = lint_source(
+        """
+        import glob
+
+        class Charm:
+            def publish(self, relation):
+                data = UnitData(dashboards=list(glob.glob("*.json")))
+                relation.data[self.app]["d"] = str(data.model_dump())
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_model_dump_of_opaque_param_is_still_laundered(lint_source):
+    # Monotonicity guard: a dump of an *opaque model parameter* carries
+    # only contract-boundary uncertainty (the model's field-NAME order), which the
+    # dump genuinely launders. Filtering concrete content must NOT start flagging
+    # this -- it stays a non-write, no databag finding.
+    findings = lint_source(
+        """
+        class Charm:
+            def publish(self, relation, model):
+                relation.data[self.app]["d"] = model.model_dump_json()
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+# -- dict-by-fixed-key field provenance -----------------------------------------
+
+
+def test_unstable_value_extracted_by_dict_key_is_flagged(lint_source):
+    # a value buried under a constant dict key, then pulled back out by
+    # that key and serialised, still flaps. The fixed-key read must return *that
+    # key's* taint, not be treated as an order-independent mapping lookup.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def publish(self, relation, peers):
+                cfg = {"jobs": list(set(peers))}
+                relation.data[self.app]["x"] = json.dumps(cfg["jobs"])
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_unstable_value_extracted_from_instance_attr_dict_is_flagged(lint_source):
+    # The cross-method half: build the dict in __init__, pull the unstable value out
+    # by key in a handler. Carried class-wide under the compound attr ``cfg['jobs']``.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def __init__(self, peers):
+                self.cfg = {"jobs": list(set(peers))}
+            def reconcile(self, relation):
+                relation.data[self.app]["x"] = json.dumps(self.cfg["jobs"])
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_clean_sibling_dict_key_is_not_flagged(lint_source):
+    # Field-sensitivity guard: extracting a *clean* sibling key from the same dict
+    # must NOT be flagged. This is the false positive the conservative whole-container
+    # approach was rejected for -- per-key tracking keeps it clean.
+    findings = lint_source(
+        """
+        class Charm:
+            def publish(self, relation, peers):
+                cfg = {"jobs": list(set(peers)), "name": "fixed"}
+                relation.data[self.app]["x"] = cfg["name"]
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_clean_sibling_key_of_instance_attr_dict_is_not_flagged(lint_source):
+    # Same field-sensitivity guard across methods.
+    findings = lint_source(
+        """
+        class Charm:
+            def __init__(self, peers):
+                self.cfg = {"jobs": list(set(peers)), "name": "fixed"}
+            def reconcile(self, relation):
+                relation.data[self.app]["x"] = self.cfg["name"]
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_whole_container_dump_with_buried_unstable_value_is_flagged(lint_source):
+    # Regression: dumping the *whole* dict (not extracting a key) still flaps via the
+    # buried list field -- the dominant container-burial shape, which already worked
+    # and must keep working alongside the per-key tracking.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def __init__(self, peers):
+                self.cfg = {"jobs": list(set(peers))}
+            def reconcile(self, relation):
+                relation.data[self.app]["d"] = json.dumps(self.cfg)
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
