@@ -95,6 +95,10 @@ class Context:
     #: the ``--explain-gaps`` scan to grade an untraced-parameter blind spot.
     params: List[str] = field(default_factory=list)
     param_annotations: Dict[str, Optional[str]] = field(default_factory=dict)
+    #: file/name of the function being walked -- used to resolve the born-site of a
+    #: ``self.<attr> = <expr>`` instance-attribute taint to the assigning method.
+    func_path: Optional[str] = None
+    func_name: Optional[str] = None
 
 
 class FunctionAnalyzer:
@@ -123,6 +127,8 @@ class FunctionAnalyzer:
             cls=fi.class_name,
             params=list(fi.params),
             param_annotations=dict(fi.param_annotations),
+            func_path=fi.path,
+            func_name=fi.name,
         )
         self._visit_body(getattr(fi.node, "body", []), ctx, handler)
 
@@ -215,6 +221,49 @@ class FunctionAnalyzer:
                         ctx.env[f"{name}.{fld}"] = set(
                             ctx.env.get(f"{name}.{fld}", ())
                         ) | set(origins)
+
+    @staticmethod
+    def _resolve_attr_origin(o: Origin, ctx: Context):
+        """Resolve a ``self.<attr>`` taint origin's born-site to the assigning method.
+
+        Mirrors :func:`handlers._resolve_field_origin`: a locally-born origin carries
+        ``None`` placeholders (== "this file / this function"). The attribute may be
+        read back in *another* method/file, so the placeholders are pinned to the
+        assigning method here, letting a finding blame the ``set()`` in ``__init__``
+        rather than the reader's serializer. Param-flavored origins are dropped (not
+        remappable without the call's arg mapping).
+        """
+        if o == "volatile":
+            return o
+        if not isinstance(o, tuple):
+            return None
+        tag = o[0]
+        if tag in ("local", "element"):
+            return (tag, o[1] or ctx.func_path, o[2], o[3] or ctx.func_name)
+        if tag == "itercaller":
+            return (tag, o[1] or ctx.func_path, o[2], o[3])
+        return None  # param / iterparam: not cross-method-resolvable here
+
+    def _record_instance_attr(
+        self, tgt: ast.AST, taint: Set[Origin], ctx: Context
+    ) -> None:
+        """For ``self.<attr> = <expr>``, union the field's taint into the class map.
+
+        The cross-method half of instance-attribute provenance: the within-method
+        read-back is already handled by the ``"self.<attr>"`` env key; this carries
+        the same taint to a read in a *different* method of the class.
+        """
+        if not (
+            isinstance(tgt, ast.Attribute)
+            and isinstance(tgt.value, ast.Name)
+            and tgt.value.id in ("self", "cls")
+            and ctx.cls
+        ):
+            return
+        resolved = {self._resolve_attr_origin(o, ctx) for o in taint}
+        self.engine.record_instance_attr(
+            ctx.cls, tgt.attr, {o for o in resolved if o}
+        )
 
     def _returned_field_map(self, value: ast.AST, ctx: Context):
         """Per-field taint of a returned value object: ``{field -> origins}``.
@@ -676,6 +725,10 @@ class FunctionAnalyzer:
                 path = astutils.attr_path(tgt)
                 if path is not None:
                     ctx.env[path] = set(taint)
+                # ``self.<attr> = expr``: also carry the taint class-wide, so a read
+                # in another method (the build-in-__init__, read-in-handler idiom)
+                # stays field-sensitive across the method boundary.
+                self._record_instance_attr(tgt, taint, ctx)
                 # ``container[k] = <unordered>`` / ``obj.attr = <unordered>``: the
                 # element write also taints the enclosing container, so a later
                 # serialization of the *whole* container is order-unstable.
@@ -699,6 +752,13 @@ class FunctionAnalyzer:
             self._record_type(stmt.target, stmt.value, ctx)
             self._record_databag_alias(stmt.target, stmt.value, ctx)
             self._record_field_taint(stmt.target.id, stmt.value, ctx)
+        elif stmt.value is not None:
+            path = astutils.attr_path(stmt.target)
+            if path is not None:
+                ctx.env[path] = self._eval(stmt.value, ctx)
+            self._record_instance_attr(
+                stmt.target, self._eval(stmt.value, ctx), ctx
+            )
 
     def _visit_expr_stmt(self, stmt: ast.Expr, ctx: Context, handler: Handler) -> None:
         call = stmt.value

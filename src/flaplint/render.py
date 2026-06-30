@@ -174,13 +174,18 @@ def _describe(f: Finding) -> str:
     if f.origin_path:
         origin = f"{_relpath(f.origin_path)}:{f.origin_line}"
         if f.via:
+            # The born site is in another function, reached through one or more
+            # call/return/attribute hops -- so this is NOT a direct
+            # ``subject = via()`` assignment. Say "upstream" and "fix it there" so
+            # the reader looks at the source, not for a call next to this write.
             sentence += (
-                f" The value assigned to {subject} originates from "
-                f"`{f.via}()` at {origin}."
+                f" Fix at the source: the instability is created upstream in "
+                f"`{f.via}()` ({origin}) and reaches {subject} through intervening "
+                "assignments — not at this write."
             )
         else:
             sentence += (
-                f" The value assigned to {subject} originates at {origin}."
+                f" The instability is created at {origin}; fix it there."
             )
     return sentence
 

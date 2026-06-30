@@ -129,3 +129,43 @@ def test_json_flag_is_alias_for_format_json(tmp_path, capsys):
     main([path, "--min-confidence", "low", "--json"])
     out = capsys.readouterr().out.lstrip()
     assert out.startswith("[")
+
+
+# -- offending-variable naming (handlers._variable) -------------------------
+
+import ast
+
+from flaplint.handlers import _variable
+
+
+def _expr(src: str) -> ast.AST:
+    return ast.parse(src, mode="eval").body
+
+
+def test_variable_names_a_one_level_instance_attribute():
+    # The charm idiom: an instance attribute is the actionable identifier, not the
+    # useless bare ``self`` (which root_name would yield and we'd drop).
+    assert _variable(_expr("self.upgrade_stack")) == "self.upgrade_stack"
+
+
+def test_variable_drills_into_a_mapping_literal():
+    # ``databag.update({"k": json.dumps(self.x)})`` -- the offending value is nested
+    # inside the mapping; name it rather than reporting <anonymous>.
+    assert _variable(_expr('{"upgrade-stack": json.dumps(self.upgrade_stack)}')) == (
+        "self.upgrade_stack"
+    )
+
+
+def test_variable_drills_into_a_list_and_peels_wrappers():
+    assert _variable(_expr("[str(peers)]")) == "peers"
+
+
+def test_variable_keeps_access_chain_root_for_subscript_and_call():
+    # Regression: the existing root-of-chain behaviour must survive.
+    assert _variable(_expr("addrs[0]")) == "addrs"
+    assert _variable(_expr("glob('*.json')")) == "glob"
+
+
+def test_variable_is_empty_for_a_bare_self_and_an_anonymous_literal():
+    assert _variable(_expr("self")) == ""
+    assert _variable(_expr("{1, 2, 3}")) == ""  # no named value to point at

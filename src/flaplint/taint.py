@@ -144,6 +144,41 @@ class TaintEngine:
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
         self._aliases = FileImports()
+        #: class name -> ``{attr -> origins}``: the taint an instance attribute
+        #: carries, unioned over every ``self.<attr> = <expr>`` assignment in any
+        #: method of the class. Lets taint survive being parked on ``self`` in one
+        #: method (typically ``__init__``) and read back in another -- the
+        #: cross-method instance-attribute barrier (the charm idiom: build in
+        #: ``__init__``, read in a handler). Born-sites are pre-resolved to the
+        #: assigning method's file/name. Grows monotonically (terminates the loop).
+        self.instance_attr_taint: Dict[str, Dict[str, Set[Origin]]] = {}
+        #: set True whenever :meth:`record_instance_attr` grows the map, so the
+        #: summary fixed point keeps iterating until instance-attr taint settles.
+        self.instance_attr_changed = False
+
+    def record_instance_attr(
+        self, cls_ctx: Optional[str], attr: str, origins: Set[Origin]
+    ) -> None:
+        """Union ``origins`` into the class-level taint of ``self.<attr>``."""
+        if not cls_ctx or not origins:
+            return
+        bucket = self.instance_attr_taint.setdefault(cls_ctx, {})
+        merged = bucket.get(attr, set()) | set(origins)
+        if merged != bucket.get(attr, set()):
+            bucket[attr] = merged
+            self.instance_attr_changed = True
+
+    def _instance_attr_taint(
+        self, node: ast.Attribute, cls_ctx: Optional[str]
+    ) -> Set[Origin]:
+        """Class-level taint of ``self.<attr>`` (cross-method), or empty."""
+        if (
+            cls_ctx
+            and isinstance(node.value, ast.Name)
+            and node.value.id in ("self", "cls")
+        ):
+            return set(self.instance_attr_taint.get(cls_ctx, {}).get(node.attr, ()))
+        return set()
 
     @staticmethod
     def survives_structural_compare(origins: Set[Origin]) -> Set[Origin]:
@@ -269,6 +304,11 @@ class TaintEngine:
             path = astutils.attr_path(node)
             if path is not None and path in env:
                 return set(env[path])
+            # ``self.<attr>`` parked in one method and read in another: consult the
+            # class-level instance-attribute taint (the cross-method barrier).
+            inst = self._instance_attr_taint(node, cls_ctx)
+            if inst:
+                return inst
             # ``self.<prop>`` / ``self.<member>.<prop>``: consult the summary.
             return self._property_taint(node, cls_ctx)
 

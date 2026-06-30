@@ -90,16 +90,50 @@ def _unwrap(node: ast.AST) -> ast.AST:
     return cur
 
 
+def _container_parts(node: ast.AST) -> List[ast.AST]:
+    """The value sub-expressions of a container literal / comprehension (else [])."""
+    if isinstance(node, ast.Dict):
+        return [v for v in node.values if v is not None]
+    if isinstance(node, (ast.List, ast.Set, ast.Tuple)):
+        return list(node.elts)
+    if isinstance(node, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+        return [node.elt]
+    if isinstance(node, ast.DictComp):
+        return [node.value]
+    return []
+
+
 def _variable(node: ast.AST) -> str:
     """Best-effort name of the offending variable/collection (``""`` if none).
 
-    The root of an access chain (``addrs[0]`` -> ``addrs``, ``glob(...)`` ->
-    ``glob``) is the actionable identifier a user looks at; anonymous values
-    (a bare ``{...}`` set literal) have no name and yield ``""``. Transparent
-    serialiser wrappers (``str(peers)``) are peeled first so the collection is
-    named, not the wrapper.
+    Named so a finding can say *which* value to look at, in order of usefulness:
+
+    * a one-level attribute path -- ``self.upgrade_stack`` rather than the useless
+      bare ``self`` (the value parked on an instance attribute, the charm idiom);
+    * the root of an access chain -- ``addrs[0]`` -> ``addrs``, ``glob(...)`` ->
+      ``glob``;
+    * drilling one step into a container the unstable value is *nested* in -- the
+      mapping handed to ``databag.update({"k": json.dumps(self.x)})`` yields
+      ``self.x``, not ``<anonymous>``.
+
+    Transparent serialiser wrappers (``str(peers)``) are peeled first so the
+    collection is named, not the wrapper. A bare ``{...}`` with no named value, or a
+    deeper ``a.b.c`` chain, still yields ``""``.
     """
-    name = astutils.root_name(_unwrap(node))
+    node = _unwrap(node)
+    path = astutils.attr_path(node)  # ``self.upgrade_stack`` (one-level attribute)
+    if path is not None:
+        return path
+    parts = _container_parts(node)
+    if parts:
+        # the offending collection is nested inside a literal -- name the first
+        # value-leaf that has a name (the born-site provenance pins the real source).
+        for part in parts:
+            name = _variable(part)
+            if name:
+                return name
+        return ""
+    name = astutils.root_name(node)
     return name if name and name not in ("self", "cls") else ""
 
 

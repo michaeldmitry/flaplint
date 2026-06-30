@@ -24,10 +24,15 @@ def compute_summaries(functions: List[FuncInfo], analyzer: FunctionAnalyzer) -> 
     changed = True
     while changed:
         changed = False
+        analyzer.engine.instance_attr_changed = False
         for fi in functions:
             handler = SummaryHandler(fi)
             analyzer.analyze(fi, handler)
             changed = changed or handler.changed
+        # instance-attribute taint (``self.<attr>`` carried across methods) grows
+        # over the same fixed point: a class can't settle until every method that
+        # assigns an attribute has been seen, then every reader re-evaluated.
+        changed = changed or analyzer.engine.instance_attr_changed
 
 
 def _own_returns(node: ast.AST) -> List[ast.expr]:
