@@ -4,17 +4,30 @@ Charms don't usually write their own databags — they hand values to a *library
 does. Those libraries reach a running charm by two different routes, and `flaplint`
 treats them differently.
 
-## Quick guide: which flag to use
+## It's automatic by default
+
+You usually need **no flags**. `flaplint src` auto-discovers the charm's own
+environment and traces the dependencies that write relation data:
+
+1. a sibling `.venv`/`venv`'s `bin/python` is auto-picked and used to resolve
+   imports through its import system (namespace-package-aware — the most reliable
+   path); failing that,
+2. the sibling `.venv`/`venv`'s `site-packages` is folder-scanned.
+
+Findings *inside* traced dependencies are shown by default (as non-blocking
+warnings).
+
+## When to reach for a flag
 
 | my situation | flag |
 |---|---|
-| A venv already exists for this charm | `--python .venv/bin/python` ⭐ most reliable |
-| No venv, but there's a `.venv`/`venv` folder next to the charm | `--auto-deps` |
-| I have a bare `site-packages` directory | `--venv path/to/site-packages` |
-| I want to see findings *inside* the dependency (not just trace through it) | add `--report-deps` to any of the above |
+| The right environment isn't a sibling `.venv` (e.g. a `uv`/`tox`/system env elsewhere) | `--python path/to/that/.venv/bin/python` |
+| I only have a bare `site-packages` directory (an unpacked `.charm`, no interpreter) | `--venv path/to/site-packages` |
+| I want a fast, own-code-only run (CI gate, or no venv present) | `--no-deps` |
+| I want to trace deps but *not* see findings inside them | `--no-report-deps` |
 
-If you skip all three flags, `flaplint` only reads the charm's own `src/` and the
-sibling `lib/` directory — it won't trace calls into installed packages.
+`--no-deps` reads only the charm's own `src/` and sibling `lib/` — it won't trace
+calls into installed packages.
 
 ## Vendored libraries
 
@@ -35,40 +48,41 @@ Real PyPI or `charmlibs` dependencies: `cosl`, `ops`, `charmlibs.interfaces.otlp
 `coordinated-workers`, and so on.
 
 - **Where it lives:** in a venv / `site-packages` — not beside your source.
-- **How it's found:** only if you point `flaplint` at the environment with a flag.
+- **How it's found:** automatically (a sibling `.venv`), or by pointing `flaplint`
+  at the environment with a flag.
 
-All three flags add **read-only** roots: the library code is read so calls into it can
-be followed, but findings are reported against *your* code unless you pass `--report-deps`.
+These roots are **read-only**: the library code is read so calls into it can be
+followed. Findings inside them are shown by default (as warnings) unless you pass
+`--no-report-deps`.
 
-### `--python PATH` ⭐ most reliable
+### Automatic (the default)
 
-Ask a working interpreter where each imported dependency lives. Use when you have an
-active venv (`uv sync`, tox, `$VIRTUAL_ENV`):
+`flaplint src` picks up a sibling `.venv`/`venv` on its own: it prefers the venv's
+`bin/python` (see below), falling back to folder-scanning its `site-packages`, and
+keeps only the packages that actually write to relation data. For coordinated-workers
+charms this picks up `coordinated_workers/coordinator.py`, which writes the
+worker/coordinator relation data. Use `--no-deps` to skip this entirely.
+
+### `--python PATH` — point at a specific interpreter
+
+By default a sibling `.venv`'s `bin/python` is auto-picked; pass `--python` to use a
+different environment (`uv sync`, tox, `$VIRTUAL_ENV`, a CI cache):
 
 ```bash
-flaplint src --python my-charm/.venv/bin/python
+flaplint src --python /path/to/other/.venv/bin/python
 ```
 
-This is the most reliable option because:
+Resolving through an interpreter is the most reliable mechanism because:
 - It handles namespace packages (`charmlibs.interfaces.*` ships as a namespace package
   with no `__init__.py` at the top level — folder scanning misses it; the interpreter
   finds it correctly).
 - It handles exact install locations and single-file dependencies.
 - It **installs nothing** — it only reads what's already there.
 
-### `--auto-deps`
+An **editable install** (`pip install -e`) resolves a package back to the charm's own
+`src`; flaplint compares real paths so that code is analysed once, not reported twice.
 
-Find a sibling `.venv`/`venv` automatically and scan it, keeping only the packages
-that actually write to relation data. No config required:
-
-```bash
-flaplint src --auto-deps
-```
-
-For coordinated-workers charms this picks up `coordinated_workers/coordinator.py`,
-which writes the worker/coordinator relation data.
-
-### `--venv PATH`
+### `--venv PATH` — a bare site-packages
 
 Point at a `site-packages` directory you name. Use when you have a bare
 `site-packages` dir (or an unpacked `.charm`) and no interpreter to ask:
@@ -79,7 +93,7 @@ flaplint src --venv .venv/lib/python3.12/site-packages
 
 ## Why the tool doesn't scan all of `site-packages`
 
-Scanning the whole `site-packages` tree is slow and noisy. `--auto-deps` and
+Scanning the whole `site-packages` tree is slow and noisy. Automatic resolution and
 `--python` narrow it down with two cheap checks:
 
 1. **Imports:** only the top-level modules your charm actually `import`s are
@@ -101,7 +115,8 @@ Scanning the whole `site-packages` tree is slow and noisy. `--auto-deps` and
 That's why `charmlibs.interfaces.otlp`, which publishes via
 `relation.save(databag, self._charm.app)`, is correctly included.
 
-## When a finding comes from a dependency: error or warning?
+## When a finding comes from a dependency: yours or not?
 
-See [Errors vs. warnings](../README.md#errors-vs-warnings--who-can-fix-it) for how the
-tool tells apart code you own (error) from libraries you only use (warning).
+See [Ownership — whose job is the fix?](../README.md#ownership--whose-job-is-the-fix) for
+how the tool tells apart code you own (`✖` yours, fails the run) from libraries you only
+use (`▲` in a dependency, non-blocking) — a separate axis from `confidence`.

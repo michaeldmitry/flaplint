@@ -103,21 +103,23 @@ uv pip install -e .       # or: pip install -e .
 ```
 
 ```bash
-# the common case: scan a charm's src/ (its sibling lib/ is auto-included)
+# the common case: scan a charm's src/ (its sibling lib/ is auto-included).
+# Dependencies are resolved automatically: flaplint finds the charm's own
+# environment (a sibling .venv's bin/python, else its site-packages) and traces
+# the deps that write relation data — no flags needed.
 flaplint /path/to/my-charm/src
 
 # scan a checked-out library source tree as well, and report on it
 flaplint my-charm/src --dep ../cos-lib/src
 
-# follow into installed dependencies (cosl, ops, …) to resolve calls,
-# but only *report* problems inside your own code
-flaplint my-charm/src --venv my-charm/.venv
+# fast, own-code-only run (skip dependency resolution) — e.g. a CI gate
+flaplint my-charm/src --no-deps
 
-# auto-detect which installed deps write to relation data and trace only those
-flaplint my-charm/src --auto-deps
+# point at a specific environment instead of the auto-picked sibling .venv
+flaplint my-charm/src --python /path/to/other/.venv/bin/python
 
-# resolve deps through a working interpreter — most reliable
-flaplint my-charm/src --python my-charm/.venv/bin/python
+# trace dependencies but don't report findings inside them (resolution only)
+flaplint my-charm/src --no-report-deps
 
 # CI gate: only surface the confident findings, machine-readable
 flaplint my-charm/src --min-confidence high --json
@@ -145,18 +147,18 @@ for f in findings:
 | `paths…` | charm source files or directories to scan and report on |
 | `--dep PATH` | extra source root to analyse and report on (e.g. a vendored lib) |
 | `--venv PATH` | virtualenv / `site-packages` to trace into for call resolution only |
-| `--auto-deps` | auto-detect which installed deps write to relation data and trace only those (locates a sibling `.venv`/`venv` if no `--venv` is given) |
-| `--python PATH` | resolve the charm's deps through an existing interpreter's import system (e.g. a `uv sync` `.venv`'s `bin/python`); namespace-package-aware, *installs nothing*, traces only the deps that write databags |
-| `--report-deps` | also report findings *inside* `--venv` packages (default: trace only) |
+| `--python PATH` | resolve the charm's deps through a *specific* interpreter's import system (e.g. a `uv sync` `.venv`'s `bin/python`); namespace-package-aware, *installs nothing*. **A sibling `.venv`'s `bin/python` is auto-picked by default** — pass this only to override |
+| `--no-deps` | disable automatic dependency resolution; scan only the charm's own `src/` and sibling `lib/` (fast, own-code-only — e.g. a CI gate, or when no venv is present) |
+| `--no-report-deps` | trace installed dependencies for call resolution but do **not** report findings inside them (default: dependency findings *are* shown, as non-blocking warnings; a charm's own vendored `lib/` is always reported) |
 | `--min-confidence {low,medium,high}` | reporting threshold (default `medium`) |
-| `--sort {criticality,location}` | finding order: most severe first, or by file location (default `criticality`) |
+| `--sort {criticality,location}` | finding order: most important first (yours before dependencies, higher confidence first), or by file location (default `criticality`) |
 | `--format {pretty,concise,json}` | output style: grouped colour report (`pretty`, default), one-line-per-finding for editors/grep (`concise`), or machine `json` |
 | `--json` | alias for `--format json` |
 | `--explain-gaps` | also list **blind spots**: writes whose content flaplint couldn't fully trace (an unresolved library call, a value-object field, an untraced parameter). Not findings, never fail the run — a worklist of where a missed flap could hide |
 
 > Colour in `pretty` mode is emitted only to a terminal; it auto-disables when piped or in CI, and honours the `NO_COLOR` / `FORCE_COLOR` conventions.
 
-> For how `--venv`, `--auto-deps` and `--python` discover vendored vs. installed libraries, see [Resolving charm dependencies](docs/resolving-dependencies.md).
+> For how automatic resolution, `--venv` and `--python` discover vendored vs. installed libraries, see [Resolving charm dependencies](docs/resolving-dependencies.md).
 
 ### Silencing a known-good line
 
@@ -198,51 +200,48 @@ For the full story — the six instability kinds, how each serializer treats the
 By default `flaplint` prints a **grouped, colourised report**:
 
 ```text
-flaplint  · relation-databag flapping check
+flaplint  · charm flapping checker
 
-src/charm.py  · 3 error(s)
-  ✖  142:9  unordered collection · peers → databag  [high]
-            a set/dict is serialised without sorted(), so its bytes reshuffle
-            from one reconcile to the next; downstream: spurious relation-changed churn
-            fix: sort before writing — json.dumps(sorted(x)) (or sort_keys=True for dict keys)
-            ↳ born at src/utils.py:20, written via _collect()
-  ✖  51:13  nondeterministic value · uuid4 → databag  [high]
-            the value is regenerated every reconcile, so it differs even when sorted;
-            downstream: spurious relation-changed churn
-            fix: make it stable — derive it deterministically, or persist it once and reuse it
+src/charm.py
+  ✖  142:9  unordered collection · peers → databag  · high confidence
+            `peers` is an unordered collection written to the relation databag.
+            Fix at the source: the instability is created upstream in `_collect()`
+            (src/utils.py:20).
+  ✖  51:13  nondeterministic value · uuid4 → databag  · high confidence
+            `uuid4` is freshly generated each time this code runs, so the value written
+            differs from last time (sorting cannot fix it).
 
-lib/charms/grafana_k8s/v0/grafana_dashboard.py  · 1 warning(s)
-  ▲ 1359:9  nondeterministic value · json → databag  [high]
-            the value is regenerated every reconcile, so it differs even when sorted;
-            downstream: spurious relation-changed churn
-            fix lives in a dependency you don't own — reported for awareness, doesn't fail CI
+lib/charms/grafana_k8s/v0/grafana_dashboard.py
+  ▲ 1359:9  nondeterministic value · stored_data → databag  · high confidence
+            `stored_data` is freshly generated each time this code runs …
 
 ────────────────────────────────────────────────────────
-  ✖ 4 problem(s)   3 error(s)   1 warning(s)   · 11 file(s) scanned
+  ✖ 3 flap risk(s)   2 yours   1 in dependencies   · 11 file(s) scanned
+  ✖ yours — fails the run     ▲ in a dependency — non-blocking
 ```
 
-Each finding's first line reads `mark line:col  <failure mode> · <variable> → <sink>  [confidence]`:
+Every finding carries **two independent axes**, spelled out so neither is mistaken for the other:
 
-| Part | Meaning |
-|------|---------|
-| `✖` / `▲` | **who can fix it** — `✖` is code you own (fails CI); `▲` lives in a dependency (non-blocking) |
-| `line:col` | **where to fix it** — for `unordered-pick` this is the pick itself, not the blameless serialiser |
-| failure mode | one of the four root causes; tells you *how to fix it* (see below) |
-| `· <variable>` | the **affected identifier** to go look at (`peers`, `scheduler_addrs`, or the volatile call `uuid4`) |
-| `→ <sink>` | where the value lands: `databag`, `file`, `plan`, or `hash` |
-| `[confidence]` | `high` / `medium` / `low` |
+| Axis | What it answers | How it shows |
+|------|-----------------|--------------|
+| **ownership** | *whose job is the fix?* | the `✖` **yours** / `▲` **in a dependency** mark, the footer legend, and the total (`2 yours`) tally |
+| **confidence** | *how sure is flaplint it's a real flap?* | `high` / `medium` / `low`, in the header tail |
 
-The indented lines explain *why* it flaps, the concrete *fix*, and — when the value is created elsewhere — a `↳ born at …` trail back to where it was created.
+They're orthogonal: a `▲` finding can be `high confidence` (a real flap, but in a library you don't own) and a `✖` can be `medium`. Each finding's header line reads `mark line:col  <failure mode> · <variable> → <sink>  · <confidence>`; then the indented plain-English *why* and *fix*, with a `Fix at the source …` trail when the value is born elsewhere.
+
+- `line:col` — **where to fix it** (for `unordered-pick` this is the pick itself, not the blameless serialiser)
+- `· <variable>` — the **affected identifier** to look at (`peers`, `scheduler_addrs`, `uuid4`)
+- `→ <sink>` — where the value lands: `databag`, `file`, `plan`, `hash`, or `render`
 
 ### Machine-readable / editor output
 
-For editors, `grep`, or scripts, `--format concise` emits one flat line per finding (and `--json` emits the structured records):
+For editors, `grep`, or scripts, `--format concise` emits one flat line per finding (and `--json` emits the structured records). The two axes are separate greppable fields — `owner=yours|dependency` and `confidence=high|medium|low`:
 
 ```text
-src/charm.py:142:9: type=unordered-collection severity=high sink=databag var=peers
-src/coordinator.py:229:42: type=unordered-pick severity=high sink=file var=scheduler_addrs
-src/charm.py:51:13: type=nondeterministic severity=high sink=databag var=uuid4
-lib/charms/grafana_k8s/v0/grafana_dashboard.py:1359:9: [warning] type=nondeterministic severity=high sink=databag var=json
+src/charm.py:142:9: owner=yours type=unordered-collection confidence=high sink=databag var=peers
+src/coordinator.py:229:42: owner=yours type=unordered-pick confidence=high sink=file var=scheduler_addrs
+src/charm.py:51:13: owner=yours type=nondeterministic confidence=high sink=databag var=uuid4
+lib/charms/grafana_k8s/v0/grafana_dashboard.py:1359:9: owner=dependency type=nondeterministic confidence=high sink=databag var=stored_data
 ```
 
 ### The four problem types
@@ -256,6 +255,6 @@ lib/charms/grafana_k8s/v0/grafana_dashboard.py:1359:9: [warning] type=nondetermi
 
 `kind=caller` means the bug is right here in your code. `kind=sink` means a helper function that writes a *parameter* unsorted — it trusts its caller to pass ordered data. See [sinks-and-findings.md](docs/sinks-and-findings.md) for the full grading rules.
 
-### Errors vs. warnings — who can fix it
+### Ownership — whose job is the fix?
 
-An **error** (`✖`) is code the charm owns — its `src/` or its own `lib/charms/<charm-name>/` namespace; these fail CI. A **warning** (`▲`) lives in a library the charm only *uses* and is shown for awareness but never fails CI — you can't fix someone else's library here.
+The blocking axis is about **responsibility**, not severity (that's what `confidence` is for). A `✖` **yours** finding is code the charm owns — its `src/` or its own `lib/charms/<charm-name>/` namespace; these fail the run. A `▲` **in a dependency** finding lives in a library the charm only *uses*: shown for awareness, but never fails the run — you can't fix someone else's library here. A dependency finding can still be `high confidence`; it just isn't yours to fix.

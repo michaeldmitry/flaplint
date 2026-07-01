@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import pytest
 import textwrap
 from pathlib import Path
 
@@ -61,6 +62,9 @@ def test_json_output_shape(tmp_path, capsys):
         "origin_path",
         "origin_line",
         "via",
+        "sink_path",
+        "sink_line",
+        "sink_col",
     }
     assert entry["kind"] == "caller"
     assert entry["confidence"] == "high"
@@ -96,3 +100,21 @@ def test_min_confidence_filters_medium_sinks(tmp_path, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert payload == []
     assert code == 0
+
+
+# -- dependency-flag CLI surface ---------------------------------------------
+
+
+def test_removed_flags_are_rejected(tmp_path):
+    # The old opt-in flags are gone: auto-deps is default, report-deps is opt-out.
+    path = _write(tmp_path, _CLEAN)
+    for gone in ("--auto-deps", "--report-deps"):
+        with pytest.raises(SystemExit):
+            main([path, gone])
+
+
+def test_no_deps_and_no_report_deps_are_accepted(tmp_path):
+    # The new opt-outs parse and run.
+    path = _write(tmp_path, _CLEAN)
+    assert main([path, "--no-deps", "--min-confidence", "low"]) == 0
+    assert main([path, "--no-report-deps", "--min-confidence", "low"]) == 0

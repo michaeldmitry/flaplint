@@ -131,7 +131,7 @@ databag["name"] = json.dumps(self.cfg["name"])          # clean: sibling key is 
 
 **Fix:** sort when the value is first created (`self._endpoints = sorted(...)`) or at the point of use (`sorted(self._endpoints)`).
 
-Flaplint tracks each field independently — `cfg.name` stays clean even if `cfg.endpoints` is unstable. The tracking also carries across a function return: `cfg = self._build_cfg(); cfg.endpoints` is caught if `_build_cfg` returns an object with an unstable field.
+Flaplint tracks each field independently — `cfg.name` stays clean even if `cfg.endpoints` is unstable. The tracking also carries across a function return: `cfg = self._build_cfg(); cfg.endpoints` is caught if `_build_cfg` returns an object with an unstable field. It also follows a nested field chain to any depth — `self.ctx.config.targets` is tracked the same as `self.targets`, so long as the chain is pure attribute access (a `.get_ctx().targets` call or `self.items[0].targets` index in the middle stops it; see [Known gaps](architecture.md#known-gaps)).
 
 ### Pattern 7: Filesystem listing
 
@@ -183,7 +183,20 @@ relation.data[app]["d"] = data.model_dump_json()         # caught: field names a
 
 **Fix:** `sorted(glob.glob("*.json"))` — sort before constructing the model.
 
-**Pydantic v1 note:** the v1 spellings `.json()` / `.dict()` take the conservative path — they inherit *all* receiver taint, including list-field element disorder. So they catch the set-coerced-to-list case that v2 `model_dump_json()` misses (the known gap documented in [architecture.md](architecture.md#known-gaps)).
+**A bare `set` handed to a list field is caught too.** Pydantic's `__init__` coerces the value into the field's declared type, so a `set` passed to a `list`/`tuple`/`Sequence` field is turned into a positionally-ordered sequence *inside the model* — its disorder moves from key order (which key-sorting fixes) into element order (which it can't):
+
+```python
+class Cfg(BaseModel):
+    hosts: list[str]                       # __init__ runs list(hosts) internally
+
+cfg = Cfg(hosts=set(peers))                # set → list field: promoted to itercaller
+relation.data[app]["h"] = cfg.model_dump_json()          # caught (not laundered)
+relation.data[app]["h"] = json.dumps(cfg.hosts, sort_keys=True)  # caught on read-back too
+```
+
+flaplint reads the model's field annotation to recognise this. It's gated on a **set** into a **sequence-typed** field of a **directly-`BaseModel`-based** model: a `Set[str]` field keeps set semantics (still key-order, still laundered), and a plain `@dataclass` doesn't coerce at all (see [Known gaps](architecture.md#known-gaps)).
+
+**Pydantic v1 note:** the v1 spellings `.json()` / `.dict()` take the conservative path — they inherit *all* receiver taint, so they also catch the field-value flaps above (and are the reason the pre-annotation-aware analysis still caught the `list(...)` case).
 
 ---
 

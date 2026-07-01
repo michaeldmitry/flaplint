@@ -68,6 +68,7 @@ def report(
         sink: str,
         variable: str,
         origin: Tuple = None,
+        sink_loc: "Tuple[str, ast.AST] | None" = None,
     ) -> None:
         line = getattr(node, "lineno", 0)
         if line in suppressed.get(path, ()):
@@ -77,6 +78,25 @@ def report(
         if key in seen:
             return
         seen.add(key)
+        # Downstream sink pointer: where the value is actually written, when that
+        # differs from the finding location (an ``unordered-pick`` / iteration
+        # finding sits at the *fix* site, which can be lines or a helper away from
+        # the write). Suppressed when the write is on the *same line* as the
+        # finding (e.g. an inline comprehension in the databag write), to avoid a
+        # redundant "reaches databag at <the same line>".
+        sink_path, sink_line, sink_col = "", 0, 0
+        if sink_loc is not None:
+            s_path = sink_loc[0]
+            s_line = getattr(sink_loc[1], "lineno", 0)
+            s_col = getattr(sink_loc[1], "col_offset", 0) + 1
+            if (s_path, s_line) != (path, line):
+                sink_path, sink_line, sink_col = s_path, s_line, s_col
+        # Upstream born-at pointer, suppressed when it resolves to the finding's own
+        # line (e.g. ``list(set(x))`` -- the set and the materialization share a
+        # line), so it never redundantly points at itself.
+        origin_path, origin_line, via = "", 0, ""
+        if origin and (origin[0], origin[1]) != (path, line):
+            origin_path, origin_line, via = origin[0], origin[1], origin[2]
         findings.append(
             Finding(
                 path,
@@ -87,9 +107,12 @@ def report(
                 rule,
                 sink,
                 variable,
-                origin_path=origin[0] if origin else "",
-                origin_line=origin[1] if origin else 0,
-                via=origin[2] if origin else "",
+                origin_path=origin_path,
+                origin_line=origin_line,
+                via=via,
+                sink_path=sink_path,
+                sink_line=sink_line,
+                sink_col=sink_col,
             )
         )
 
@@ -112,8 +135,8 @@ def report(
         analyzer.analyze(fi, ReportHandler(fi, sink_out, gaps_out))
         if gaps_out:
             gaps.extend(gaps_out)
-        for node, conf, rule, sink, variable, path, origin in sink_out:
-            emit(path, node, "caller", conf, rule, sink, variable, origin)
+        for node, conf, rule, sink, variable, path, origin, sink_loc in sink_out:
+            emit(path, node, "caller", conf, rule, sink, variable, origin, sink_loc)
             if rule == "unordered-iteration":
                 confirmed_iter.add(
                     (

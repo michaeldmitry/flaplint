@@ -492,3 +492,230 @@ def test_nested_container_element_mutation_taints_root(lint_source):
     )
     assert any(f.rule == "unordered-iteration" for f in findings)
 
+
+
+# -- downstream sink pointer (where the value is written, when it's not inline) --
+# An iteration / pick finding is reported at the *fix* site (the loop / the index),
+# which can be several lines -- or a helper call -- away from the databag write. The
+# finding carries that downstream write location so the report can point at it.
+
+
+def test_iteration_finding_carries_downstream_sink_location(lint_source):
+    # The materialised list is built on one line and written to the databag several
+    # lines later: the finding sits at the materialisation, and pins the later write.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                eps = list(relation.units)          # line 6: the iteration (fix here)
+                payload = json.dumps(eps)            # line 7
+                relation.data[self.app]["v"] = payload   # line 8: the write
+        """
+    )
+    iters = [f for f in findings if f.rule == "unordered-iteration"]
+    assert iters, "expected an unordered-iteration finding"
+    f = iters[0]
+    assert f.line == 6           # reported at the iteration
+    assert f.sink_line == 8      # points at the databag write downstream
+    assert f.sink_path == f.path
+
+
+def test_inline_iteration_has_no_redundant_sink_pointer(lint_source):
+    # When the iteration and the write are on the *same line* (an inline
+    # comprehension in the databag write), the pointer would just repeat the
+    # finding's own line, so it is suppressed.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps([u.name for u in relation.units])
+        """
+    )
+    iters = [f for f in findings if f.rule == "unordered-iteration"]
+    assert iters, "expected an unordered-iteration finding"
+    assert iters[0].sink_line == 0   # no separate pointer for a same-line write
+
+
+def test_sink_pointer_appears_in_concise_output(lint_source):
+    # The machine-readable one-liner surfaces the pointer as ``sink_at=path:line``.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                eps = list(relation.units)
+                payload = json.dumps(eps)
+                relation.data[self.app]["v"] = payload
+        """
+    )
+    line = next(f.format() for f in findings if f.rule == "unordered-iteration")
+    assert "sink_at=" in line and ":8" in line.split("sink_at=", 1)[1]
+
+
+# -- born-at origin on iteration findings (restored after the local→itercaller shift) --
+# The finding anchors at the materialisation (the fix site); the born-site of the
+# underlying unordered value is carried through the promotion so the finding can still
+# point ``origin=`` at the ``set()`` that created the churn -- the trail that used to
+# ride the ``local`` flavor before it was split into ``itercaller``.
+
+
+def test_iteration_finding_points_origin_at_the_born_set(lint_source):
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                s = set(self.hosts)              # line 6: born here
+                eps = list(s)                    # line 7: materialised (fix here)
+                relation.data[self.app]["v"] = json.dumps(eps)   # line 8: written
+        """
+    )
+    f = next(f for f in findings if f.rule == "unordered-iteration")
+    assert f.line == 7                      # anchored at the materialisation
+    assert f.origin_line == 6               # points back at the born set
+    assert f.sink_line == 8                 # and forward at the write
+
+
+def test_inline_materialisation_has_no_redundant_origin(lint_source):
+    # ``list(set(x))`` on one line: the born set and the materialisation share a line,
+    # so the origin would just point at itself and is suppressed.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps(list(set(self.hosts)))
+        """
+    )
+    f = next(f for f in findings if f.rule == "unordered-iteration")
+    assert f.origin_line == 0               # no redundant self-pointing origin
+
+
+def test_sink_pointer_lands_on_the_write_line_not_the_construction(lint_source):
+    # ``Model(\n...\n).dump(bag)`` -- the outer call's lineno is the model line, but
+    # the databag write is on the ``.dump(bag)`` line. The sink pointer must land on
+    # the write, not the start of the multi-line construction.
+    findings = lint_source(
+        """
+        from pydantic import BaseModel
+
+        class Data(BaseModel):
+            items: list
+
+        class Charm:
+            def publish(self, relation):
+                eps = list(relation.units)          # line 9: the iteration
+                Data(
+                    items=eps,
+                ).dump(relation.data[self.app])     # line 12: the write
+        """
+    )
+    f = next(f for f in findings if f.rule == "unordered-iteration")
+    assert f.line == 9        # anchored at the iteration
+    assert f.sink_line == 12  # points at the .dump write, not the Data( line
+
+
+# -- set built incrementally via .add()/.update() (intrinsic hash disorder) ------
+# A set's iteration order is hash-seeded, so a set built up with .add()/.update() is
+# unstable *regardless of what was inserted* -- even from an ordered source, and even
+# though the empty ``set()`` it started from is otherwise stable. This is the
+# ``requested_protocols = set(); for ...: .update(...)`` idiom (cos_agent), which
+# must be caught without needing ``--relations-unordered``.
+
+
+def test_empty_set_updated_in_loop_then_iterated_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def collect(self):
+                acc = set()
+                for x in self.things:      # source order irrelevant: acc is a set
+                    acc.update(x)
+                return acc
+
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps(list(self.collect()))
+        """
+    )
+    assert any(f.rule == "unordered-iteration" and f.sink == "databag" for f in findings)
+
+
+def test_empty_set_add_then_serialized_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                acc = set()
+                acc.add(self.name)
+                relation.data[self.app]["v"] = json.dumps(list(acc))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_incrementally_built_set_sorted_before_sink_is_clean(lint_source):
+    # The sanitiser is honoured: sorting the set before it reaches the sink is clean.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def collect(self):
+                acc = set()
+                for x in self.things:
+                    acc.add(x)
+                return sorted(acc)
+
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps(self.collect())
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_dict_accumulator_from_ordered_source_is_not_flagged(lint_source):
+    # Guard against over-tainting: a *dict* built in a loop keeps insertion order, so
+    # from an ordered source it is stable -- only a set has intrinsic hash disorder.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def collect(self):
+                d = {}
+                for x in self.ordered_list:
+                    d[x] = 1
+                return d
+
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps(self.collect(), sort_keys=True)
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_empty_set_never_mutated_stays_stable(lint_source):
+    # An empty set that is never populated has one stable serialization -- it must
+    # not be flagged just for being a set.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def publish(self, relation):
+                acc = set()
+                relation.data[self.app]["v"] = json.dumps(list(acc))
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)

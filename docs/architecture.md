@@ -175,12 +175,19 @@ def reconcile(self): push(",".join(self._render()))  # _render() builds from sel
 
 flaplint sees `_render()` return something but can't trace what it rebuilds from. If the method returned `self._hosts` directly it would be caught.
 
-### A value buried more than one level deep
+### A value reached through a call or subscript in the field chain
 
 ```python
-self.ctx.targets = set(x)          # ← caught (one level: self.ctx, field: targets)
-self.ctx.config.targets = set(x)   # ← NOT caught (two levels deep)
+self.ctx.config.targets = set(x)   # ← caught (a pure attribute chain, any depth)
+self.get_ctx().targets = set(x)    # ← NOT caught (a call breaks the chain)
+self.items[0].targets = set(x)     # ← NOT caught (a subscript breaks the chain)
 ```
+
+Field taint is tracked along a pure attribute chain rooted at a name, to any depth
+(`self.ctx.config.targets` is followed both within a method and across methods). But
+a link that goes through a call or an index isn't a stable slot flaplint can name, so
+the chain stops being tracked there — the value effectively becomes "rebuilt by a
+method" (the gap above).
 
 ### A value looked up by a variable key
 
@@ -189,18 +196,19 @@ cfg["peers"] = set(x)         # ← caught (constant key "peers" is tracked)
 cfg[key] = set(x)             # ← NOT caught (variable key — can't know which slot)
 ```
 
-### A set promoted to a list inside a model's constructor
+### A model whose base class isn't a direct `BaseModel`
+
 
 ```python
-class Cfg(BaseModel):
-    hosts: list[str]        # the model's __init__ calls list(hosts) internally
-
-cfg = Cfg(hosts=some_set)   # at the call site, flaplint sees a set (local flavor)
-cfg.model_dump_json()       # a key-sorting serializer launders local → looks safe
-                            # but the list inside is still unstable — missed
+class _Base(BaseModel): ...
+class Cfg(_Base):           # ← indirect base — not recognised as a coercing model
+    hosts: list[str]
+cfg = Cfg(hosts=some_set)   # the set→list promotion is missed at this path
 ```
 
-The promotion happens inside the constructor, which flaplint doesn't inspect schema-deep. The value at the call site looks like a plain `set`, which a key-sorting serializer legitimately launders — so the downstream list-order flap is missed at that path.
+An intermediate project base class (`class Cfg(_Base)` where `_Base(BaseModel)`) isn't
+followed transitively, so the field's coercion isn't known. The common direct-subclass
+shape is covered.
 
 ### A finding for a forwarded parameter lands on the writer, not the typed caller
 

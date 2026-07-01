@@ -9,9 +9,10 @@ accesses on stored collaborators.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from . import astutils
+from .constants import SEQUENCE_FIELD_ANNOTATIONS
 from .model import FileImports, FuncInfo, Registry
 
 
@@ -25,11 +26,15 @@ class Collector(ast.NodeVisitor):
         registry: Registry,
         attr_types: Dict[str, Dict[str, str]],
         file_imports: Optional[Dict[str, FileImports]] = None,
+        model_seq_fields: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.path = path
         self.primary = primary
         self.registry = registry
         self.attr_types = attr_types
+        #: pydantic-model class name -> sequence-typed field names, so a set
+        #: coerced into such a field is promoted ``local`` -> ``itercaller``.
+        self.model_seq_fields = model_seq_fields if model_seq_fields is not None else {}
         self.functions: List[FuncInfo] = []
         self.class_stack: List[str] = []
         #: this file's import aliases, filled as ``import``/``from`` are visited.
@@ -101,9 +106,35 @@ class Collector(ast.NodeVisitor):
                     self.attr_types.setdefault(cls_name, {})[tgt.attr] = ctor
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._record_model_seq_fields(node)
         self.class_stack.append(node.name)
         self.generic_visit(node)
         self.class_stack.pop()
+
+    def _record_model_seq_fields(self, node: ast.ClassDef) -> None:
+        """Record a pydantic model's sequence-typed fields (``hosts: list[str]``).
+
+        A pydantic ``__init__`` coerces an incoming value into the field's declared
+        type, so a ``set`` passed to a ``list``/``tuple``/``Sequence`` field is
+        turned into a positionally-ordered sequence internally -- baking element
+        order a key-sorting serializer can't reach. Recording these fields lets the
+        constructor site promote such an argument ``local`` -> ``itercaller``.
+
+        Gated on a direct ``BaseModel`` base: a plain dataclass does *not* coerce
+        (it stores the ``set`` as-is, whose disorder stays key-order/``local``), so
+        promoting there would be a false positive.
+        """
+        if not any(astutils.final_attr(b) == "BaseModel" for b in node.bases):
+            return
+        fields = {
+            stmt.target.id
+            for stmt in node.body
+            if isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and astutils.annotation_root(stmt.annotation) in SEQUENCE_FIELD_ANNOTATIONS
+        }
+        if fields:
+            self.model_seq_fields.setdefault(node.name, set()).update(fields)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._add_function(node)

@@ -151,10 +151,10 @@ class Finding:
     line: int
     col: int
     kind: str  # "caller" | "sink" (vantage point; also severity ranking / dedup)
-    confidence: str  # criticality: "low" | "medium" | "high"
+    confidence: str  # how sure flaplint is: "low" | "medium" | "high"
     rule: str  # failure mode: nondeterministic | unordered-collection |
     #            unordered-pick
-    sink: str  # where the value lands: "databag" | "file" | "hash" | "plan"
+    sink: str  # where the value lands: "databag" | "file" | "hash" | "plan" | "render"
     variable: str  # offending variable / collection name ("" if anonymous)
     level: str = "error"  # blocking status: "error" (charm-owned fix) | "warning"
     #: provenance pointer: where the unstable value is *born* -- the ``set()`` /
@@ -167,12 +167,32 @@ class Finding:
     #: name of the function that owns the born site (``via=...`` in the chain
     #: from origin to sink); ``""`` if unknown or same as the finding's function.
     via: str = ""
+    #: downstream pointer: where the unstable value is actually *written* to the
+    #: sink (the databag/file/hash/plan write), when that differs from the
+    #: ``path:line`` above. For an ``unordered-pick`` / ``unordered-iteration``
+    #: finding the location points at the *fix* site (the pick / the iteration),
+    #: which can be several lines -- or a helper call -- away from the write; this
+    #: pins where the value lands. ``""`` / ``0`` when the write coincides with the
+    #: finding location (an ``unordered-collection`` / ``nondeterministic`` finding
+    #: is reported *at* its write, so there is nothing extra to point at).
+    sink_path: str = ""
+    sink_line: int = 0
+    sink_col: int = 0
 
     def format(self) -> str:
-        """Render as ``path:line:col: [warning] key=value ...`` structured fields."""
+        """Render as ``path:line:col: owner=... confidence=... key=value ...``.
+
+        The two axes are distinct greppable fields -- ``owner`` (whose job the fix
+        is: ``yours``/``dependency``; only ``yours`` fails the run) and
+        ``confidence`` (how sure flaplint is: ``high``/``medium``/``low``) -- so
+        neither reads as the other's severity. ``owner`` replaces the old
+        ``[warning]`` marker; ``confidence`` replaces the old ``severity=``.
+        """
+        owner = "yours" if self.level == "error" else "dependency"
         fields = [
+            f"owner={owner}",
             f"type={self.rule}",
-            f"severity={self.confidence}",
+            f"confidence={self.confidence}",
             f"sink={self.sink}",
         ]
         if self.variable:
@@ -181,8 +201,9 @@ class Finding:
             fields.append(f"origin={self.origin_path}:{self.origin_line}")
         if self.via:
             fields.append(f"via={self.via}")
-        marker = "[warning] " if self.level == "warning" else ""
-        return f"{self.path}:{self.line}:{self.col}: {marker}" + " ".join(fields)
+        if self.sink_line:
+            fields.append(f"sink_at={self.sink_path}:{self.sink_line}")
+        return f"{self.path}:{self.line}:{self.col}: " + " ".join(fields)
 
 
 @dataclass
@@ -199,7 +220,7 @@ class Gap:
     path: str
     line: int
     col: int
-    sink: str  # the write target reached: "databag" | "file" | "plan" | "hash"
+    sink: str  # the write target reached: "databag" | "file" | "plan" | "hash" | "render"
     reason: str  # plain-English description of what couldn't be traced
     snippet: str = ""  # the un-traced expression, for quick scanning
 

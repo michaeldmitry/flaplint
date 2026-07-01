@@ -93,8 +93,21 @@ def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     ``unordered-iteration`` pointing at the materialization ``node`` (where the
     ``sorted()`` fix lands). Everything else passes through unchanged; ``path`` is
     ``None`` (== the current file), resolved by the consumer (mirrors ``element``).
+
+    The promoted origin's 4th slot carries the *born-site* of the underlying
+    ``local`` value -- ``(born_path, born_node, born_func)`` -- so a finding can
+    still point ``origin=`` at the ``set()`` / ``glob()`` that created the churn,
+    even though the finding itself anchors at the materialization. (Before the
+    ``local`` -> ``itercaller`` split this trail came for free, because such a value
+    was reported as ``unordered-collection`` at the write with a born-site origin.)
     """
-    return {("itercaller", None, node, None) if is_local(o) else o for o in origins}
+    out: Set[Origin] = set()
+    for o in origins:
+        if is_local(o):
+            out.add(("itercaller", None, node, (o[1], o[2], o[3])))
+        else:
+            out.add(o)
+    return out
 
 
 def _promote_to_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
@@ -154,9 +167,15 @@ class TaintEngine:
         *,
         relations_unordered: bool = False,
         file_imports: Optional[Dict[str, "FileImports"]] = None,
+        model_seq_fields: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.registry = registry
         self.class_attr_types = class_attr_types
+        #: pydantic-model class name -> sequence-typed field names (``list``/
+        #: ``tuple``/``Sequence``). A ``set`` coerced into one of these fields has
+        #: its ``local`` taint promoted to ``itercaller`` at construction, because
+        #: the model's ``__init__`` bakes the set into element order.
+        self.model_seq_fields = model_seq_fields or {}
         self.relations_unordered = relations_unordered
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
@@ -220,6 +239,18 @@ class TaintEngine:
             return set()
         attr = f"{base.attr}[{key.value!r}]"
         return set(self.instance_attr_taint.get(cls_ctx, {}).get(attr, ()))
+
+    @staticmethod
+    def coerce_to_sequence_field(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
+        """Promote ``local`` -> ``itercaller`` for a value coerced into a sequence field.
+
+        When a bare ``set`` is passed to a pydantic ``list``/``tuple``/``Sequence``
+        field, the model's ``__init__`` materialises it into element order -- the
+        same promotion :func:`_as_local_sequence` applies to ``list(some_set)``. The
+        argument ``node`` anchors the finding at the construction site where the
+        ``sorted()`` fix belongs. Every other flavor passes through unchanged.
+        """
+        return _as_local_sequence(origins, node)
 
     @staticmethod
     def survives_structural_compare(origins: Set[Origin]) -> Set[Origin]:

@@ -85,6 +85,7 @@ _SINK_TARGET: Dict[str, str] = {
     "file": "an on-disk file",
     "hash": "a content hash",
     "plan": "a pebble plan",
+    "render": "rendered workload config",
 }
 
 
@@ -95,6 +96,18 @@ _SINK_LABEL: Dict[str, str] = {
     "file": "on-disk file",
     "hash": "content hash",
     "plan": "pebble plan",
+    "render": "rendered config",
+}
+
+#: The exit-code axis (``level``) is about *responsibility*, not severity -- yet
+#: "error/warning" reads like a severity that then clashes with the separate
+#: confidence axis ("a warning, but high?"). So the UI speaks about ownership
+#: instead: an ``error`` is code the charm owns (yours; fails the run), a
+#: ``warning`` lives in a dependency (not yours; non-blocking). Per finding this
+#: rides the ✖/▲ mark and the footer legend; the summary tally spells it out.
+_OWNER_TOTAL: Dict[str, str] = {  # bottom summary tally
+    "error": "yours",
+    "warning": "in dependencies",
 }
 
 
@@ -107,67 +120,80 @@ def _describe(f: Finding) -> str:
     subject = f"`{f.variable}`" if f.variable else "this variable"
     target = _SINK_TARGET.get(f.sink, "the databag")
 
-    # A content hash and an on-disk file are both *change-detectors*: the charm
-    # diffs them against the previous reconcile to decide whether to do expensive
-    # work (restart / replan / re-sync / re-publish / further I/O). If the value
-    # behind them has no stable byte-order, the detector differs every reconcile
-    # and the gate trips spuriously -- so the *feeding of unstable content into
-    # them* is the sink, not any single downstream use.
-    is_detector = f.sink in ("hash", "file", "plan")
+    # Weave the sink location straight into the mention of the target -- "written
+    # to X at file:line" -- so it reads as one natural clause instead of a
+    # trailing "It reaches ..." afterthought. Only when the finding sits at a
+    # *fix site* away from the write (a pick / an iteration) does ``sink_line``
+    # point somewhere the header doesn't already show; when the finding *is* the
+    # write, its own line:col is in the header, so naming it again is just noise.
+    if f.sink_line:
+        where = (
+            f"{_relpath(f.sink_path)}:{f.sink_line}" if f.sink_path
+            else f"line {f.sink_line}"
+        )
+        target_at = f"{target} at {where}"
+    else:
+        target_at = target
+
+    # A content hash, an on-disk file, a pebble plan and a rendered config blob
+    # are all *change-detectors*: the charm diffs them against the previous
+    # reconcile to decide whether to do expensive work (restart / replan /
+    # re-sync / re-publish / further I/O). If the value behind them has no stable
+    # byte-order, the detector differs every reconcile and the gate trips
+    # spuriously -- so the *feeding of unstable content into them* is the sink,
+    # not any single downstream use.
+    is_detector = f.sink in ("hash", "file", "plan", "render")
 
     if f.rule == "unordered-collection":
         if is_detector:
             core = (
-                f"{subject} is an unordered data structure fed into {target} "
-                "without sorted(), so any change-detection built on it trips."
+                f"{subject} is an unordered collection written to {target_at} "
+                "without first being sorted."
             )
         else:
-            core = (
-                f"{subject} is an unordered data structure serialised into {target} "
-                "without sorted()."
-            )
+            core = f"{subject} is an unordered collection written to {target_at}."
     elif f.rule == "unordered-pick":
         core = (
-            f"{subject} is selected by position from unordered data structure before it "
-            f"reaches {target}, so the selected element may vary between runs."
+            f"{subject} is selected by position from an unordered collection before "
+            f"reaching {target_at}, so a different element may be selected on different runs."
         )
     elif f.rule == "unordered-iteration":
         if f.kind == "caller":
-            # Confirmed: an unstable value was traced into this iteration.
+            # Confirmed: an unordered value was traced *into* this iteration. The
+            # subject is the source being looped, not the sequence built from it,
+            # so say plainly that iterating it bakes the disorder into element
+            # order. The "Fix at the source" trail below points at where that
+            # source is born.
             core = (
-                f"a value built from an unordered source is iterated over at "
-                f"{subject} without sorted() to build an order-dependent sequence "
-                f"that reaches {target}. Sort the collection before iterating."
+                f"{subject} is an unordered source iterated without sorted() to "
+                f"build a sequence written to {target_at}, so the sequence's element "
+                f"order can differ from one reconcile to the next."
             )
         else:
             # Precautionary contract boundary: we cannot see, from this function,
             # whether callers pass an unordered collection -- but if any does, the
             # element order flaps. Say so plainly, and name the escape hatches.
             core = (
-                f"{subject} is iterated without sorted() to build an order-dependent "
-                f"sequence that can reach {target}. This is a contract boundary: if "
-                "any caller passes an unordered collection (e.g. one built from a "
-                "set or a relation.units frozenset), the sequence's element order "
-                "flaps across reconciles, and key-sorting the serializer cannot fix "
-                f"list-element order. Sort at the iteration (sorted({subject})), or "
-                f"annotate {subject} as Dict/List if callers already guarantee order."
+                f"{subject} is iterated without sorted() to build a sequence written to {target_at}. "
+                f"Sort at the iteration (sorted({subject})), or "
+                f"annotate {subject} as dict/list if callers already guarantee order."
             )
     elif f.rule == "nondeterministic":
         if is_detector:
             core = (
                 f"{subject} is freshly generated each time this code runs, so when this "
-                f"path executes it feeds a different value into {target} and any "
+                f"path executes it feeds a different value into {target_at} and any "
                 "change-detection built on it trips."
             )
         else:
             core = (
                 f"{subject} is freshly generated each time this code runs, so when this "
-                f"path executes the value written to {target} differs from last time "
+                f"path executes the value written to {target_at} differs from last time "
                 "(sorting cannot fix it). If that write is intentional, suppress it with "
                 "`# databag-order: ignore`."
             )
     else:
-        core = f"{subject} reaches {target} in a nondeterministic form."
+        core = f"{subject} reaches {target_at} in a nondeterministic form."
 
     sentence = core
 
@@ -180,8 +206,7 @@ def _describe(f: Finding) -> str:
             # the reader looks at the source, not for a call next to this write.
             sentence += (
                 f" Fix at the source: the instability is created upstream in "
-                f"`{f.via}()` ({origin}) and reaches {subject} through intervening "
-                "assignments — not at this write."
+                f"`{f.via}()` ({origin})."
             )
         else:
             sentence += (
@@ -248,17 +273,9 @@ def render_report(
     out: List[str] = ["", banner, ""]
 
     for path, group in groups.items():
-        n_err = sum(1 for f in group if f.level == "error")
-        n_warn = len(group) - n_err
-        counts = []
-        if n_err:
-            counts.append(p.red(f"{n_err} error(s)"))
-        if n_warn:
-            counts.append(p.yellow(f"{n_warn} warning(s)"))
-        header = p.bold(p.underline(_relpath(path))) + "  " + p.dim(
-            "· " + ", ".join(counts)
-        )
-        out.append(header)
+        # Just the filename: ownership and confidence now ride each finding's
+        # header line, and a per-file count would only echo them.
+        out.append(p.bold(p.underline(_relpath(path))))
 
         loc_w = max(len(f"{f.line}:{f.col}") for f in group)
         body_indent = " " * (6 + loc_w)
@@ -273,13 +290,15 @@ def render_report(
             conf_paint = {"high": p.red, "medium": p.yellow, "low": p.blue}.get(
                 f.confidence, p.dim
             )
-            conf_tag = conf_paint(f"[{f.confidence}]")
 
+            # Header line ends with the confidence (how sure flaplint is). Ownership
+            # (whose job the fix is) rides the ✖/▲ mark and the footer legend, so it
+            # isn't repeated here as words that could read like a second severity.
             out.append(
                 f"  {mark} {p.dim(loc)}  {p.bold(title)} "
-                f"{p.dim('·')} {var} {p.dim('→ ' + sink)}  {conf_tag}"
+                f"{p.dim('·')} {var} {p.dim('→ ' + sink)}  "
+                f"{p.dim('·')} {conf_paint(f'{f.confidence} confidence')}"
             )
-
             out.append(p.dim(_wrap(_describe(f), body_indent, width)))
 
 
@@ -342,14 +361,18 @@ def _summary(findings: Sequence[Finding], files_scanned: int, p: _Palette) -> st
     warnings = len(findings) - errors
     rule = p.dim("─" * 56)
 
-    parts = [p.red("✖") + f" {len(findings)} problem(s)"]
-    parts.append(p.red(f"{errors} error(s)"))
+    parts = [p.red("✖") + f" {len(findings)} flap risk(s)"]
+    if errors:
+        parts.append(p.red(f"{errors} {_OWNER_TOTAL['error']}"))
     if warnings:
-        parts.append(p.yellow(f"{warnings} warning(s)"))
+        parts.append(p.yellow(f"{warnings} {_OWNER_TOTAL['warning']}"))
     parts.append(p.dim(f"· {files_scanned} file(s) scanned"))
     summary = "  " + "   ".join(parts)
 
-    # legend = "  " + p.dim(
-    #     "✖ you own this code     ▲ in a dependency — non-blocking"
-    # )
-    return rule + "\n" + summary + "\n"
+    # Spell out the two marks so the ownership axis is never read as severity:
+    # confidence (how sure) is a separate word on each finding's meta line.
+    legend = (
+        "  " + p.red("✖") + p.dim(" yours — fails the run     ")
+        + p.yellow("▲") + p.dim(" in a dependency — non-blocking")
+    )
+    return rule + "\n" + summary + "\n" + legend + "\n"

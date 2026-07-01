@@ -155,6 +155,24 @@ FILE_READ_METHODS: Set[str] = {
 #: under ``--explain-gaps``.
 MODEL_SERIALIZERS: Set[str] = {"model_dump_json", "model_dump"}
 
+#: Model field annotations that impose *positional* (element) order. When a
+#: Pydantic model coerces an unordered value (a bare ``set``) into a field of one
+#: of these types, its ``__init__`` runs ``list(value)`` internally -- so the
+#: disorder moves from *key* order (``local``, laundered by a key-sorting
+#: serializer such as ``model_dump_json`` / ``json.dumps(sort_keys=True)``) into
+#: *element* positions (``itercaller``, which no key-sorting serializer can
+#: reach). A ``set`` passed to such a field is therefore promoted ``local`` ->
+#: ``itercaller`` at construction. ``set``/``dict`` fields are absent: their only
+#: disorder stays key-order, which a key-sorting serializer legitimately fixes.
+SEQUENCE_FIELD_ANNOTATIONS: Set[str] = {
+    "list",
+    "List",
+    "tuple",
+    "Tuple",
+    "Sequence",
+    "MutableSequence",
+}
+
 #: Digest/hash calls used as change-detectors. A charm hashes some content and
 #: diffs the digest against the previous reconcile to decide whether to do
 #: expensive work (restart, pebble replan, rule re-sync, databag re-publish, ...).
@@ -259,6 +277,22 @@ ACCUMULATOR_METHODS: Set[str] = {
 #: are deliberately excluded. ``append``/``insert`` are list-only; ``extend`` is
 #: list/deque (treated as a sequence either way).
 LIST_ACCUMULATOR_METHODS: Set[str] = {"append", "extend", "insert"}
+
+#: Mutating ``set`` methods that add elements. A ``set`` built up incrementally --
+#: ``s = set(); ... s.update(x)`` / ``s.add(x)`` -- is still a ``set``, whose
+#: iteration order is hash-seeded and therefore unstable *regardless of what was
+#: inserted* (unlike a ``dict``, whose order follows insertion). So mutating a
+#: known ``set`` variable makes it ``local``, even when the empty ``set()`` it
+#: started from was treated as stable and the values came from an ordered source.
+#: This is what catches the ``requested_protocols = set(); for ...: .update(...)``
+#: idiom without needing ``--relations-unordered``.
+SET_MUTATION_METHODS: Set[str] = {
+    "add",
+    "update",
+    "difference_update",
+    "intersection_update",
+    "symmetric_difference_update",
+}
 
 #: Mutating ``MutableMapping`` methods that write *content* into a databag. A
 #: call ``bag.update(x)`` / ``bag.setdefault(k, x)`` on a relation databag is a

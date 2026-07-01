@@ -716,6 +716,10 @@ def test_element_pick_through_return_rendered_yaml_is_a_sink(lint_source):
     # not the serializer.
     assert callers[0].rule == "unordered-pick"
     assert callers[0].variable == "addrs"
+    # A ``return yaml.dump(cfg)`` is a config-render boundary, not a proven file
+    # write -- flaplint can't see which consumer diffs the blob, so it reports the
+    # honest ``render`` family rather than claiming an on-disk file.
+    assert callers[0].sink == "render"
 
 
 def test_volatile_through_return_rendered_yaml_is_a_sink(lint_source):

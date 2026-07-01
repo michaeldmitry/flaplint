@@ -30,41 +30,59 @@ def final_attr(func: ast.AST) -> Optional[str]:
     return None
 
 
-def attr_path(node: ast.AST) -> Optional[str]:
-    """Access-path key for a single-level field read/write, else ``None``.
+def _attr_chain(node: ast.AST) -> Optional[list]:
+    """Dotted parts of a pure ``Name.a.b.c`` attribute chain, root first, else ``None``.
 
-    ``attrs.sans_dns`` (an ``Attribute`` on a plain ``Name``) -> ``"attrs.sans_dns"``.
-    Used as a compound ``env`` key so a value object's *per-field* taint can be
-    stored and read back without modelling the heap (see the value-object field
-    provenance in :mod:`flaplint.traversal`). Deeper chains (``a.b.c``) and
-    subscripts return ``None`` -- only the common one-level field idiom is tracked.
+    ``attrs.sans_dns`` -> ``["attrs", "sans_dns"]``; ``self.ctx.config.targets`` ->
+    ``["self", "ctx", "config", "targets"]``. Any non-``Attribute`` / non-``Name``
+    link -- a call (``a.b().c``) or a subscript (``a[0].b``) -- returns ``None``,
+    because a value reached through one isn't a stable field slot.
     """
-    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        return f"{node.value.id}.{node.attr}"
-    return None
+    parts = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if not isinstance(cur, ast.Name):
+        return None
+    parts.append(cur.id)
+    parts.reverse()
+    return parts
 
 
-def self_attr_key(node: ast.AST) -> Optional[str]:
-    """Class-level key for a ``self``/``cls``-rooted attribute, one or two levels.
+def attr_path(node: ast.AST) -> Optional[str]:
+    """Access-path key for a field read/write on a ``Name``-rooted chain, else ``None``.
 
-    ``self.jobs`` -> ``"jobs"``; ``self._stored.jobs`` -> ``"_stored.jobs"``. The
-    two-level form is the ops **StoredState** idiom (``self._stored.<x>``), the
-    standard way a charm carries data across event handlers -- so an unstable value
-    parked there in one handler and published in another stays tracked. Returns
-    ``None`` for a non-``self`` root or a chain deeper than two levels.
+    ``attrs.sans_dns`` -> ``"attrs.sans_dns"``; ``self.ctx.config.targets`` ->
+    ``"self.ctx.config.targets"``. Used as a compound ``env`` key so a value object's
+    *per-field* taint can be stored and read back without modelling the heap (see the
+    value-object field provenance in :mod:`flaplint.traversal`). The chain must be
+    pure attribute access rooted at a plain ``Name`` -- a call or subscript link
+    returns ``None`` (not a stable field slot). Reads and writes go through the same
+    helper, so the key is symmetric to any depth.
     """
     if not isinstance(node, ast.Attribute):
         return None
-    base = node.value
-    if isinstance(base, ast.Name) and base.id in ("self", "cls"):
-        return node.attr
-    if (
-        isinstance(base, ast.Attribute)
-        and isinstance(base.value, ast.Name)
-        and base.value.id in ("self", "cls")
-    ):
-        return f"{base.attr}.{node.attr}"
-    return None
+    parts = _attr_chain(node)
+    return ".".join(parts) if parts is not None else None
+
+
+def self_attr_key(node: ast.AST) -> Optional[str]:
+    """Class-level key for a ``self``/``cls``-rooted attribute, to any depth.
+
+    ``self.jobs`` -> ``"jobs"``; ``self._stored.jobs`` -> ``"_stored.jobs"`` (the ops
+    **StoredState** idiom); ``self.ctx.config.targets`` -> ``"ctx.config.targets"``.
+    Returning the whole sub-chain lets an unstable value parked on a nested ``self``
+    field in one method (typically ``__init__``) and read in another stay tracked,
+    field-sensitively. Returns ``None`` for a non-``self``/``cls`` root or any chain
+    passing through a call/subscript.
+    """
+    if not isinstance(node, ast.Attribute):
+        return None
+    parts = _attr_chain(node)
+    if parts is None or parts[0] not in ("self", "cls"):
+        return None
+    return ".".join(parts[1:])
 
 
 def subscript_path(node: ast.AST) -> Optional[str]:
@@ -296,6 +314,22 @@ def kw_const_is(call: ast.Call, name: str, value: bool) -> bool:
             and kw.value.value is value
         ):
             return True
+    return False
+
+
+def is_set_construction(node: ast.AST) -> bool:
+    """True if ``node`` builds a ``set``/``frozenset`` value.
+
+    A set literal (``{a, b}``), a set comprehension (``{x for x in ...}``), or a
+    ``set(...)`` / ``frozenset(...)`` call. Used to tag a variable as set-valued so
+    a later ``.add()`` / ``.update()`` is known to keep it an (unordered) set --
+    even when it started from an empty ``set()`` that is otherwise stable. A bare
+    ``{}`` is a *dict* literal (``ast.Dict``), not a set, so it is excluded.
+    """
+    if isinstance(node, (ast.Set, ast.SetComp)):
+        return True
+    if isinstance(node, ast.Call):
+        return final_attr(node.func) in ("set", "frozenset")
     return False
 
 

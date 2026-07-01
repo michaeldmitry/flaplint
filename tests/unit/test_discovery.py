@@ -15,6 +15,7 @@ from typing import List
 
 from flaplint.analyzer import Analyzer
 from flaplint.discovery import (
+    auto_interpreter,
     candidate_venvs,
     filter_sink_roots,
     imported_top_levels,
@@ -196,12 +197,12 @@ def test_auto_deps_traces_writer_dependency(tmp_path: Path) -> None:
         """,
     )
 
-    without = Analyzer([str(charm)], min_confidence="low").run()
-    assert without == []  # the bug lives across the dep boundary
-
-    with_deps = Analyzer(
-        [str(charm)], auto_deps=True, min_confidence="low"
+    without = Analyzer(
+        [str(charm)], resolve_deps=False, min_confidence="low"
     ).run()
+    assert without == []  # --no-deps: the bug lives across the untraced dep boundary
+
+    with_deps = Analyzer([str(charm)], min_confidence="low").run()  # auto by default
     assert any(f.kind == "caller" for f in with_deps)
 
 
@@ -234,3 +235,71 @@ def test_criticality_sort_puts_high_callers_first(tmp_path: Path) -> None:
     confs = [f.confidence for f in crit]
     assert confs == sorted(confs, key=lambda c: {"high": 0, "medium": 1, "low": 2}[c])
     assert crit[0].confidence == "high"
+
+
+# --- auto-picked interpreter + default-on resolution -------------------------
+
+
+def test_auto_interpreter_finds_sibling_venv_python(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    binp = tmp_path / ".venv" / "bin" / "python"
+    binp.parent.mkdir(parents=True)
+    binp.write_text("")  # just needs to exist and be a file
+    assert auto_interpreter([str(tmp_path / "src")]) == str(binp)
+
+
+def test_auto_interpreter_absent_returns_empty(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    assert auto_interpreter([str(tmp_path / "src")]) == ""
+
+
+def test_resolution_is_on_by_default_and_no_deps_disables_it(tmp_path: Path) -> None:
+    # The same charm+dep as the auto-deps test: with default resolution the
+    # cross-boundary bug is caught with no flags; --no-deps (resolve_deps=False)
+    # scans own code only and misses it.
+    sp = tmp_path / ".venv" / "lib" / "python3.14" / "site-packages"
+    _write(
+        sp / "writerdep" / "__init__.py",
+        """
+        import json
+        def publish(relation, app, value):
+            relation.data[app]["x"] = json.dumps(value)
+        """,
+    )
+    charm = _write(
+        tmp_path / "src" / "charm.py",
+        """
+        import writerdep
+        def handler(self):
+            writerdep.publish(self.relation, self.app, {1, 2, 3})
+        """,
+    )
+    auto = Analyzer([str(charm)], min_confidence="low").run()  # default: resolve_deps=True
+    assert any(f.kind == "caller" for f in auto)
+
+    own_only = Analyzer([str(charm)], resolve_deps=False, min_confidence="low").run()
+    assert own_only == []
+
+
+def test_editable_install_resolving_to_src_is_not_double_reported(tmp_path: Path) -> None:
+    # A package importable both as the charm's own src and (via the interpreter's
+    # path) as an installed dep must be analysed once -- realpath dedup -- so a
+    # finding isn't reported twice.
+    pkg = tmp_path / "src" / "mypkg"
+    _write(
+        pkg / "__init__.py",
+        """
+        import json
+        class Charm:
+            def publish(self, relation):
+                relation.data[self.app]["v"] = json.dumps(list(set(self.hosts)))
+        """,
+    )
+    # Point a "site-packages" root at the very same src tree (an editable install).
+    findings = Analyzer(
+        [str(tmp_path / "src")],
+        venvs=[str(tmp_path / "src")],
+        min_confidence="low",
+    ).run()
+    at_line = [f for f in findings if f.rule == "unordered-iteration"]
+    assert len(at_line) == 1  # not doubled by the overlapping root

@@ -16,6 +16,7 @@ from typing import Dict, List, Sequence, Set
 from .collector import Collector
 from .constants import CONFIDENCE_RANK, KIND_RANK, SUPPRESS_COMMENT
 from .discovery import (
+    auto_interpreter,
     candidate_venvs,
     discover_site_packages,
     filter_sink_roots,
@@ -48,9 +49,9 @@ class Analyzer:
         *,
         deps: Sequence[str] = (),
         venvs: Sequence[str] = (),
-        auto_deps: bool = False,
+        resolve_deps: bool = True,
         python: str = "",
-        report_deps: bool = False,
+        report_deps: bool = True,
         relations_unordered: bool = False,
         min_confidence: str = "medium",
         sort: str = "criticality",
@@ -59,7 +60,10 @@ class Analyzer:
         self.paths = list(paths)
         self.deps = list(deps)
         self.venvs = list(venvs)
-        self.auto_deps = auto_deps
+        #: automatically discover the charm's dependency environment (a sibling
+        #: ``.venv`` interpreter, else its site-packages) and trace the deps that
+        #: write relation data. On by default; disabled with ``--no-deps``.
+        self.resolve_deps = resolve_deps
         self.python = python
         self.report_deps = report_deps
         self.relations_unordered = relations_unordered
@@ -77,37 +81,54 @@ class Analyzer:
         primary_files = set(gather_py_files(primary_roots, include_tests=False))
         self.primary_files = sorted(primary_files)
 
-        secondary_roots = discover_site_packages(self.venvs)
-        if self.auto_deps or self.python:
+        secondary_roots = discover_site_packages(self.venvs)  # explicit --venv
+        if self.resolve_deps:
             imported = imported_top_levels(self.primary_files)
-            if self.auto_deps:
+            # Prefer an interpreter (explicit --python, else an auto-picked sibling
+            # .venv's bin/python): it follows PEP 420 namespace packages that a bare
+            # folder scan misses. Fall back to folder-scanning the sibling venv's
+            # site-packages when no interpreter is available (e.g. an unpacked .charm).
+            python = self.python or auto_interpreter(self.paths)
+            if python:
+                resolved = interpreter_module_paths(python, imported)
+                secondary_roots = sorted(
+                    set(secondary_roots) | set(filter_sink_roots(resolved))
+                )
+            else:
                 site_packages = secondary_roots or discover_site_packages(
                     candidate_venvs(self.paths)
                 )
                 secondary_roots = sink_dep_roots(site_packages, imported)
-            if self.python:
-                resolved = interpreter_module_paths(self.python, imported)
-                secondary_roots = sorted(
-                    set(secondary_roots) | set(filter_sink_roots(resolved))
-                )
 
         secondary_files = set(gather_py_files(secondary_roots, include_tests=False))
-        secondary_files -= primary_files
+        # Drop any secondary file that is really a primary file reached under a
+        # different path spelling -- an *editable* install (``pip install -e``)
+        # resolves a package back to the charm's own ``src``, so the interpreter
+        # returns absolute paths that string-differ from the relative primary
+        # paths. Compare by ``realpath`` so those are not analysed (and reported)
+        # twice.
+        primary_real = {os.path.realpath(p) for p in primary_files}
+        secondary_files = {
+            f for f in secondary_files if os.path.realpath(f) not in primary_real
+        }
         self.secondary_files = sorted(secondary_files)
 
         registry: Registry = {}
         class_attr_types: Dict[str, Dict[str, str]] = {}
+        model_seq_fields: Dict[str, Set[str]] = {}
         file_imports: Dict[str, FileImports] = {}
         functions: List[FuncInfo] = []
         suppressed: Dict[str, Set[int]] = {}
 
         for path in self.primary_files:
             self._ingest(
-                path, True, registry, class_attr_types, file_imports, functions, suppressed
+                path, True, registry, class_attr_types, model_seq_fields,
+                file_imports, functions, suppressed,
             )
         for path in self.secondary_files:
             self._ingest(
-                path, False, registry, class_attr_types, file_imports, functions, suppressed
+                path, False, registry, class_attr_types, model_seq_fields,
+                file_imports, functions, suppressed,
             )
 
         engine = TaintEngine(
@@ -115,6 +136,7 @@ class Analyzer:
             class_attr_types,
             relations_unordered=self.relations_unordered,
             file_imports=file_imports,
+            model_seq_fields=model_seq_fields,
         )
         analyzer = FunctionAnalyzer(engine)
         mark_databag_accessors(functions, registry)
@@ -152,8 +174,8 @@ class Analyzer:
         argument) or the charm's own ``lib/charms/<name>/`` namespace. Everything
         else -- a *vendored* copy of another charm's library (whether reached via
         the auto-included sibling ``lib/`` or an explicit ``--dep``), or an
-        installed dependency surfaced via ``--report-deps`` -- is a **warning**:
-        real, but not the charm's to fix, so it must not fail CI.
+        installed dependency reported by default (unless ``--no-report-deps``) -- is
+        a **warning**: real, but not the charm's to fix, so it must not fail CI.
 
         ``--dep`` only adds a root to *analyze and report*; it never changes a
         finding's level. Ownership is decided purely by location (own ``src`` or
@@ -200,6 +222,8 @@ class Analyzer:
             f.path = os.path.relpath(os.path.abspath(f.path), cwd)
             if f.origin_path:
                 f.origin_path = os.path.relpath(os.path.abspath(f.origin_path), cwd)
+            if f.sink_path:
+                f.sink_path = os.path.relpath(os.path.abspath(f.sink_path), cwd)
 
     def _ingest(
         self,
@@ -207,6 +231,7 @@ class Analyzer:
         primary: bool,
         registry: Registry,
         class_attr_types: Dict[str, Dict[str, str]],
+        model_seq_fields: Dict[str, Set[str]],
         file_imports: Dict[str, FileImports],
         functions: List[FuncInfo],
         suppressed: Dict[str, Set[int]],
@@ -226,7 +251,8 @@ class Analyzer:
         }
         report_here = primary or self.report_deps
         collector = Collector(
-            path, report_here, registry, class_attr_types, file_imports
+            path, report_here, registry, class_attr_types, file_imports,
+            model_seq_fields=model_seq_fields,
         )
         collector.visit(tree)
         functions.extend(collector.functions)
@@ -241,8 +267,9 @@ def analyze_paths(
     *,
     deps: Sequence[str] = (),
     venvs: Sequence[str] = (),
-    auto_deps: bool = False,
-    report_deps: bool = False,
+    resolve_deps: bool = True,
+    python: str = "",
+    report_deps: bool = True,
     relations_unordered: bool = False,
     min_confidence: str = "medium",
     sort: str = "criticality",
@@ -252,7 +279,8 @@ def analyze_paths(
         paths,
         deps=deps,
         venvs=venvs,
-        auto_deps=auto_deps,
+        resolve_deps=resolve_deps,
+        python=python,
         report_deps=report_deps,
         relations_unordered=relations_unordered,
         min_confidence=min_confidence,

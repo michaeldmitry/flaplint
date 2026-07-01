@@ -144,9 +144,9 @@ def candidate_venvs(paths: List[str]) -> List[str]:
 
     For each scanned path we look for a conventional ``.venv`` or ``venv``
     directory in the path itself and in its parent (so both ``charm/`` and the
-    usual ``charm/src`` invocation find a ``charm/.venv``). Used by
-    ``--auto-deps`` when no explicit ``--venv`` is given, so the common case
-    ``flaplint src --auto-deps`` just works.
+    usual ``charm/src`` invocation find a ``charm/.venv``). Used by the default
+    automatic dependency resolution (and :func:`auto_interpreter`) when no explicit
+    ``--venv``/``--python`` is given, so the common case ``flaplint src`` just works.
     """
     out: List[str] = []
     for path in paths:
@@ -159,6 +159,29 @@ def candidate_venvs(paths: List[str]) -> List[str]:
                 if os.path.isdir(cand) and cand not in out:
                     out.append(cand)
     return out
+
+
+def auto_interpreter(paths: List[str]) -> str:
+    """Best-effort path to a sibling virtualenv's interpreter, or ``""``.
+
+    Looks inside each candidate ``.venv``/``venv`` (see :func:`candidate_venvs`)
+    for a real interpreter -- ``bin/python`` on POSIX, ``Scripts\\python.exe`` on
+    Windows -- and returns the first that exists. Used to auto-pick ``--python``
+    so the common ``flaplint src`` invocation resolves dependencies through the
+    charm's own environment (PEP 420 namespace packages included) without the user
+    naming the interpreter. Returns ``""`` when no sibling interpreter is found, so
+    the caller falls back to folder-scanning the site-packages.
+    """
+    for venv in candidate_venvs(paths):
+        for rel in (
+            os.path.join("bin", "python"),
+            os.path.join("bin", "python3"),
+            os.path.join("Scripts", "python.exe"),
+        ):
+            cand = os.path.join(venv, rel)
+            if os.path.isfile(cand):
+                return cand
+    return ""
 
 
 def imported_top_levels(files: List[str]) -> Set[str]:

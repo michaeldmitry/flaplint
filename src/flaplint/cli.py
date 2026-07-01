@@ -34,17 +34,10 @@ def _build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="PATH",
-        help="virtualenv (or site-packages) to FOLLOW INTO for call resolution "
-        "only -- installed dependencies are traced to see if they write to "
-        "relation data, but are NOT reported unless --report-deps. Contrast "
-        "--dep, which is also reported.",
-    )
-    parser.add_argument(
-        "--auto-deps",
-        action="store_true",
-        help="auto-detect which installed dependencies write to relation data "
-        "and trace only those (locates a sibling .venv/venv if no --venv given). "
-        "The charm's own vendored lib/ is always auto-included.",
+        help="virtualenv (or site-packages) to FOLLOW INTO for call resolution -- "
+        "installed dependencies are traced to see if they write to relation data. "
+        "Findings inside them are shown by default (suppress with --no-report-deps). "
+        "Contrast --dep, which is analysed as first-class source you own.",
     )
     parser.add_argument(
         "--python",
@@ -54,14 +47,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "installed (e.g. a `uv sync`-created .venv's bin/python). Imported deps "
         "are resolved through THAT interpreter's import system -- following PEP "
         "420 namespace packages like charmlibs.interfaces.otlp -- and the ones "
-        "that write relation data are traced. Resolve-only (like --venv), but "
-        "version-exact to that env and not tied to a sibling .venv location. "
+        "that write relation data are traced. By default a sibling .venv's "
+        "bin/python is auto-picked; pass this to point at a specific env. "
         "Installs nothing; the deps must already be present in that env.",
     )
     parser.add_argument(
-        "--report-deps",
-        action="store_true",
-        help="also report findings inside --venv site-packages (default: trace only)",
+        "--no-deps",
+        dest="resolve_deps",
+        action="store_false",
+        help="disable automatic dependency resolution -- scan only the charm's own "
+        "code (its src/ and sibling lib/). By default flaplint auto-discovers the "
+        "charm's environment (a sibling .venv interpreter, else its site-packages) "
+        "and traces the dependencies that write relation data. Use this for a fast, "
+        "own-code-only run (e.g. a CI gate, or when no venv is present).",
+    )
+    parser.add_argument(
+        "--no-report-deps",
+        dest="report_deps",
+        action="store_false",
+        help="do NOT report findings inside traced installed dependencies -- trace "
+        "them for call resolution only. By default findings in dependencies are "
+        "shown (as non-blocking warnings). A charm's own vendored lib/ is always "
+        "reported regardless.",
     )
     parser.add_argument(
         "--min-confidence",
@@ -73,8 +80,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "--sort",
         choices=("criticality", "location"),
         default="criticality",
-        help="order findings by criticality (most severe first) or by file "
-        "location (default: criticality)",
+        help="order findings by criticality (most important first: yours before "
+        "dependencies, higher confidence first) or by file location "
+        "(default: criticality)",
     )
     parser.add_argument(
         "--format",
@@ -110,7 +118,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         args.paths,
         deps=args.dep,
         venvs=args.venv,
-        auto_deps=args.auto_deps,
+        resolve_deps=args.resolve_deps,
         python=args.python,
         report_deps=args.report_deps,
         relations_unordered=args.relations_unordered,
@@ -140,8 +148,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         warnings = len(findings) - errors
         gap_note = f", {len(gaps)} blind spot(s)" if args.explain_gaps else ""
         print(
-            f"\n{len(findings)} potential issue(s): "
-            f"{errors} error(s), {warnings} warning(s){gap_note} "
+            f"\n{len(findings)} flap risk(s): "
+            f"{errors} yours, {warnings} in dependencies{gap_note} "
             f"in {len(analyzer.primary_files)} file(s).",
             file=sys.stderr,
         )

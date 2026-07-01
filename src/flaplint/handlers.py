@@ -64,6 +64,12 @@ _TRANSPARENT_WRAPPERS: Set[str] = (
     NONSORTING_SERIALIZERS | PROPAGATE_CALLS | {"dumps", "dump", "safe_dump"}
 )
 
+#: Mapping *views* -- ``d.items()`` / ``d.keys()`` / ``d.values()``. A view is a
+#: transparent window whose iteration order is the receiver mapping's own order, so
+#: the offending value to name is the mapping, never the blameless view call:
+#: ``self._hosts(rel).items()`` -> ``_hosts()``, not ``items()``.
+_MAPPING_VIEWS: Set[str] = {"items", "keys", "values"}
+
 
 def _unwrap(node: ast.AST) -> ast.AST:
     """Peel transparent serialiser / repackaging calls to the real value.
@@ -71,18 +77,22 @@ def _unwrap(node: ast.AST) -> ast.AST:
     ``str(json.dumps(list(x)))`` -> ``x``: each layer just reformats its first
     argument, so the offending identifier is whatever they all wrap. Receiver
     methods that pass their value through unchanged -- ``x.encode()`` /
-    ``x.decode()`` -- are peeled to their *receiver* (``str(peers).encode()`` ->
-    ``peers``), mirroring the taint engine's encode/decode pass-through; without
-    this the name would wrongly resolve to the outer ``str`` wrapper.
+    ``x.decode()``, and mapping views ``x.items()`` / ``x.keys()`` /
+    ``x.values()`` -- are peeled to their *receiver* (``str(peers).encode()`` ->
+    ``peers``; ``self._hosts(rel).items()`` -> ``self._hosts(rel)``), mirroring the
+    taint engine's pass-through; without this the name would wrongly resolve to the
+    outer wrapper or the view method.
     """
     cur = node
     while isinstance(cur, ast.Call):
         name = astutils.final_attr(cur.func)
-        if (
+        if isinstance(cur.func, ast.Attribute) and (
             name in ("encode", "decode")
-            and isinstance(cur.func, ast.Attribute)
+            # A view takes no arguments (``d.items()``); an ``.items(x)`` is some
+            # other method and must not be peeled.
+            or (name in _MAPPING_VIEWS and not cur.args and not cur.keywords)
         ):
-            cur = cur.func.value  # peel to the receiver: ``x.encode()`` -> ``x``
+            cur = cur.func.value  # peel to the receiver: ``x.items()`` -> ``x``
         elif name in _TRANSPARENT_WRAPPERS and cur.args:
             cur = cur.args[0]
         else:
@@ -121,9 +131,13 @@ def _variable(node: ast.AST) -> str:
     deeper ``a.b.c`` chain, still yields ``""``.
     """
     node = _unwrap(node)
-    path = astutils.attr_path(node)  # ``self.upgrade_stack`` (one-level attribute)
-    if path is not None:
-        return path
+    # Name a *one-level* attribute path in full (``self.upgrade_stack``); a deeper
+    # ``a.b.c`` chain falls through to the member-naming logic below so it reports
+    # the innermost collection (``peers``) rather than the whole receiver chain.
+    # (``attr_path`` itself now spans any depth, for env-key provenance -- but the
+    # display heuristic wants only the one-level case.)
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        return astutils.attr_path(node)
     parts = _container_parts(node)
     if parts:
         # the offending collection is nested inside a literal -- name the first
@@ -193,7 +207,12 @@ def _resolve_field_origin(o: Origin, fi: FuncInfo):
     if tag in ("local", "element"):
         return (tag, o[1] or fi.path, o[2], o[3] or fi.name)
     if tag == "itercaller":
-        return (tag, o[1] or fi.path, o[2], o[3])
+        # Resolve the carried born-site's placeholders to this callee too, so a
+        # caller reading the field back blames the ``set()`` in the helper.
+        born = o[3]
+        if born is not None:
+            born = (born[0] or fi.path, born[1], born[2] or fi.name)
+        return (tag, o[1] or fi.path, o[2], born)
     return None  # param / iterparam: not cross-function-resolvable here
 
 
@@ -219,8 +238,16 @@ class Handler:
         desc: str,
         arg: ast.AST,
         sink_type: str = "databag",
+        write_node: "ast.AST | None" = None,
     ) -> None:
-        """Called when ``origins`` reach a sink (``databag`` or ``hash``)."""
+        """Called when ``origins`` reach a sink (``databag`` or ``hash``).
+
+        ``write_node`` optionally pins the *exact* write location for the
+        downstream sink pointer, when it differs from ``node`` -- e.g. a
+        ``Model(\n...\n).dump(relation.data[entity])`` whose outer call ``node``
+        starts on the model line, while the databag write is on the ``.dump`` line.
+        Defaults to ``node``.
+        """
 
     def ret(self, origins: Set[Origin]) -> None:
         """Called for each ``return <value>`` with the value's taint."""
@@ -257,7 +284,7 @@ class SummaryHandler(Handler):
             self.fi.iter_params[idx] = site
             self.changed = True
 
-    def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None) -> None:
         # Hash sinks are reported only at concrete local-origin sites, not folded
         # into parameter summaries (which describe relation-data writes).
         if sink_type != "databag":
@@ -400,7 +427,28 @@ class ReportHandler(Handler):
             )
         )
 
-    def sink(self, node, origins, kind, desc, arg, sink_type="databag") -> None:
+    def _born_origin(self, born):
+        """``(path, line, via)`` for an itercaller's carried born-site, or ``None``.
+
+        ``born`` is the ``(born_path, born_node, born_func)`` recorded when a
+        ``local`` value was promoted to ``itercaller`` (``None`` if none, e.g. the
+        traced-parameter case). Placeholders resolve to this function (mirrors
+        :func:`_pick_local_site`); ``via`` is blanked when the born site is in this
+        function -- and the whole origin is dropped when the born value sits on the
+        same line as the finding, so it doesn't redundantly point at itself.
+        """
+        if born is None:
+            return None
+        path = born[0] or self.fi.path
+        func = born[2] or self.fi.name
+        line = getattr(born[1], "lineno", 0)
+        via = "" if func == self.fi.name else func
+        return (path, line, via)
+
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None) -> None:
+        # ``write_node`` pins the exact databag write for the downstream pointer;
+        # falls back to ``node`` (the write and the statement usually coincide).
+        write_node = write_node or node
         # Only locally-born unstable values are concrete bugs at this site;
         # parameter-only flows are reported on the helper that owns the sink.
         # ``element`` is value-position order instability (a pick) and reports
@@ -437,6 +485,7 @@ class ReportHandler(Handler):
                     _volatile_name(arg) or _variable(arg),
                     self.fi.path,
                     None,
+                    None,  # finding sits at the write; no separate sink pointer
                 )
             )
             return
@@ -462,6 +511,7 @@ class ReportHandler(Handler):
                     _variable(site_node),
                     site_path,
                     None,
+                    (self.fi.path, write_node),  # the write is downstream of the pick
                 )
             )
             return
@@ -481,12 +531,18 @@ class ReportHandler(Handler):
             # scrambles the sequence, so each is a place a ``sorted()`` is needed.
             # Same-site duplicates (the value reaching several sinks) collapse in
             # report.py's ``(path, line, col, rule)`` dedup.
+            # Keep each distinct materialization site with the born-site of its
+            # underlying unordered value (4th slot), so a finding at ``list(s)`` can
+            # still point ``origin=`` at where ``s`` was born (``set()`` / a helper's
+            # return) -- the trail that used to ride the ``local`` flavor.
             sites = {}
             for o in origins:
                 if is_itercaller(o):
                     site = (o[1] or self.fi.path, o[2])
-                    sites.setdefault(_loc_key(site), site)
-            for site_path, site_node in sorted(sites.values(), key=_loc_key):
+                    sites.setdefault(_loc_key(site), (site, o[3]))
+            for (site_path, site_node), born in sorted(
+                sites.values(), key=lambda s: _loc_key(s[0])
+            ):
                 self.out.append(
                     (
                         site_node,
@@ -495,7 +551,8 @@ class ReportHandler(Handler):
                         sink_type,
                         _variable(site_node),
                         site_path,
-                        None,
+                        self._born_origin(born),
+                        (self.fi.path, write_node),  # the write is downstream of the iteration
                     )
                 )
             return
@@ -508,5 +565,6 @@ class ReportHandler(Handler):
                 _variable(arg),
                 self.fi.path,
                 _pick_local_site(origins, self.fi),
+                None,  # finding sits at the write; no separate sink pointer
             )
         )

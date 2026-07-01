@@ -209,6 +209,117 @@ def test_model_dump_of_opaque_param_is_still_laundered(lint_source):
     assert not any(f.sink == "databag" for f in findings)
 
 
+# -- set coerced into a pydantic sequence field (previously a known gap) --------
+# A pydantic ``__init__`` coerces a value into the field's declared type. A bare
+# ``set`` handed to a ``list``/``tuple``/``Sequence`` field is turned into a
+# positional sequence internally -- so its disorder moves from key order
+# (``local``, laundered by a key-sorting serializer) into element order
+# (``itercaller``, which survives one). Recognising the field's annotation lets the
+# construction site promote ``local`` -> ``itercaller``.
+
+
+def test_set_into_list_field_dumped_whole_is_flagged(lint_source):
+    # The primary shape: a bare set into a ``list``-typed field, then the whole model
+    # dumped via the key-sorting ``model_dump_json`` -- caught as element-order (not
+    # laundered away as a plain set would be).
+    findings = lint_source(
+        """
+        from pydantic import BaseModel
+
+        class UnitData(BaseModel):
+            hosts: list[str]
+
+        class Charm:
+            def publish(self, relation, peers):
+                data = UnitData(hosts=set(peers))
+                relation.data[self.app]["d"] = data.model_dump_json()
+        """
+    )
+    assert any(f.rule == "unordered-iteration" and f.sink == "databag" for f in findings)
+
+
+def test_set_into_list_field_read_back_and_key_sorted_is_flagged(lint_source):
+    # The laundering miss: read the field back and pass it through an explicit
+    # key-sorting serializer. Recorded as a plain set it would be laundered; as an
+    # element-ordered list (the pydantic coercion) it must survive and be flagged.
+    findings = lint_source(
+        """
+        import json
+        from pydantic import BaseModel
+
+        class Cfg(BaseModel):
+            hosts: list[str]
+
+        class Charm:
+            def publish(self, relation, peers):
+                cfg = Cfg(hosts=set(peers))
+                relation.data[self.app]["h"] = json.dumps(cfg.hosts, sort_keys=True)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" and f.sink == "databag" for f in findings)
+
+
+def test_set_into_set_field_is_not_promoted(lint_source):
+    # A pydantic ``Set`` field keeps set semantics -- its disorder stays key-order,
+    # which a key-sorting serializer legitimately fixes. Must NOT be promoted.
+    findings = lint_source(
+        """
+        import json
+        from typing import Set
+        from pydantic import BaseModel
+
+        class Cfg(BaseModel):
+            hosts: Set[str]
+
+        class Charm:
+            def publish(self, relation, peers):
+                cfg = Cfg(hosts=set(peers))
+                relation.data[self.app]["h"] = json.dumps(cfg.hosts, sort_keys=True)
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_set_into_dataclass_list_field_is_not_promoted(lint_source):
+    # A plain dataclass does NOT coerce -- the field holds the set as-is, whose
+    # disorder is key-order (``local``), laundered by a key-sorting serializer.
+    # Promoting here would be a false positive, so it must stay clean.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass
+
+        @dataclass
+        class Cfg:
+            hosts: list
+
+        class Charm:
+            def publish(self, relation, peers):
+                cfg = Cfg(hosts=set(peers))
+                relation.data[self.app]["h"] = json.dumps(cfg.hosts, sort_keys=True)
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_sorted_set_into_list_field_is_clean(lint_source):
+    # The fix is honoured: sorting before construction leaves the field stable.
+    findings = lint_source(
+        """
+        from pydantic import BaseModel
+
+        class UnitData(BaseModel):
+            hosts: list[str]
+
+        class Charm:
+            def publish(self, relation, peers):
+                data = UnitData(hosts=sorted(set(peers)))
+                relation.data[self.app]["d"] = data.model_dump_json()
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
 # -- dict-by-fixed-key field provenance -----------------------------------------
 
 
@@ -288,3 +399,82 @@ def test_whole_container_dump_with_buried_unstable_value_is_flagged(lint_source)
         """
     )
     assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+# -- deeper-than-one-level nesting (previously a known gap) ------------------
+# The path helpers used to cap at one attribute level (``obj.field``) / two for a
+# ``self``-rooted chain (``self._stored.x``). A value buried deeper -- through an
+# intermediate value object (``self.ctx.config.targets``) -- was silently dropped.
+# The access-path key now spans any depth, symmetric on read and write.
+
+
+def test_deep_self_field_within_method_is_flagged(lint_source):
+    # ``self.ctx.config.targets`` -- three levels from ``self``. Assigned an unstable
+    # set and read back (joined into a databag) in the same method.
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self):
+                self.ctx.config.targets = set(self.hosts)
+                self.relation.data[self.app]["t"] = ",".join(self.ctx.config.targets)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" and f.confidence == "high" for f in findings)
+
+
+def test_deep_self_field_across_methods_is_flagged(lint_source):
+    # The charm idiom at depth: parked on a nested self field in one method, read in
+    # another. Rides the class-level instance-attribute taint under the full sub-chain.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def build(self):
+                self.ctx.config.targets = list(set(self.hosts))
+            def publish(self, relation):
+                relation.data[self.app]["t"] = json.dumps(self.ctx.config.targets)
+        """
+    )
+    assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
+
+
+def test_deep_plain_field_chain_within_method_is_flagged(lint_source):
+    # A plain (non-self) ``Name``-rooted chain of depth 3: ``cfg.inner.targets``.
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self):
+                cfg.inner.targets = set(self.hosts)
+                self.relation.data[self.app]["t"] = ",".join(cfg.inner.targets)
+        """
+    )
+    assert any(f.rule == "unordered-iteration" and f.confidence == "high" for f in findings)
+
+
+def test_deep_self_field_is_field_sensitive(lint_source):
+    # A clean sibling under the same nested container must not inherit a dirty
+    # sibling's taint: reading ``self.ctx.config.name`` stays clean.
+    findings = lint_source(
+        """
+        class Charm:
+            def reconcile(self):
+                self.ctx.config.targets = set(self.hosts)
+                self.ctx.config.name = "fixed"
+                self.relation.data[self.app]["n"] = ",".join(self.ctx.config.name)
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)
+
+
+def test_deep_self_field_respects_sorted(lint_source):
+    # A ``sorted()`` write to the deep field is honoured -- no finding on read-back.
+    findings = lint_source(
+        """
+        class Charm:
+            def build(self):
+                self.ctx.config.targets = sorted(set(self.hosts))
+            def publish(self, relation):
+                relation.data[self.app]["t"] = ",".join(self.ctx.config.targets)
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"] == []

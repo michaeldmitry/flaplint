@@ -28,6 +28,7 @@ from .constants import (
     PROPAGATE_CALLS,
     RENDER_SERIALIZERS,
     SANITIZER_CALLS,
+    SET_MUTATION_METHODS,
     STR_SPLIT_METHODS,
     TEMPLATE_RENDER_METHODS,
     UNORDERED_ATTRS,
@@ -89,6 +90,10 @@ class Context:
 
     env: Dict[str, Set[Origin]]
     types: Dict[str, str] = field(default_factory=dict)  # variable -> class name
+    #: variables currently holding a ``set``/``frozenset`` value, so a later
+    #: ``.add()`` / ``.update()`` on one is known to keep it an unordered set even
+    #: when it started from an otherwise-stable empty ``set()``.
+    set_vars: Set[str] = field(default_factory=set)
     cls: Optional[str] = None  # enclosing class of the analyzed function
     #: local variable -> its databag-provenance kind (relation/relation_data/databag)
     databag_kinds: Dict[str, str] = field(default_factory=dict)
@@ -166,6 +171,12 @@ class FunctionAnalyzer:
             ctx.types[target.id] = cls
         elif target.id in ctx.types:
             del ctx.types[target.id]
+        # Track set-valued bindings so a later ``.add()`` / ``.update()`` on this
+        # name is known to keep it an unordered set (see ``_visit_expr_stmt``).
+        if astutils.is_set_construction(value):
+            ctx.set_vars.add(target.id)
+        else:
+            ctx.set_vars.discard(target.id)
 
     def _record_databag_alias(
         self, target: ast.AST, value: ast.AST, ctx: Context
@@ -201,11 +212,18 @@ class FunctionAnalyzer:
           summary (the cross-function half).
         """
         self._clear_field_taint(name, ctx)
-        if isinstance(value, ast.Call) and astutils.ctor_class(value) is not None:
+        ctor = astutils.ctor_class(value)
+        if isinstance(value, ast.Call) and ctor is not None:
+            seq_fields = self.engine.model_seq_fields.get(ctor, ())
             for kw in value.keywords:
                 if kw.arg is None or kw.value is None:
                     continue
                 t = self._eval(kw.value, ctx)
+                if t and kw.arg in seq_fields:
+                    # A set coerced into a ``list``/``tuple`` pydantic field bakes
+                    # element order (``local`` -> ``itercaller``), so it survives a
+                    # key-sorting ``model_dump_json`` / ``json.dumps(sort_keys=True)``.
+                    t = self.engine.coerce_to_sequence_field(t, kw.value)
                 if t:
                     ctx.env[f"{name}.{kw.arg}"] = t
             return
@@ -291,7 +309,10 @@ class FunctionAnalyzer:
         if tag in ("local", "element"):
             return (tag, o[1] or ctx.func_path, o[2], o[3] or ctx.func_name)
         if tag == "itercaller":
-            return (tag, o[1] or ctx.func_path, o[2], o[3])
+            born = o[3]
+            if born is not None:
+                born = (born[0] or ctx.func_path, born[1], born[2] or ctx.func_name)
+            return (tag, o[1] or ctx.func_path, o[2], born)
         return None  # param / iterparam: not cross-method-resolvable here
 
     def _record_instance_attr(
@@ -392,7 +413,7 @@ class FunctionAnalyzer:
         # **ctx)`` (template-ordered) -- is *not* a gap. A parameter the caller already
         # promises to keep ordered (``data: list``/``str``) is the caller's job, not a
         # blind spot, so an ordered annotation is skipped.
-        if sink in ("file", "plan", "hash"):
+        if sink in ("file", "plan", "hash", "render"):
             origins = self._eval(content, ctx)
             seen_params = set()
             for o in origins:
@@ -411,9 +432,10 @@ class FunctionAnalyzer:
                     "" if ctx.param_annotations.get(pname) else
                     " — add a type hint (e.g. `: list`/`: str` if ordered, `: Set` if not)"
                 )
+                site = "render" if sink == "render" else f"{sink} write"
                 yield content, (
                     f"depends on parameter `{pname}`, not traced to its callers "
-                    f"(a {sink} write gets no caller-contract check, so an unordered "
+                    f"(a {site} gets no caller-contract check, so an unordered "
                     f"caller would be missed){hint}"
                 )
 
@@ -473,16 +495,24 @@ class FunctionAnalyzer:
         taints ``obj``) for the pydantic-model construction idiom, and stays
         local to the analysed function (it never alters global expression taint).
         """
-        if astutils.ctor_class(value) is None or not isinstance(value, ast.Call):
+        ctor = astutils.ctor_class(value)
+        if ctor is None or not isinstance(value, ast.Call):
             return set()
+        seq_fields = self.engine.model_seq_fields.get(ctor, ())
         out: Set[Origin] = set()
         for arg in value.args:
             if isinstance(arg, ast.Starred):
                 continue
             out |= self._eval(arg, ctx)
         for kw in value.keywords:
-            if kw.value is not None:
-                out |= self._eval(kw.value, ctx)
+            if kw.value is None:
+                continue
+            t = self._eval(kw.value, ctx)
+            if kw.arg in seq_fields:
+                # Match the field-level promotion so a whole-object model dump
+                # (``Model(hosts=set(...)).model_dump_json()``) is key-sort-proof too.
+                t = self.engine.coerce_to_sequence_field(t, kw.value)
+            out |= t
         return out
 
     def _escape_content_taint(self, call: ast.Call, ctx: Context) -> Set[Origin]:
@@ -665,6 +695,18 @@ class FunctionAnalyzer:
                 # writer puts into it (sibling args / a value-object receiver).
                 origins = self._escape_content_taint(sub, ctx)
                 if origins:
+                    # The bag argument pins the *write* line -- for a multi-line
+                    # ``Model(\n...\n).dump(bag)`` that is the ``.dump(bag)`` line,
+                    # not the outer call's start line -- so the downstream sink
+                    # pointer lands on the actual write.
+                    bag_node = next(
+                        (
+                            a
+                            for a in (*sub.args, *(kw.value for kw in sub.keywords))
+                            if self._is_databag_object(a, ctx)
+                        ),
+                        sub,
+                    )
                     handler.sink(
                         sub,
                         origins,
@@ -672,6 +714,7 @@ class FunctionAnalyzer:
                         "relation databag (written by callee)",
                         self._writer_content_node(sub, ctx),
                         "databag",
+                        write_node=bag_node,
                     )
             save_content = astutils.databag_save_content(sub)
             if save_content is not None:
@@ -759,10 +802,14 @@ class FunctionAnalyzer:
                         "direct",
                         "config rendered for the workload",
                         v.args[0] if v.args else v,
-                        "file",
+                        # A ``return yaml.dump(x)`` renders a config blob that
+                        # escapes to *some* consumer (a workload push, a file, a
+                        # databag) which diffs it -- flaplint can't prove which,
+                        # so it's a "render" boundary, not a claimed on-disk file.
+                        "render",
                     )
                 if v.args:
-                    self._gap_check(v.args[0], "file", ctx, handler)
+                    self._gap_check(v.args[0], "render", ctx, handler)
             handler.ret(self._eval(stmt.value, ctx))
             handler.ret_fields(self._returned_field_map(stmt.value, ctx))
             return
@@ -858,6 +905,21 @@ class FunctionAnalyzer:
         ):
             ctx.env[call.func.value.id] = set()  # x.sort() sanitizes in place
             return
+        # Populating a known ``set`` variable (``s.add(x)`` / ``s.update(x)``) makes
+        # it a (possibly non-empty) set, whose iteration order is hash-seeded and so
+        # unstable -- independent of what was inserted. Mark it ``local`` here so a
+        # ``s = set(); for ...: s.update(...); return s`` (or a later serialization)
+        # is caught even when the empty ``set()`` was stable and the loop source was
+        # ordered. The mutation call anchors the born-site.
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in SET_MUTATION_METHODS
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in ctx.set_vars
+        ):
+            name = call.func.value.id
+            ctx.env[name] = set(ctx.env.get(name, ())) | {("local", None, call, None)}
         # Builder mutation: ``obj.add(<unordered>)`` on a locally-constructed
         # object absorbs the argument's instability into the object's state, so a
         # later ``obj.as_dict()`` / ``obj.render()`` is order-unstable. Gated to a

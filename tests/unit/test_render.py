@@ -7,7 +7,7 @@ from pathlib import Path
 
 from flaplint.cli import main
 from flaplint.model import Finding
-from flaplint.render import colour_enabled, render_report
+from flaplint.render import _describe, colour_enabled, render_report
 
 
 def _write(tmp_path: Path, source: str) -> str:
@@ -58,7 +58,7 @@ def test_render_groups_by_file_and_has_plain_english():
     assert "unordered collection" in report
     assert "peers" in report  # concrete description names the variable
     # Footer summary with totals.
-    assert "3 problem(s)" in report
+    assert "3 flap risk(s)" in report
 
 
 def test_render_clean_message():
@@ -77,13 +77,28 @@ def test_render_ansi_when_colour_enabled():
     assert "\033[" in report
 
 
-def test_warning_finding_notes_dependency_ownership():
+def test_dependency_finding_reads_as_ownership_not_severity():
     report = render_report(
         [_finding(level="warning")], files_scanned=1, colour=False
     )
-    # A warning finding renders with the warning mark and is counted as such.
+    # A dependency finding uses the ▲ mark -- never the word "warning", which read
+    # as a severity clashing with the confidence axis. Ownership is conveyed by the
+    # mark + footer legend, not repeated as words on each finding.
     assert "▲" in report
-    assert "warning(s)" in report
+    assert "warning" not in report
+    assert "in a dependency" in report  # summary tally + legend
+    assert "high confidence" in report  # confidence still on the header
+    # Ownership words are NOT duplicated onto the finding line.
+    assert "not yours to fix" not in report
+
+
+def test_owned_finding_shows_confidence_and_legend_explains_marks():
+    report = render_report([_finding(level="error")], files_scanned=1, colour=False)
+    assert "✖" in report
+    assert "high confidence" in report
+    # The header carries confidence only; ownership lives on the mark + legend.
+    assert "yours to fix" not in report
+    assert "fails the run" in report  # legend spells out ✖
 
 
 def test_colour_enabled_respects_no_color(monkeypatch):
@@ -113,7 +128,9 @@ def test_format_concise_matches_finding_format(tmp_path, capsys):
     main([path, "--min-confidence", "low", "--format", "concise"])
     out = capsys.readouterr().out
     assert "type=unordered-collection" in out
-    assert "severity=high" in out
+    assert "confidence=high" in out
+    assert "owner=yours" in out
+    assert "severity=" not in out  # the confusing word is gone
 
 
 def test_format_pretty_is_default(tmp_path, capsys):
@@ -185,6 +202,62 @@ def test_variable_names_the_method_for_a_self_call():
     assert _variable(_expr("obj.bar()")) == "obj"
 
 
+def test_variable_peels_a_mapping_view_to_its_receiver():
+    # ``for k, v in self._relation_hosts(rel).items()`` -- the view is a
+    # transparent window onto the mapping, so name the mapping that produced it
+    # (``_relation_hosts()``), never the blameless ``items()`` (the grafana_source
+    # shape). ``.keys()`` / ``.values()`` peel the same way.
+    assert _variable(_expr("self._relation_hosts(rel).items()")) == (
+        "_relation_hosts()"
+    )
+    assert _variable(_expr("hosts.keys()")) == "hosts"
+    assert _variable(_expr("self.mapping.values()")) == "self.mapping"
+    # A same-named method that takes arguments is NOT a view -- don't peel it.
+    assert _variable(_expr("queue.items(limit)")) == "queue"
+
+
 def test_variable_is_empty_for_a_bare_self_and_an_anonymous_literal():
     assert _variable(_expr("self")) == ""
     assert _variable(_expr("{1, 2, 3}")) == ""  # no named value to point at
+
+
+# -- iteration-finding description wording -----------------------------------
+
+
+def _describe_of(f: Finding) -> str:
+    """The single-sentence description for one finding (unwrapped)."""
+    return _describe(f)
+
+
+def test_upstream_iteration_description_omits_redundant_fix_hint():
+    # When the instability has an upstream origin, "Fix at the source" carries the
+    # advice -- the generic "Sort the collection before iterating" and the wordy
+    # "not at this write" are dropped.
+    f = Finding(
+        path="charm.py", line=10, col=5, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="databag", variable="self.app_units",
+        origin_path="lib/upgrade.py", origin_line=551, via="app_units",
+        sink_path="lib/upgrade.py", sink_line=994,
+    )
+    text = _describe_of(f)
+    assert "Fix at the source" in text
+    assert "Sort the collection before iterating" not in text
+    assert "not at this write" not in text
+    assert "994" in text  # still shows where it lands
+
+
+def test_confirmed_iteration_description_does_not_blame_the_caller():
+    # A ``kind=caller`` iteration finding is *confirmed* here -- the source was
+    # traced -- so it must not hedge with "if a caller passes an unordered
+    # collection". It states the source is unordered, and weaves the sink
+    # location into the sentence rather than tacking it on at the end.
+    f = Finding(
+        path="charm.py", line=4, col=15, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="render", variable="relation.units",
+        sink_path="charm.py", sink_line=6,
+    )
+    text = _describe_of(f)
+    assert "If a caller passes" not in text
+    assert "unordered source iterated without sorted()" in text
+    assert "It reaches" not in text  # location is inline, not a trailing sentence
+    assert "rendered workload config at charm.py:6" in text

@@ -52,7 +52,9 @@ Recognised writes:
 | `f.write(data)` / `f.writelines(lines)` | `data` / `lines` |
 | `os.write(fd, data)` | `data` |
 
-There's one more: a function that **returns** `yaml.dump(...)` or `json.dumps(...)`. The rendered text is handed to a caller that compares it, so an unstable value that survives key-sorting changes the output run-to-run.
+### `render` — a returned, rendered config blob
+
+One case looks like a file but isn't provably one: a function that **returns** `yaml.dump(...)` or `json.dumps(...)`. The rendered text is handed to *some* caller that compares it — a container push, a file write, a databag — but flaplint can't see which, so it reports the `render` family. An unstable value that survives key-sorting still changes the output run-to-run, so it's caught the same way; only the label is more cautious.
 
 ### `plan` — a pebble plan
 
@@ -126,14 +128,16 @@ If a caller is later proven to pass unordered data, the confirmed finding replac
 
 ---
 
-## Errors vs. warnings — who can fix it
+## Ownership — whose job is the fix?
 
-Whether a finding fails CI depends only on **who owns the code**:
+Whether a finding fails the run is an axis about **responsibility**, kept separate from *confidence* (how sure flaplint is). Internally the two ownership states are still called `error`/`warning` (the `level` field, and the JSON `level` key), but the UI speaks about ownership so a reader never mistakes the blocking mark for a second severity next to confidence:
 
-- **error** (`✖`) — the fix is in code the charm owns: its own `src/`, or its own `lib/charms/<charm-name>/`. Errors fail CI.
-- **warning** (`▲`) — the fix is in a library the charm only *uses* (an installed dependency, or a vendored copy of another charm's lib). Shown for awareness, doesn't fail CI.
+- `✖` **yours** (`level=error`) — the fix is in code the charm owns: its own `src/`, or its own `lib/charms/<charm-name>/`. These fail the run.
+- `▲` **in a dependency** (`level=warning`) — the fix is in a library the charm only *uses* (an installed dependency, or a vendored copy of another charm's lib). Shown for awareness, doesn't fail the run.
 
-`--dep` adds a root to analyse and report on, but never changes whether a finding is an error or a warning. See [resolving-dependencies.md](resolving-dependencies.md).
+The two axes are orthogonal: a `▲` dependency finding can be `high confidence` (a real flap you just can't fix here), and a `✖` finding can be `medium`. In `--format concise` they're the separate fields `owner=yours|dependency` and `confidence=high|medium|low`.
+
+`--dep` adds a root to analyse and report on, but never changes whose a finding is. See [resolving-dependencies.md](resolving-dependencies.md).
 
 ## Removing duplicates and silencing lines
 
