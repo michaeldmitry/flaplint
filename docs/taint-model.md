@@ -1,237 +1,280 @@
-# How flaplint spots an unstable value
+# What flaplint detects
 
-This is the heart of `flaplint`: what makes a value's text come out differently from
-one run to the next, how that gets labelled, and how the label changes as the value
-is copied, transformed, and passed around. [sinks-and-findings.md](sinks-and-findings.md)
-builds on the words introduced here.
+This page explains *what makes a value unstable* in flaplint's eyes and *how it changes* as the value moves through your code. [sinks-and-findings.md](sinks-and-findings.md) builds on the vocabulary introduced here.
 
-For any expression, flaplint asks one question:
+## The question flaplint asks
 
-> If this value reaches a databag (or a file, or a hash), will its text be the same
-> on two otherwise-identical reconciles — and if not, why not?
+For any value reaching a sink, flaplint asks:
 
-A stable value has no answer to "why not". An unstable one carries a short label that
-says *why* it's unstable. That label is what the rest of this page is about.
+> If this value is written to a databag (or a file, or a hash) on two otherwise-identical reconciles, will the text be the same both times?
 
-## The six kinds of instability
+If yes → stable, no finding. If no → unstable, and *why* it's unstable determines both the fix and whether a given serializer can save you.
 
-There are six labels. What separates them is **which fix actually works** — and in
-particular, whether it's enough to let a serializer sort the keys for you. (A
-key-sorting serializer is one that puts mapping keys in order as it writes them:
-`yaml.dump`, `json.dumps(sort_keys=True)`, a Pydantic dump.)
+## Patterns flaplint catches
 
-| what it is | name in the code | the fix |
+Here are the concrete patterns, grouped by what makes them flap and what fixes them.
+
+### Pattern 1: Unordered dict keys written directly
+
+```python
+config = {u.name: u.app.name for u in relation.units}   # dict — key order not fixed
+databag["config"] = json.dumps(config)                    # key order varies each reconcile
+```
+
+**What's wrong:** the dict is built by iterating over `relation.units`, which is an unordered set. The key order follows whatever order the set happens to produce — different each reconcile.
+
+**Fix:** `json.dumps(config, sort_keys=True)` — or `yaml.dump(config)` (sorts keys by default).
+
+**Why key-sorting is enough here:** the *entire* disorder is in the dict's key order. `sort_keys=True` locks key order alphabetically regardless of how the dict was built, so the output is identical every reconcile.
+
+This is labelled **`local`** — the instability is at the "key order" level, which a key-sorting serializer genuinely fixes.
+
+### Pattern 2: List built from an unordered source
+
+The critical difference from Pattern 1: **once you convert a set to a list, the disorder moves from key order into element positions** — and key-sorting is blind to element positions.
+
+```python
+addrs = list(self.endpoints)               # set → list: element order is now baked in
+databag["addrs"] = json.dumps(addrs)       # flaps even with sort_keys=True
+```
+
+**What's wrong:** `json.dumps(addrs, sort_keys=True)` sorts dict *keys* inside the JSON but leaves the list elements in whatever order they came out of the set. `[c, a, b]` stays `[c, a, b]` — the serializer never touches it.
+
+**Fix:** `list(sorted(self.endpoints))` — sort *before* materialising the list.
+
+The same problem appears in comprehensions and loops:
+
+```python
+addrs = [ep.address for ep in self.endpoints]   # endpoints is a set — same flap
+addrs = []
+for ep in self.endpoints:                        # loop materialises the same disorder
+    addrs.append(ep.address)
+```
+
+And in joins — joining bakes the set's order into the resulting string, which nothing can reorder:
+
+```python
+joined = ",".join(self.endpoints)   # same as list(set): string bakes in the order
+```
+
+This is labelled **`itercaller`** — the instability is in the iterated sequence's element order, which survives any key-sorting serializer. It's the most easily missed case and the central distinction flaplint exists to catch.
+
+### Pattern 3: Positional pick from an unordered source
+
+```python
+first_addr = list(self.endpoints)[0]   # which item is "first" depends on the run
+databag["primary"] = first_addr
+```
+
+**What's wrong:** picking by position from an unordered collection gives a different item each time. This is labelled **`element`**.
+
+**Fix:** `sorted(self.endpoints)[0]` — sort before picking so "first" is deterministic.
+
+### Pattern 4: A different-every-run value
+
+```python
+databag["nonce"] = str(uuid4())    # different every reconcile, no matter what
+```
+
+**What's wrong:** `uuid4()`, `time()`, `random()`, and similar calls produce a new value every time the code runs. No sorting can help — the value itself changes, not just its order. This is labelled **`volatile`**.
+
+**Fix:** derive the value deterministically (e.g. from something stable, like an app name), or persist it once and reuse it.
+
+### Pattern 5: A helper that trusts its caller
+
+```python
+def publish(self, relation, items):               # no type hint on items
+    relation.data[self.app]["peers"] = json.dumps(items)   # writes items unsorted
+```
+
+flaplint can't see what `items` will actually hold, but it can see that if any caller passes an unordered value, it'll be written to the databag without sorting. This is flagged as a **`sink`** finding (medium confidence) — a helper that trusts its caller to pass ordered data.
+
+If a caller is traced passing an unstable `items`, a higher-confidence **`caller`** finding is emitted at the call site.
+
+### Pattern 6: Unstable value stored in a field or on `self`
+
+Storing an unstable value in a dataclass field, a Pydantic model field, or on `self` doesn't make it stable. Flaplint tracks the taint through field reads and across method boundaries.
+
+```python
+# Dataclass / value object
+@dataclass
+class Cfg:
+    endpoints: set[str]
+    name: str
+
+cfg = Cfg(endpoints=set(hosts), name="primary")
+databag["hosts"] = json.dumps(list(cfg.endpoints))   # caught: cfg.endpoints is still a set
+```
+
+```python
+# Instance attribute, across methods
+class Provider:
+    def __init__(self):
+        self._endpoints = {u.name for u in self.relation.units}   # stored on self
+
+    def publish(self, databag):
+        databag["hosts"] = json.dumps(list(self._endpoints))      # caught: self._endpoints is unstable
+```
+
+**What's wrong:** the instability is in the value itself, not in the variable name. Reading it back from a field or from `self` doesn't change that.
+
+**Fix:** sort when the value is first created (`self._endpoints = sorted(...)`) or at the point of use (`sorted(self._endpoints)`).
+
+```python
+# Dict by constant key — tracked field-sensitively
+self.cfg["jobs"] = set(hosts)
+databag["jobs"] = json.dumps(list(self.cfg["jobs"]))   # caught: cfg["jobs"] is unstable
+databag["name"] = json.dumps(self.cfg["name"])          # clean: sibling key is not tainted
+```
+
+**What's wrong:** the instability is in the value itself, not in the variable name. Reading it back from a field, from `self`, or by a constant dict key doesn't change that.
+
+**Fix:** sort when the value is first created (`self._endpoints = sorted(...)`) or at the point of use (`sorted(self._endpoints)`).
+
+Flaplint tracks each field independently — `cfg.name` stays clean even if `cfg.endpoints` is unstable. The tracking also carries across a function return: `cfg = self._build_cfg(); cfg.endpoints` is caught if `_build_cfg` returns an object with an unstable field.
+
+### Pattern 7: Filesystem listing
+
+`glob`, `listdir`, `scandir`, and `iterdir` return files in **filesystem order**, which is not guaranteed to be consistent across runs — it follows inode order, not alphabetical.
+
+```python
+alert_files = glob.glob("/etc/rules/*.yaml")      # order is not predictable
+databag["alerts"] = json.dumps(alert_files)        # caught: list order flaps
+```
+
+**What's wrong:** the filesystem can return the same set of files in a different order between container restarts or after any file sync. Each reconcile the databag sees a different list.
+
+**Fix:** `sorted(glob.glob("/etc/rules/*.yaml"))` — sort immediately after the listing.
+
+This applies to any directory-listing call: `os.listdir`, `Path.iterdir`, `os.walk`.
+
+### Pattern 8: Jinja template render with unstable values
+
+flaplint treats `.render(...)` as opaque — it can't see inside the template — so it assumes the **rendered output is as unstable as the values passed in**.
+
+```python
+config = template.render(
+    peers=list(self.endpoints),    # set → list → itercaller
+    name=self.app.name,            # stable
+)
+container.push("/etc/app/config.yaml", config)    # caught: output inherits itercaller
+```
+
+**What's wrong:** even though the template itself is a fixed text file, its output depends on the order the inputs appear. An unstable list passed in produces unstable rendered text — the config will reshuffle every reconcile.
+
+**Fix:** sort the unstable inputs before passing them: `sorted(self.endpoints)`.
+
+The rendered text inherits the instability kind of its inputs — if `itercaller` goes in, `itercaller` comes out. If all inputs are stable, the render is stable.
+
+### Pattern 9: Pydantic model with an unstable list field
+
+`model_dump_json()` writes field names in fixed order — it acts like a key-sorting serializer. But like any key-sorting serializer, it only fixes key (field-name) order. A field whose value is itself a list built from an unordered source still flaps.
+
+```python
+class UnitData(BaseModel):
+    dashboards: list[str]
+
+data = UnitData(dashboards=list(glob.glob("*.json")))   # list from glob → itercaller
+relation.data[app]["d"] = data.model_dump_json()         # caught: field names are fixed;
+                                                          # list elements are not
+```
+
+**What's wrong:** `model_dump_json` writes the list in element order — the same way `json.dumps` would. The field name "dashboards" is always in the same place, but the elements inside `[...]` reshuffle every reconcile.
+
+**Fix:** `sorted(glob.glob("*.json"))` — sort before constructing the model.
+
+**Pydantic v1 note:** the v1 spellings `.json()` / `.dict()` take the conservative path — they inherit *all* receiver taint, including list-field element disorder. So they catch the set-coerced-to-list case that v2 `model_dump_json()` misses (the known gap documented in [architecture.md](architecture.md#known-gaps)).
+
+---
+
+## The six kinds of instability (reference)
+
+Internally, flaplint tracks *why* a value is unstable with one of six labels:
+
+| label | what it means | the fix |
 |---|---|---|
-| a whole thing with no fixed order — a `set`, a `glob()` result, `relation.units` | `local` | let a key-sorting serializer handle it, or `sorted()` |
-| one item picked by **position** out of something unordered — `addrs[0]` | `element` | `sorted(addrs)[0]` — sort *before* picking |
-| a **list made from** something unordered — `list(some_set)`, `[x for x in some_set]` | `itercaller` | `sorted(...)` where the list is built |
-| a list made by looping over a **parameter** — the *caller* decides the order, not this function | `iterparam` | sort where it's looped over, or have the caller pass sorted data |
-| a value that's **different every run** — `uuid4()`, `time()`, `random()` | `volatile` | nothing; sorting can't help — don't write it to the bag |
-| "as unstable as parameter N" — a stand-in, filled in at each call | `param` | depends on what the caller passes |
+| `local` | a bare set/dict/glob — disorder is at the key-order level | key-sorting serializer, or `sorted()` |
+| `element` | one item picked by position out of something unordered | `sorted(x)[i]` before picking |
+| `itercaller` | a list/string/tuple materialised from an unordered source | `sorted(...)` before materialising |
+| `iterparam` | a list built by looping over a *parameter* — caller decides the order | sort at the call site, or sort inside the loop |
+| `volatile` | a value that's different every run — `uuid4()`, `time()`, `random()` | make it stable / persistent |
+| `param` | a stand-in for "as unstable as parameter N" — resolved at each call site | depends on what the caller passes |
 
-Every unstable value also remembers **where it was created**, so a finding can point
-at the `set()` or `list(...)` that started the trouble instead of the place it was
-finally written.
+The label matters because it determines **which fix works** and whether a given serializer can help.
 
-### Why a plain set and a list-made-from-a-set are different
-
-This is the most easily-missed point in the whole tool, so here it is plainly:
-
-- A **`set`** written through a key-sorting serializer is **fine**. The serializer
-  puts the items in order for you (`yaml.safe_dump` writes a set as a sorted mapping;
-  `json.dumps(sort_keys=True)` sorts the keys). → labelled `local`.
-- A **`list(set)`** written through the **same** serializer is **not** fine. Sorting
-  keys does nothing to the order of a list's items: `[c, a, b]` stays `[c, a, b]`.
-  Turning a set into a list moves the disorder somewhere sorting-the-keys never
-  reaches. → labelled `itercaller`.
-
-So `list(some_set)` is treated differently from a bare `set` for one reason: it
-changes whether letting the serializer sort the keys is enough to save you.
-
-`" ".join(some_set)` is the same story in disguise. Joining bakes the set's order
-into the resulting **string**, and a key-sorting serializer can't reach inside a
-string any more than it can reorder a list. So joining an unordered collection is
-also `itercaller`, not `local` — sort *before* the join.
-
-## What each serializer fixes
+## What each serializer does
 
 Serializers come in two kinds:
+- **plain** — `str`, `repr`, `.encode()`, `json.dumps(x)` without `sort_keys`. Output follows input order exactly.
+- **key-sorting** — `yaml.dump` / `yaml.safe_dump`, `json.dumps(sort_keys=True)`, a Pydantic dump. These put *mapping keys* in alphabetical order, and nothing else.
 
-- **plain** — `str`, `repr`, `.encode()`, `json.dumps(x)` with no `sort_keys`. The
-  text comes out in exactly the order it went in.
-- **key-sorting** — `yaml.dump`/`safe_dump`, `json.dumps(sort_keys=True)`, a Pydantic
-  dump. These put *mapping keys* in order, and nothing else.
+Which labels survive each:
 
-Which kinds of instability each one leaves behind:
-
-| kind | survives `str()` / `repr()` | survives a key-sorting serializer |
+| label | survives `str()` / `repr()` | survives a key-sorting serializer |
 |---|:---:|:---:|
-| `local` | yes | **no** — sorting the keys fixes it |
+| `local` | yes | **no** — key-sorting fixes it |
 | `element` | yes | yes |
 | `itercaller` | yes | yes |
 | `iterparam` | yes | yes |
 | `volatile` | yes | yes |
-| `param` | — | — *(a stand-in, filled in at the call)* |
+| `param` | — | — *(resolved at the call)* |
 
-The single most common bug this tool exists to catch — and the one simpler checkers
-miss — is the bottom of this table: a value whose **list order** is unstable, written
-through a serializer that only sorts **keys**.
+The single most common bug this tool exists to catch — and the one simpler checkers miss — is **`itercaller` surviving a key-sorting serializer**: a list built from a set looks like "just another collection" but key-sorting can't reorder its elements.
 
-## Where unstable values come from
+## Where unstable values come from (sources)
 
-These are the **sources** in taint-analysis terms — the points where instability
-(flaplint's flavour of taint) first enters a value.
+### Things with no fixed order → `local`
 
-### Things with no fixed order (`local`)
+- **Sets**: `set(...)`, `frozenset(...)`, set literals `{a, b}`, set comprehensions `{x for x in …}`
+- **Set math**: `a | b`, `a & b`, `a - b`, and so on
+- **Directory listings**: `glob`, `listdir`, `scandir`, `walk`, `iterdir`, … — filesystem order is not guaranteed
+- **`relation.units`** — the set of units in a relation; order varies run-to-run
 
-- **Sets**: `set(...)`, `frozenset(...)` with contents (an empty `set()` is fine),
-  set literals `{a, b}`, and set comprehensions `{x for x in …}`.
-- **Set math**: `a | b`, `a & b`, `a - b`, and so on.
-- **Listing a directory**: `glob`, `listdir`, `scandir`, `walk`, `iterdir`, … —
-  the order files come back in isn't guaranteed.
-- **`relation.units`** — a set of units whose order changes from one run to the next.
+### Values that differ every run → `volatile`
 
-### Different-every-run values (`volatile`)
+`uuid4()` and its siblings, `time()`, `random()` and related functions, `token_hex()`, and so on.
 
-`uuid4()` and its siblings, `time()`, `random()` and the other random functions,
-`token_hex()`, and so on.
+### Parameters → `param`
 
-### Parameters (`param`)
+A reference to a parameter is recorded as "as unstable as parameter N" — a placeholder resolved at each call site. This is how "does this function write an unstable argument?" is answered without re-analysing the callee every time.
 
-A reference to a parameter is recorded as "as unstable as parameter N" rather than a
-real instability. It's a promise to check the actual argument at each call — the idea
-behind [following values across function calls](architecture.md#following-values-across-function-calls).
+## How a value changes as it moves (propagation)
 
-### Type hints (a hint at the write, not a source)
+### Things that pass instability through unchanged
 
-A parameter's type hint never makes a value unstable by itself. It only adjusts the
-confidence of a [helper-trusts-its-caller finding](sinks-and-findings.md#when-a-helper-trusts-its-caller):
-a hint like `Set` or `Iterable` raises confidence; `List`, `Dict`, or `str` skips the
-finding (the caller owns the order); a named object type like a dataclass also skips
-it (you can't `sorted()` a dataclass).
+`list`, `tuple`, `reversed`, `dict`, `copy`, `deepcopy` carry the input's instability forward. A plain (non-key-sorting) serializer passes it through too: `json.dumps(x)` is only as stable as `x`.
 
-## How a value changes as it moves
+A template render (`template.render(x=…)`) is treated the same way — flaplint can't see inside the template, so it assumes the rendered text is as unstable as the values handed in. This catches the common pattern of rendering a config from Jinja and writing it to a file.
 
-This is **propagation** — the rules for how taint flows through each operation: what
-passes it through, what clears it (the **sanitisers**), and what changes *which kind* it
-is.
+### Things that make a value stable (sanitisers)
 
-### Things that pass it through unchanged
-
-`list`, `tuple`, `reversed`, `dict`, `copy`, `deepcopy` carry their input's
-instability along — `copy.deepcopy(dict(x))` is exactly as unstable as `x`. A
-serializer that doesn't sort keys passes it through too: `json.dumps(x)` is only as
-stable as `x`.
-
-A template render (`template.render(x=…)`) is treated the same way. flaplint can't
-see inside the template, so it assumes the rendered text is as unstable as the values
-handed in — which catches the common pattern of rendering a config from a Jinja
-template and writing it to a file. (The looping that actually reorders the text lives
-in the template, so a plain read of the Python would miss it.)
-
-### Things that make it safe (the sanitisers)
-
-`sorted(...)` (and `.sort()`) make a value stable. A key-sorting serializer makes the
-`local` kind safe (it sorts the keys), but — as the table shows — not the others.
-
-Two more things clear the "this parameter *might* be an unordered collection" worry of
-a `param`:
-
-- **`str.split` / `rsplit` / `splitlines`.** Splitting a string gives back a list in
-  the order the string reads, left to right — never a collection's order (you can't
-  `.split()` a set). So looping over `s.split(",")` is predictable; only the string's
-  own *different-every-run* content (a `uuid4()` inside it) carries through.
-- **An `isinstance(x, <ordered type>)` check.** Inside `if isinstance(raw, list):`,
-  `raw` is definitely a list — a caller passing a set can't reach that branch — so the
-  caller-might-pass-a-set worry is dropped there. It's the runtime twin of hinting the
-  parameter as `list`. Only the `param` worry is cleared: `isinstance` proves the
-  *type*, not the *order*, so a genuinely unstable `list(some_set)` inside the check
-  still gets flagged.
+- `sorted(...)` and `.sort()` make a value stable.
+- A key-sorting serializer makes the `local` kind safe but leaves `itercaller` / `element` / `volatile` intact.
+- **`str.split` / `rsplit` / `splitlines`**: splitting a string gives back a list in left-to-right order, never in a collection's order — so the loop is predictable. (Only a `volatile` string's *content* carries through.)
+- **`isinstance(x, <ordered type>)` check**: inside `if isinstance(raw, list):`, the `param` worry is cleared because the caller can't pass a bare set through that branch. (It only clears the type concern, not concrete instability — a real `list(some_set)` inside the check still flaps.)
 
 ### Things that change which kind it is
 
-Three operations move a value from one kind to another, because they change which fix
-works:
+Three operations promote a value to a more severe label:
 
-1. **Picking by position out of something unordered → `element`.** `unordered[0]`
-   grabs one item whose identity depends on the unstable order — the classic
-   "grab the first address" bug. Sorting the keys can't fix a single picked value.
+1. **Picking by position → `element`**: `unordered[0]` grabs one item whose identity depends on the run-to-run ordering. Can't be fixed by sorting keys.
 
-2. **Building a list from a set → `itercaller`.** `list(some_set)`,
-   `tuple(relation.units)`, `[x for x in some_set]`. The list's item order now carries
-   the disorder, where sorting the keys won't reach. (`dict`/`copy` are *not* in this
-   group — they keep a mapping, whose key order a serializer does fix.) The **imperative
-   form is the same**: a list filled by appending in a loop over an unordered source
-   (`for u in relation.units: eps.append(...)`) is `itercaller` too, reported at the loop
-   where the `sorted()` goes — identical to the comprehension. A `set`/`dict` accumulator
-   (`s.add(...)`, `d[k] = v`) stays `local` (its disorder *is* key-order, which a
-   key-sorting serializer launders). `enumerate` carries the list's taint through, so an
-   **index-keyed dict** (`{f"k-{i}": e for i, e in enumerate(eps)}`) flaps even though the
-   keys sort — the `i`→`e` binding follows `eps`'s order. And mutating a **nested element**
-   (`template["sinks"].update(eps)`) makes the root `template` unstable, so a later
-   `yaml.dump(template)` is caught.
+2. **Building a list from a set → `itercaller`**: `list(some_set)`, `tuple(relation.units)`, `[x for x in some_set]`, a loop accumulator (`for u in relation.units: eps.append(…)`). The list's item order now carries the disorder. A `set` or `dict` accumulator stays `local` — its disorder is key-order, which a key-sorting serializer does fix.
 
-3. **Looping a parameter into a list → `iterparam`.** The order belongs to the
-   caller, so this is flagged as a place that trusts its caller, pointing at the loop
-   where a `sorted()` would go.
+   Two subtle cases:
+   - **`enumerate` on a flapping list** carries the taint through, so an index-keyed dict (`{f"k-{i}": e for i, e in enumerate(eps)}`) still flaps even though the keys sort.
+   - **Mutating a nested element** (`template["sinks"].update(eps)`) makes the root `template` unstable, so a later `yaml.dump(template)` is caught.
 
-### What each serializer does
+3. **Looping a parameter into a list → `iterparam`**: the caller decides the order, so this is flagged as a `sink` finding at the loop.
 
-| call | what happens |
-|---|---|
-| `str(x)`, `repr(x)`, `x.encode()` | text comes out in input order — every kind of instability survives except a bare parameter |
-| `json.dumps(x)` | passes everything through |
-| `json.dumps(x, sort_keys=True)` | makes the `local` kind safe; the rest survive |
-| `yaml.dump`/`safe_dump(x)` | sorts keys by default (makes `local` safe); `sort_keys=False` passes everything through |
-| `json.dump(obj, fp)` | writes a *file*, not a value — handled as a [file write](sinks-and-findings.md) instead |
-| a Pydantic dump (`model_dump_json` / `model_dump`) | launders the model's *field-name* order (and an opaque model param's boundary uncertainty), but **not** a concrete field's value order — see the caveat below |
-
-### A method call keeps the receiver's instability
-
-Calling a method on an unstable value generally keeps it unstable, even when we can't
-see inside the method — `d.keys()`, or a builder's `.as_dict()` after an unordered
-`.add()`. A Pydantic dump (`model_dump_json` / `model_dump`) is a *partial* exception: it
-launders the model's fixed field-*name* order, but not the order *within* a field value.
-
-**A dump fixes field-*name* order, not a list field's elements.** A model whose *field is
-a list* built from an unordered source still flaps: the dump writes that list in element
-order, so `data.model_dump_json()` is not safe when `data.dashboards` came from a
-`glob()`. flaplint **catches this** without reading the model's schema: a dump only
-reorders field *names*, so it inherits the
-receiver's *concrete* content taint (`itercaller`/`element`/`local`/`volatile`) and drops
-only the field-name-order / opaque-param flavors (`param`/`iterparam`). The v1 `.json()` /
-`.dict()` spellings stay even more conservative (they inherit *all* receiver taint), so
-they catch it too. What remains a blind spot is a set→list promotion *inside* the model's
-`__init__` — the deepest form of the [object-field barrier](architecture.md#following-values-through-object-fields-and-where-it-stops),
-which would need the model's field types to resolve.
-
-### Through a value object's field
-
-An unstable value stored in a **value object's field** (a dataclass, a pydantic
-model, a NamedTuple) is read back out with its instability intact:
-
-```python
-ctx = Ctx(targets=set(hosts), name="x")     # the targets field → local
-push(",".join(ctx.targets))                  # read back → itercaller (a joined set)
-```
-
-This tracks **each field separately** — reading a clean field (`ctx.name`) stays
-clean — and it carries across a function return (`ctx = self._build(); ctx.targets`).
-It does **not** reach through a value buried inside a dict, a field rebuilt by a
-method, or a deeper `a.b.c` path. See
-[the architecture note](architecture.md#following-values-through-object-fields-and-where-it-stops).
 
 ## A worked example
 
 ```python
-group_by = set(route.get("group_by", []))                 # a set → local
-group_by = list(group_by.union(["juju_model"]))           # now a list → itercaller
+group_by = set(route.get("group_by", []))               # local: a set
+group_by = list(group_by.union(["juju_model"]))         # itercaller: list from a set
 config["route"]["group_by"] = group_by
-return yaml.safe_dump(config)                              # sorts keys — but the list survives
+return yaml.safe_dump(config)                           # sorts keys — but not list items
 ```
 
-`yaml.safe_dump` sorts the config's keys but can't reorder the `group_by` list, so the
-text changes every reconcile. Because the value is the list kind (`itercaller`), it
-survives the key-sorting serializer and is reported, pointing at the `list(...)` where
-`sorted(...)` belongs. Had it stayed a plain set, flaplint would have correctly
-assumed `yaml.safe_dump` sorted it and said nothing.
+`yaml.safe_dump` sorts `config`'s keys but can't reorder the `group_by` list's elements. Because `group_by` is `itercaller`, it survives the key-sorting and is reported — pointing at the `list(...)` where `sorted(...)` belongs. Had it stayed a plain set, the key-sorting would have been enough and flaplint would correctly say nothing.
