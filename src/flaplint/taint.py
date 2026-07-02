@@ -14,7 +14,9 @@ from typing import Dict, Optional, Set
 
 from . import astutils
 from .constants import (
+    BUILDER_ARG_PROPAGATORS,
     BUILTIN_COLLECTION_METHODS,
+    BYTES_SERIALIZER_METHODS,
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
     PROPAGATE_CALLS,
@@ -475,6 +477,23 @@ class TaintEngine:
             return _survives_stringify(
                 self.eval(call.func.value, env, cls_ctx, depth + 1)
             )
+        if name in BYTES_SERIALIZER_METHODS and isinstance(call.func, ast.Attribute):
+            # ``csr.public_bytes(encoding)`` renders the object to DER/PEM whose
+            # byte-stability follows the object's own -- a SAN built from a set makes
+            # the bytes reshuffle. Like ``.encode()``, only genuine instability
+            # survives (the ``encoding`` argument is a clean enum, ignored).
+            return _survives_stringify(
+                self.eval(call.func.value, env, cls_ctx, depth + 1)
+            )
+        if name in BUILDER_ARG_PROPAGATORS and isinstance(call.func, ast.Attribute):
+            # Fluent builder: ``builder = builder.add_extension(ext, critical=...)``
+            # returns a new builder carrying the receiver's taint plus the added
+            # extension's, so a set-built SAN flows on to ``.sign().public_bytes()``.
+            out = self.eval(call.func.value, env, cls_ctx, depth + 1)
+            for a in call.args:
+                if not isinstance(a, ast.Starred):
+                    out |= self.eval(a, env, cls_ctx, depth + 1)
+            return out
         if name in STR_SPLIT_METHODS and isinstance(call.func, ast.Attribute):
             # ``s.split(",")`` / ``rsplit`` / ``splitlines`` return a list ordered by
             # the string's content, not by any collection's iteration order -- so the

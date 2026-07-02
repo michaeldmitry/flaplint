@@ -175,6 +175,8 @@ def reconcile(self): push(",".join(self._render()))  # _render() builds from sel
 
 flaplint sees `_render()` return something but can't trace what it rebuilds from. If the method returned `self._hosts` directly it would be caught.
 
+The same limit hides a **config-builder object** that accumulates components and is dumped elsewhere: `self.config.add_component(name, {…})` stores the value under `self._config[section][name]` (a nested-subscript instance attribute flaplint doesn't track), and a separate `build()` re-serializes the whole thing with `yaml.safe_dump`. An unstable value handed to `add_component` is therefore not followed to the dump. The instability *arriving* at the builder is still caught at its source (e.g. a set enumerated into `.../{idx}` component names is flagged at the `enumerate`, before the `add_component` call).
+
 ### A value reached through a call or subscript in the field chain
 
 ```python

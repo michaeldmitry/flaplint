@@ -289,8 +289,10 @@ Three operations promote a value to a more severe label:
 
    Two subtle cases:
    - **`enumerate` on a flapping list** carries the taint through, so an index-keyed dict (`{f"k-{i}": e for i, e in enumerate(eps)}`) still flaps even though the keys sort.
+   - **`enumerate` over an unordered source binds a positional index to each value**, so the loop *value* itself is seeded key-sort-resistant: `for i, cert in enumerate(some_set): write(f"{i}.crt", cert)` writes each `cert` under a stable index `i` whose element flaps run-to-run — the received-CA-cert / numbered-exporter anti-pattern. The fix is `sorted()` before `enumerate`. The index target (`i`) stays clean (`0, 1, 2` don't move), and enumerating a bare parameter or an already-`sorted()` source is not seeded (no concrete flap there).
    - **Mutating a nested element** (`template["sinks"].update(eps)`) makes the root `template` unstable, so a later `yaml.dump(template)` is caught.
    - **Merging one mapping into another** (`certs.update(other)` / `certs.setdefault(k, v)` on a plain `dict` variable) folds `other`'s key-insertion order into `certs`, so `certs` inherits its instability — the same absorption a loop already does (`for …: certs.update(…)`), but for the single-call form outside a loop (the `certs.update(self._get_certs_from_relation())` shape).
+   - **Building an x509 SAN from a set** (`x509.SubjectAlternativeName(set(sans))`, also `IssuerAlternativeName` / `GeneralNames`) bakes the set's order into an order-significant DER `SEQUENCE`, so the certificate's bytes reshuffle. The taint rides the fluent CSR/cert builder (`builder = builder.add_extension(…)`) and its `.public_bytes(encoding)` emit, so `set → SubjectAlternativeName → sign → public_bytes → databag/file` is caught. This is the classic TLS flap where a charm passes a sorted/`frozenset` of SANs but the library re-`set()`s them — so it usually lands as a **▲ dependency** finding, inside the tls-certificates lib rather than the charm.
 
 3. **Looping a parameter into a list → `iterparam`**: the caller decides the order, so this is flagged as a `sink` finding at the loop.
 

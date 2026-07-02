@@ -16,7 +16,9 @@ from typing import Dict, List, Optional, Set
 from . import astutils
 from .constants import (
     ACCUMULATOR_METHODS,
+    BUILDER_ARG_PROPAGATORS,
     BUILTIN_COLLECTION_METHODS,
+    BYTES_SERIALIZER_METHODS,
     FILE_WRITE_DESCS,
     HASH_CALLS,
     ISINSTANCE_ORDERED_TYPES,
@@ -40,7 +42,7 @@ from .constants import (
 from . import databag
 from .handlers import Handler, _RemoteSite
 from .model import FuncInfo, Origin, Registry
-from .taint import TaintEngine, _promote_to_sequence
+from .taint import TaintEngine, _as_local_sequence, _promote_to_sequence
 
 
 #: Call names that don't introduce ordering/volatility instability, so a call to one
@@ -82,6 +84,8 @@ _ENGINE_KNOWN_CALLS = (
     | MODEL_SERIALIZERS
     | BUILTIN_COLLECTION_METHODS
     | HASH_CALLS
+    | BUILDER_ARG_PROPAGATORS
+    | BYTES_SERIALIZER_METHODS
     | {"dumps", "dump", "safe_dump"}
 )
 
@@ -1074,6 +1078,33 @@ class FunctionAnalyzer:
         self._scan_expr(stmt.iter, ctx, handler)
         targets = [t.id for t in ast.walk(stmt.target) if isinstance(t, ast.Name)]
         container = astutils.root_name(stmt.iter)
+        # ``for i, x in enumerate(<unordered>)``: enumerate materialises the source
+        # into a *positional* sequence, so each ``x`` is the element at position ``i``.
+        # When ``i`` forms a stable key (a ``{i}.crt`` filename, a ``.../{idx}``
+        # component name) and ``x`` is written under it, the value-under-each-position
+        # flaps run-to-run -- order a key-sorting serializer can't launder. Seed the
+        # value target(s) as the key-sort-resistant iteration flavor (``local`` ->
+        # ``itercaller``, born at the enumerate where ``sorted()`` belongs) so a sink on
+        # ``x`` *inside* the loop is caught -- the direct-write case the accumulator
+        # rule below doesn't cover -- and consistently with how an accumulator built
+        # from the same loop is already reported. The index target (the first) stays
+        # clean: ``0, 1, 2`` don't move.
+        enum_arg = astutils.enumerate_arg(stmt.iter)
+        if (
+            enum_arg is not None
+            and isinstance(stmt.target, ast.Tuple)
+            and len(stmt.target.elts) >= 2
+        ):
+            pick = _as_local_sequence(self._eval(enum_arg, ctx), stmt.iter)
+            # Only genuine ordering instability, not a bare parameter: enumerating a
+            # plain param is the caller's ordering contract, not a concrete flap here.
+            pick = {o for o in pick if not (isinstance(o, tuple) and o[0] == "param")}
+            if pick:
+                for value_elt in stmt.target.elts[1:]:
+                    for nm in (
+                        t.id for t in ast.walk(value_elt) if isinstance(t, ast.Name)
+                    ):
+                        ctx.env[nm] = set(ctx.env.get(nm, ())) | set(pick)
         for inner in astutils.child_bodies(stmt):
             self._visit_body(inner, ctx, handler)
         # If the loop iterates an unordered source, every accumulator it fills

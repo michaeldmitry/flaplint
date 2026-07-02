@@ -719,3 +719,101 @@ def test_empty_set_never_mutated_stays_stable(lint_source):
         """
     )
     assert not any(f.sink == "databag" for f in findings)
+
+
+# --- enumerate: a value written directly under its positional index -------------
+# ``for i, x in enumerate(some_set): sink(f"...{i}...", x)`` -- enumerate pairs each
+# element with a *positional* index, so the value under each (stable) index flaps.
+# The accumulator rule doesn't cover a sink written *directly* in the loop body
+# (a ``{i}.crt`` file, a ``.../{idx}`` component), so the value target is seeded.
+# This is the postgresql/loki/otel received-CA-cert anti-pattern.
+
+
+def test_enumerate_value_written_to_numbered_file_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        from typing import Set
+
+        class Charm:
+            def _certs(self) -> Set[str]:
+                return self._opaque()
+
+            def receive(self, folder):
+                ca_certs = self._certs()
+                for i, cert in enumerate(ca_certs):
+                    folder.joinpath(f"{i}.crt").write_text(cert)
+        """
+    )
+    files = [f for f in findings if f.sink == "file"]
+    assert len(files) == 1
+    assert files[0].rule == "unordered-iteration"
+    assert files[0].confidence == "high"
+
+
+def test_enumerate_value_pushed_to_workload_is_flagged(lint_source):
+    # The loki shape: ``container.push(f"{i}.crt", cert)`` inside enumerate over a set.
+    findings = lint_source(
+        """
+        from typing import Set
+
+        class Charm:
+            def _certs(self) -> Set[str]:
+                return self._opaque()
+
+            def receive(self, container):
+                for i, cert in enumerate(self._certs()):
+                    container.push(f"/certs/{i}.crt", cert, make_dirs=True)
+        """
+    )
+    assert any(f.sink == "file" and f.rule == "unordered-iteration" for f in findings)
+
+
+def test_enumerate_sorted_source_direct_write_is_clean(lint_source):
+    # The fix: sort before enumerate. The value target must not be seeded.
+    findings = lint_source(
+        """
+        from typing import Set
+
+        class Charm:
+            def _certs(self) -> Set[str]:
+                return self._opaque()
+
+            def receive(self, folder):
+                for i, cert in enumerate(sorted(self._certs())):
+                    folder.joinpath(f"{i}.crt").write_text(cert)
+        """
+    )
+    assert findings == []
+
+
+def test_enumerate_over_plain_param_direct_write_is_clean(lint_source):
+    # Enumerating a bare parameter is the caller's ordering contract, not a concrete
+    # flap here -- the value target is not seeded on a plain ``param`` source.
+    findings = lint_source(
+        """
+        class Charm:
+            def receive(self, folder, items):
+                for i, cert in enumerate(items):
+                    folder.joinpath(f"{i}.crt").write_text(cert)
+        """
+    )
+    assert findings == []
+
+
+def test_enumerate_index_used_alone_is_clean(lint_source):
+    # The index target ``i`` (0, 1, 2 …) is stable; only the *value* target is seeded.
+    # Writing something derived solely from ``i`` must not flag.
+    findings = lint_source(
+        """
+        from typing import Set
+
+        class Charm:
+            def _certs(self) -> Set[str]:
+                return self._opaque()
+
+            def receive(self, folder):
+                for i, cert in enumerate(self._certs()):
+                    folder.joinpath(f"{i}.marker").write_text(str(i))
+        """
+    )
+    assert findings == []

@@ -1278,3 +1278,95 @@ def test_iterable_return_annotation_is_not_trusted_unordered(lint_source):
         """
     )
     assert [f for f in findings if f.kind == "caller"] == []
+
+
+# --- x509 certificate SAN ordering (set -> DER SEQUENCE -> bytes) --------------
+# The classic TLS flap: SubjectAlternativeName is an order-significant DER SEQUENCE,
+# so building one from a set bakes the set's hash-seeded order into the CSR/cert
+# bytes. A charm passing a sorted/frozenset can't fix it -- the lib re-set()s -- so
+# it surfaces as a (usually dependency) finding when flaplint traces the emit.
+
+
+def test_x509_san_from_set_to_databag_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        from cryptography import x509
+        class Charm:
+            def publish(self, sans_dns):
+                san = x509.SubjectAlternativeName(set(sans_dns))
+                self.relation.data[self.app]["san"] = san.public_bytes(0)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].rule == "unordered-iteration"
+    assert callers[0].confidence == "high"
+
+
+def test_x509_csr_builder_chain_to_databag_is_flagged(lint_source):
+    # The full v4 tls_certificates shape: a SAN materialised from set(_sans), added
+    # to a builder (fluent reassignment), signed, and emitted as PEM to the databag.
+    findings = lint_source(
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        class Charm:
+            def publish(self, signing_key, sans_dns):
+                _sans = []
+                _sans.extend([x509.DNSName(san) for san in sans_dns])
+                csr_builder = x509.CertificateSigningRequestBuilder()
+                csr_builder = csr_builder.add_extension(
+                    x509.SubjectAlternativeName(set(_sans)), critical=False
+                )
+                csr = csr_builder.sign(signing_key, hashes.SHA256())
+                self.relation.data[self.app]["csr"] = csr.public_bytes(
+                    serialization.Encoding.PEM
+                ).decode()
+        """
+    )
+    assert any(f.kind == "caller" and f.rule == "unordered-iteration" for f in findings)
+
+
+def test_x509_san_written_to_file_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        from cryptography import x509
+        class Charm:
+            def write(self, path, sans_dns):
+                san = x509.SubjectAlternativeName(set(sans_dns))
+                with open(path, "wb") as fh:
+                    fh.write(san.public_bytes(0))
+        """
+    )
+    assert any(f.sink == "file" and f.rule == "unordered-iteration" for f in findings)
+
+
+def test_x509_sorted_san_is_not_flagged(lint_source):
+    # Sorting the names before building the SAN gives a stable DER SEQUENCE -- the
+    # materializer promotion must not fire on an already-ordered source.
+    findings = lint_source(
+        """
+        from cryptography import x509
+        class Charm:
+            def publish(self, sans_dns):
+                san = x509.SubjectAlternativeName(
+                    [x509.DNSName(s) for s in sorted(sans_dns)]
+                )
+                self.relation.data[self.app]["san"] = san.public_bytes(0)
+        """
+    )
+    assert findings == []
+
+
+def test_public_bytes_of_stable_object_is_not_flagged(lint_source):
+    # public_bytes must only propagate genuine instability, not manufacture it: a
+    # cert built from ordered inputs stays clean.
+    findings = lint_source(
+        """
+        from cryptography import x509
+        class Charm:
+            def publish(self, cert):
+                self.relation.data[self.app]["c"] = cert.public_bytes(0)
+        """
+    )
+    assert findings == []

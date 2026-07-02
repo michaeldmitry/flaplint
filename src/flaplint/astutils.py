@@ -479,6 +479,25 @@ def child_bodies(stmt: ast.stmt) -> List[List[ast.stmt]]:
     return bodies
 
 
+def enumerate_arg(node: ast.AST) -> Optional[ast.AST]:
+    """The iterable inside an ``enumerate(<iterable>[, start])`` call, else ``None``.
+
+    ``enumerate(some_set)`` pairs each element with a *positional* index, so when the
+    source is unordered the (index -> element) binding flaps run-to-run even though
+    the indices ``0, 1, 2`` are stable. Returned so the ``for i, x in enumerate(...)``
+    walk can mark the value target ``x`` a value-position pick (the ``{i}.crt`` /
+    ``.../{idx}`` naming pattern). Only a bare ``enumerate`` name matches.
+    """
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "enumerate"
+        and node.args
+    ):
+        return node.args[0]
+    return None
+
+
 def loop_accumulators(node: ast.For) -> set:
     """Local names mutated as accumulators anywhere within a loop body.
 

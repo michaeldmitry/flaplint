@@ -42,6 +42,20 @@ UNORDERED_CALLS: Set[str] = {
 #: index→element binding flaps even though the keys sort. It is *not* promoted to
 #: ``itercaller`` (that would false-positive on a dict keyed by the *element*,
 #: ``d[e] = ...``, whose keys a serializer sorts deterministically).
+#: cryptography ``x509`` constructors that build an *order-significant* DER
+#: ``SEQUENCE`` from an iterable of names. Building one from a ``set`` bakes the
+#: set's hash-seeded iteration order into the certificate's DER/PEM bytes -- the
+#: classic TLS flap: a charm passes a sorted/``frozenset`` of SANs, the lib
+#: re-``set()``s them (``SubjectAlternativeName(set(sans))``), and the emitted
+#: CSR/cert bytes reshuffle every hook. So -- exactly like ``list(some_set)`` --
+#: these materialize ``local`` -> ``itercaller`` (value-position order a key-sorting
+#: serializer can't launder).
+X509_SEQUENCE_CONSTRUCTORS: Set[str] = {
+    "SubjectAlternativeName",
+    "IssuerAlternativeName",
+    "GeneralNames",
+}
+
 PROPAGATE_CALLS: Set[str] = {
     "list",
     "tuple",
@@ -51,7 +65,21 @@ PROPAGATE_CALLS: Set[str] = {
     "copy",
     "deepcopy",
     "enumerate",
-}
+} | X509_SEQUENCE_CONSTRUCTORS
+
+#: Fluent-builder methods that return a *new* builder carrying the receiver's taint
+#: **plus** the added value's -- the cryptography ``builder = builder.add_extension(
+#: ext, critical=...)`` idiom. Without this the added extension (a SAN materialized
+#: from a set) would be dropped as the immutable builder is reassigned, breaking the
+#: ``add_extension(...) -> sign() -> public_bytes()`` chain to the eventual write.
+BUILDER_ARG_PROPAGATORS: Set[str] = {"add_extension"}
+
+#: Serializer *methods* that render an object to bytes/text whose stability follows
+#: the object's own -- the cryptography ``csr.public_bytes(encoding)`` /
+#: ``cert.public_bytes(encoding)``. Handled like ``.encode()``: only a genuinely
+#: unstable receiver (a SAN built from a set -> ``itercaller``) survives, so the
+#: DER/PEM bytes carry that instability to whatever diffs them.
+BYTES_SERIALIZER_METHODS: Set[str] = {"public_bytes"}
 
 #: Subset of :data:`PROPAGATE_CALLS` that materialize their argument into a
 #: *sequence*. When the argument is a locally-born unordered collection (a
@@ -63,7 +91,11 @@ PROPAGATE_CALLS: Set[str] = {
 #: ``dict``/``copy``/``deepcopy`` are excluded (they preserve a mapping, whose
 #: key disorder key-sorting *does* fix); ``join`` is excluded to avoid colliding
 #: with ``os.path.join``.
-SEQUENCE_MATERIALIZERS: Set[str] = {"list", "tuple", "reversed"}
+SEQUENCE_MATERIALIZERS: Set[str] = {
+    "list",
+    "tuple",
+    "reversed",
+} | X509_SEQUENCE_CONSTRUCTORS
 
 #: Callables that neutralize ordering taint.
 SANITIZER_CALLS: Set[str] = {"sorted"}
