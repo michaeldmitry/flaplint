@@ -160,3 +160,27 @@ def test_unannotated_back_reference_stays_unresolved(lint_source):
         """
     )
     assert [f for f in findings if f.kind == "caller"] == []
+
+
+def test_property_returning_itercaller_taints_reader(lint_source):
+    # A property whose body materialises a set into a list (``[dict(t) for t in
+    # {...}]`` dedup) returns an ``itercaller``. Reading it must surface that -- not
+    # only the ``returns_unordered`` (set) case -- so a reader that serialises it flaps.
+    findings = lint_source(
+        """
+        import json
+
+        class Consumer:
+            @property
+            def endpoints(self):
+                return [dict(t) for t in {tuple(d.items()) for d in self._raw()}]
+
+        class Charm:
+            def publish(self):
+                consumer = Consumer()
+                self.relation.data[self.app]["v"] = json.dumps(consumer.endpoints)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].rule == "unordered-iteration"

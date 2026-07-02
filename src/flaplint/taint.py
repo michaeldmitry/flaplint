@@ -566,50 +566,7 @@ class TaintEngine:
         # User-defined function: consult its return summary.
         out: Set[Origin] = set()
         for fi in self._resolve_summary_candidates(call, name, cls_ctx):
-            if fi.returns_element:
-                # Carry the callee's pick provenance so the finding points at the
-                # subscript inside the helper, not at this call / serializer.
-                if fi.element_site is not None:
-                    out.add(
-                        (
-                            "element",
-                            fi.element_site[0],
-                            fi.element_site[1],
-                            fi.element_site[2],
-                        )
-                    )
-                else:
-                    out.add(("element", fi.path, call, fi.name))
-            if fi.returns_unordered:
-                # Carry the callee's born-site so the finding points ``origin=`` at
-                # the ``set()`` / ``glob()`` inside the helper, not this call.
-                if fi.unordered_site is not None:
-                    out.add(
-                        (
-                            "local",
-                            fi.unordered_site[0],
-                            fi.unordered_site[1],
-                            fi.unordered_site[2],
-                        )
-                    )
-                else:
-                    out.add(("local", fi.path, call, fi.name))
-            if fi.returns_itercaller:
-                # The helper returns a sequence materialized from a locally-born
-                # unordered collection (``return list(some_set)``). Carry its
-                # materialization site so the finding points at the ``list(...)``
-                # inside the helper, and keep it key-sort-resistant.
-                if fi.itercaller_site is not None:
-                    out.add(
-                        (
-                            "itercaller",
-                            fi.itercaller_site[0],
-                            fi.itercaller_site[1],
-                            None,
-                        )
-                    )
-                else:
-                    out.add(("itercaller", fi.path, call, None))
+            out |= self._summary_return_origins(fi, call)
             if fi.returns_params or fi.iter_params:
                 mapping = astutils.map_call_args(call, fi)
                 for idx in fi.returns_params:
@@ -716,23 +673,53 @@ class TaintEngine:
                 return self.class_attr_types.get(base_cls, {}).get(recv.attr)
         return None
 
+    def _summary_return_origins(self, fi: "FuncInfo", node: ast.AST) -> Set[Origin]:
+        """Origins a callee/property contributes from its element/unordered/itercaller
+        return summary, each carrying the callee's born-site (so a finding points into
+        the helper, not at this call). Shared by call resolution and property reads --
+        a property is a zero-argument call, so both must surface *every* ordering
+        flavor, not just ``returns_unordered``.
+        """
+        out: Set[Origin] = set()
+        if fi.returns_element:
+            if fi.element_site is not None:
+                out.add(
+                    ("element", fi.element_site[0], fi.element_site[1], fi.element_site[2])
+                )
+            else:
+                out.add(("element", fi.path, node, fi.name))
+        if fi.returns_unordered:
+            if fi.unordered_site is not None:
+                out.add(
+                    ("local", fi.unordered_site[0], fi.unordered_site[1], fi.unordered_site[2])
+                )
+            else:
+                out.add(("local", fi.path, node, fi.name))
+        if fi.returns_itercaller:
+            if fi.itercaller_site is not None:
+                out.add(
+                    ("itercaller", fi.itercaller_site[0], fi.itercaller_site[1], None)
+                )
+            else:
+                out.add(("itercaller", fi.path, node, None))
+        return out
+
     def _property_taint(
         self, node: ast.Attribute, cls_ctx: Optional[str]
     ) -> Set[Origin]:
-        """Taint of ``self.<prop>`` / ``self.<member>.<prop>`` via summaries."""
+        """Taint of ``self.<prop>`` / ``self.<member>.<prop>`` via summaries.
+
+        Surfaces every ordering flavor the property returns -- ``unordered`` (a set),
+        ``element`` (a positional pick), *and* ``itercaller`` (a sequence materialized
+        from an unordered source, the ``[dict(t) for t in {…}]`` dedup idiom) -- not
+        just the ``local`` set case. A ``remote_write.endpoints`` property that returns
+        an itercaller list is then correctly unstable at its reader.
+        """
         recv_cls = self._receiver_class(node.value, cls_ctx)
         if recv_cls is None:
             return set()
+        out: Set[Origin] = set()
         for fi in self.registry.get(node.attr, ()):
-            if fi.is_property and fi.class_name == recv_cls and fi.returns_unordered:
-                if fi.unordered_site is not None:
-                    return {
-                        (
-                            "local",
-                            fi.unordered_site[0],
-                            fi.unordered_site[1],
-                            fi.unordered_site[2],
-                        )
-                    }
-                return {("local", fi.path, node, fi.name)}
-        return set()
+            if fi.is_property and fi.class_name == recv_cls:
+                out |= self._summary_return_origins(fi, node)
+        return out

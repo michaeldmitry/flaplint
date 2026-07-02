@@ -103,6 +103,8 @@ databag["peers"] = ",".join(self.peer_addresses)   # caught: joins a set unsorte
 
 flaplint can't trace `_compute()`, but the `-> set[str]` annotation asserts the result is unordered — so a caller that materialises or serialises it without `sorted()` is flagged, pointing back at the annotated `def`. Only the **set family** (`set`, `frozenset`, `Set`, `FrozenSet`, `AbstractSet`, `MutableSet`) counts here: a `-> Iterable`/`-> Collection` return is usually an ordered generator, so — unlike for a *parameter* — it is deliberately not treated as unordered (return-type inference asserts the value *is* unordered and drives concrete findings, so it stays tight).
 
+When the body **is** traceable, every ordering flavor a property returns reaches its readers — not just a set. A property that materialises a set into a list (`return [dict(t) for t in {tuple(d.items()) for d in raw}]`, the remote-write-endpoints dedup idiom) returns an `itercaller`, and a reader that serialises `consumer.endpoints` is flagged just as if it had read the list directly.
+
 ### Pattern 6: Unstable value stored in a field or on `self`
 
 Storing an unstable value in a dataclass field, a Pydantic model field, or on `self` doesn't make it stable. Flaplint tracks the taint through field reads and across method boundaries.
