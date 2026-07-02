@@ -116,6 +116,7 @@ class Analyzer:
         registry: Registry = {}
         class_attr_types: Dict[str, Dict[str, str]] = {}
         model_seq_fields: Dict[str, Set[str]] = {}
+        class_set_fields: Dict[str, Set[str]] = {}
         file_imports: Dict[str, FileImports] = {}
         functions: List[FuncInfo] = []
         suppressed: Dict[str, Set[int]] = {}
@@ -123,12 +124,12 @@ class Analyzer:
         for path in self.primary_files:
             self._ingest(
                 path, True, registry, class_attr_types, model_seq_fields,
-                file_imports, functions, suppressed,
+                class_set_fields, file_imports, functions, suppressed,
             )
         for path in self.secondary_files:
             self._ingest(
                 path, False, registry, class_attr_types, model_seq_fields,
-                file_imports, functions, suppressed,
+                class_set_fields, file_imports, functions, suppressed,
             )
 
         engine = TaintEngine(
@@ -137,6 +138,7 @@ class Analyzer:
             relations_unordered=self.relations_unordered,
             file_imports=file_imports,
             model_seq_fields=model_seq_fields,
+            class_set_fields=class_set_fields,
         )
         analyzer = FunctionAnalyzer(engine)
         mark_databag_accessors(functions, registry)
@@ -232,6 +234,7 @@ class Analyzer:
         registry: Registry,
         class_attr_types: Dict[str, Dict[str, str]],
         model_seq_fields: Dict[str, Set[str]],
+        class_set_fields: Dict[str, Set[str]],
         file_imports: Dict[str, FileImports],
         functions: List[FuncInfo],
         suppressed: Dict[str, Set[int]],
@@ -253,6 +256,7 @@ class Analyzer:
         collector = Collector(
             path, report_here, registry, class_attr_types, file_imports,
             model_seq_fields=model_seq_fields,
+            class_set_fields=class_set_fields,
         )
         collector.visit(tree)
         functions.extend(collector.functions)

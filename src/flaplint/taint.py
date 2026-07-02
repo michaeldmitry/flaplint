@@ -168,6 +168,7 @@ class TaintEngine:
         relations_unordered: bool = False,
         file_imports: Optional[Dict[str, "FileImports"]] = None,
         model_seq_fields: Optional[Dict[str, Set[str]]] = None,
+        class_set_fields: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.registry = registry
         self.class_attr_types = class_attr_types
@@ -176,6 +177,14 @@ class TaintEngine:
         #: its ``local`` taint promoted to ``itercaller`` at construction, because
         #: the model's ``__init__`` bakes the set into element order.
         self.model_seq_fields = model_seq_fields or {}
+        #: class name -> ``Set``/``frozenset``-typed attribute names. A read of
+        #: ``x.attr`` where ``x``'s type resolves to such a class reads as unordered
+        #: (``event.certificates`` on a ``CertificatesAvailableEvent``).
+        self.class_set_fields = class_set_fields or {}
+        #: variable name -> class name for the function currently being analysed
+        #: (params by annotation, locals by constructor). Set per ``eval`` entry by
+        #: the traversal so an attribute read can resolve its receiver's class.
+        self._var_types: Dict[str, str] = {}
         self.relations_unordered = relations_unordered
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
@@ -191,6 +200,14 @@ class TaintEngine:
         #: set True whenever :meth:`record_instance_attr` grows the map, so the
         #: summary fixed point keeps iterating until instance-attr taint settles.
         self.instance_attr_changed = False
+
+    def set_var_types(self, var_types: Dict[str, Optional[str]]) -> None:
+        """Set the current function's variable -> class-name map (see ``_var_types``).
+
+        Filtered to real class names so a lookup is a cheap ``dict.get``. Called by
+        the traversal before each ``eval`` with the live context (params + locals).
+        """
+        self._var_types = {k: v for k, v in var_types.items() if v}
 
     def record_instance_attr(
         self, cls_ctx: Optional[str], attr: str, origins: Set[Origin]
@@ -377,6 +394,13 @@ class TaintEngine:
             # ``relation.units`` and friends are unordered ops collections.
             if node.attr in UNORDERED_ATTRS:
                 return {("local", None, node, None)}
+            # A ``Set``/``frozenset``-typed attribute on a known class -- e.g.
+            # ``event.certificates`` where ``event: CertificatesAvailableEvent`` --
+            # is unordered, so joining/serialising it without ``sorted()`` flaps.
+            if isinstance(node.value, ast.Name):
+                cls = self._var_types.get(node.value.id)
+                if cls and node.attr in self.class_set_fields.get(cls, ()):
+                    return {("local", None, node, None)}
             # Value-object field read-back: ``attrs.sans_dns`` where a per-field
             # taint was recorded at construction / field write (stored under the
             # compound ``env`` key ``"attrs.sans_dns"``). This is what lets an

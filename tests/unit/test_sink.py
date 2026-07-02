@@ -64,6 +64,23 @@ def test_hash_of_set_is_flagged(lint_source):
     assert findings[0].sink == "hash"
 
 
+def test_shake_hash_of_unordered_is_flagged(lint_source):
+    # ``shake_128``/``shake_256`` are hashlib hashes too -- an unstable value hashed
+    # with one still flaps the change-gate (the postgresql generate_user_hash shape).
+    findings = lint_source(
+        """
+        from hashlib import shake_128
+
+        class Charm:
+            def _user_hash(self, names):
+                return shake_128(str(set(names)).encode()).hexdigest(16)
+        """
+    )
+    hashes = [f for f in findings if f.sink == "hash"]
+    assert len(hashes) == 1
+    assert hashes[0].confidence == "high"
+
+
 def test_hash_finding_names_the_collection_not_the_wrapper(lint_source):
     # ``sha256(str(peers).encode())`` -- the offending identifier is ``peers``,
     # the set being hashed, NOT the ``str`` serializer wrapper nor the ``.encode``
@@ -93,6 +110,72 @@ def test_hash_inside_dunder_is_suppressed(lint_source):
         """
     )
     assert findings == []
+
+
+def test_builtin_hash_of_json_dumps_is_salted_even_when_sorted(lint_source):
+    # ``hash(json.dumps(x, sort_keys=True))`` -- the content is stable, but the
+    # *builtin* hash() is PYTHONHASHSEED-salted for str content, so it returns a
+    # different int every process (every Juju hook). A persisted-and-compared hash
+    # then flaps regardless of sorting: flag it as nondeterministic.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _config_hash(self):
+                return hash(json.dumps(self._get_certs(), sort_keys=True))
+        """
+    )
+    hashes = [f for f in findings if f.sink == "hash"]
+    assert len(hashes) == 1
+    assert hashes[0].rule == "nondeterministic"
+    assert hashes[0].confidence == "high"
+    # The finding is about the hash *call*, not a single content variable.
+    assert hashes[0].variable == "hash()"
+
+
+def test_builtin_hash_of_tuple_containing_a_string_is_salted(lint_source):
+    # The traefik ``_config_hash`` shape: a tuple mixing attributes with a
+    # ``json.dumps(...)`` -- the string element makes the whole hash salted.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _config_hash(self):
+                return hash((self._addr, self.config["mode"], json.dumps(self._certs())))
+        """
+    )
+    assert any(f.sink == "hash" and f.rule == "nondeterministic" for f in findings)
+
+
+def test_hashlib_of_sorted_content_is_not_salted(lint_source):
+    # hashlib.sha256 is stable across processes, so hashing *sorted* bytes is fine
+    # -- the salted-hash rule must apply only to the builtin ``hash()``.
+    findings = lint_source(
+        """
+        import json, hashlib
+
+        class Charm:
+            def _config_hash(self):
+                blob = json.dumps(self._certs(), sort_keys=True).encode()
+                return hashlib.sha256(blob).hexdigest()
+        """
+    )
+    assert [f for f in findings if f.sink == "hash"] == []
+
+
+def test_builtin_hash_of_non_string_is_not_flagged(lint_source):
+    # ``hash((a, b))`` where nothing is provably a string: ints/bytes-unknown are
+    # not necessarily salted, so stay conservative and do not flag.
+    findings = lint_source(
+        """
+        class Charm:
+            def _config_hash(self):
+                return hash((self._port, self._replicas))
+        """
+    )
+    assert [f for f in findings if f.sink == "hash"] == []
 
 
 def test_update_on_literal_databag_is_a_sink(lint_source):
@@ -541,6 +624,147 @@ def test_pebble_add_layer_volatile_value_is_a_plan_sink(lint_source):
     assert callers[0].rule == "nondeterministic"
 
 
+def test_secret_set_content_of_unordered_is_a_secret_sink(lint_source):
+    # ``secret.set_content({..: json.dumps(<unordered>)})`` -- Juju creates a new
+    # revision when the content differs, firing secret-changed on every observer.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _publish(self):
+                d = {}
+                for u in self.rel.units:
+                    d[u.name] = 1
+                secret = self.model.get_secret(label="x")
+                secret.set_content({"keys": json.dumps(d)})
+        """
+    )
+    secrets = [f for f in findings if f.sink == "secret"]
+    assert len(secrets) == 1
+    assert secrets[0].confidence == "high"
+
+
+def test_add_secret_of_sorted_content_is_silent(lint_source):
+    # Sorted before serialising -> stable secret content -> no revision churn.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _publish(self):
+                names = sorted(self._names())
+                self.app.add_secret({"keys": json.dumps(names)}, label="y")
+        """
+    )
+    assert [f for f in findings if f.sink == "secret"] == []
+
+
+def test_param_reaching_both_databag_and_secret_yields_both(lint_source):
+    # The traefik shape: a helper writes its parameter into *both* a databag and a
+    # secret. A caller passing an unstable value must get one finding per store --
+    # each is a distinct churn source (relation-changed vs secret-changed).
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _publish(self, certs):
+                pub = {h: v for h, v in certs.items()}
+                self.model.get_relation("peers").data[self.app]["c"] = json.dumps(pub)
+                self.model.get_secret(label="s").set_content({"k": json.dumps(pub)})
+            def _sync(self):
+                certs = {}
+                for u in self.rel.units:
+                    certs[u.name] = 1
+                self._publish(certs)
+        """
+    )
+    sinks = {f.sink for f in findings if f.kind == "caller"}
+    assert "databag" in sinks
+    assert "secret" in sinks
+
+
+# -- Set-typed attribute inference (generic, no hardcoded class/attr names) ------
+
+
+def test_set_attribute_via_init_param_reads_as_unordered(lint_source):
+    # ``event.certs`` where the class stores a ``Set``-annotated __init__ param on
+    # self -- joining it into a file bakes set order into bytes. The class name is
+    # arbitrary: resolution is by the receiver's declared type, not a name match.
+    findings = lint_source(
+        """
+        from pathlib import Path
+        from typing import Set
+
+        class WidgetEvent:
+            def __init__(self, handle, certs: Set[str], n: int):
+                self.certs = certs
+                self.n = n
+
+        class Charm:
+            def _on_event(self, event: WidgetEvent):
+                Path("/etc/ca.crt").write_text("\\n".join(event.certs))
+        """
+    )
+    files = [f for f in findings if f.sink == "file"]
+    assert len(files) == 1
+    assert files[0].variable == "event.certs"
+
+
+def test_set_attribute_via_class_body_annotation_reads_as_unordered(lint_source):
+    # The class-body ``hosts: Set[str]`` shape (dataclass / pydantic), likewise
+    # resolved by declared type.
+    findings = lint_source(
+        """
+        from pathlib import Path
+        from typing import Set
+
+        class Config:
+            hosts: Set[str]
+
+        class Charm:
+            def render(self, cfg: Config):
+                Path("/etc/app.conf").write_text(",".join(cfg.hosts))
+        """
+    )
+    assert any(f.sink == "file" and f.variable == "cfg.hosts" for f in findings)
+
+
+def test_non_set_attribute_is_not_flagged(lint_source):
+    # A ``list``-typed attribute is caller-ordered, not unordered -- no false finding.
+    findings = lint_source(
+        """
+        from pathlib import Path
+        from typing import List
+
+        class Ev:
+            def __init__(self, items: List[str]):
+                self.items = items
+
+        class Charm:
+            def _on(self, event: Ev):
+                Path("/etc/app.conf").write_text("\\n".join(event.items))
+        """
+    )
+    assert [f for f in findings if f.sink == "file"] == []
+
+
+def test_set_attribute_on_untyped_receiver_is_not_flagged(lint_source):
+    # Without a declared type for the receiver, flaplint can't know the attribute is
+    # a set -- it stays conservative (no finding), exactly the pre-inference behaviour.
+    findings = lint_source(
+        """
+        from pathlib import Path
+
+        class Charm:
+            def _on(self, event):
+                Path("/etc/app.conf").write_text("\\n".join(event.certs))
+        """
+    )
+    assert [f for f in findings if f.sink == "file"] == []
+
+
 def test_path_write_text_of_unordered_is_a_config_sink(lint_source):
     findings = lint_source(
         """
@@ -855,3 +1079,202 @@ def test_container_list_files_is_an_unordered_source(lint_source):
         """
     )
     assert any(f.sink == "file" for f in findings)
+
+
+# --- file param-contracts (a helper writes a parameter to an on-disk file) -----
+# The ``render_file(path, content)`` / ``write_text(content)`` wrapper idiom: a
+# helper writes one of its parameters to a config file a workload diffs. Like a
+# databag/secret write, this is a contract boundary -- an unordered caller flaps
+# the file -- so it folds into the parameter summary (the postgresql render_file
+# case), rather than being only a --explain-gaps blind spot.
+
+
+def test_helper_writing_param_to_file_is_a_contract_sink(lint_source):
+    # An unannotated parameter written to a file is a medium contract-boundary sink.
+    findings = lint_source(
+        """
+        class Charm:
+            def _write(self, container, data):
+                container.push("/etc/app.conf", data)
+        """
+    )
+    sinks = [f for f in findings if f.kind == "sink" and f.sink == "file"]
+    assert len(sinks) == 1
+    assert sinks[0].confidence == "medium"
+    assert sinks[0].variable == "data"
+
+
+def test_helper_writing_set_annotated_param_to_file_is_high(lint_source):
+    # A Set-annotated file-content parameter is a high-confidence contract sink.
+    findings = lint_source(
+        """
+        from typing import Set
+
+        class Charm:
+            def _write(self, path, content: Set[str]):
+                with open(path, "w") as fh:
+                    fh.write("\\n".join(content))
+        """
+    )
+    sinks = [f for f in findings if f.kind == "sink" and f.sink == "file"]
+    assert len(sinks) == 1
+    assert sinks[0].confidence == "high"
+
+
+def test_str_annotated_file_content_param_is_not_a_helper_sink(lint_source):
+    # A ``content: str`` parameter is the caller's responsibility to keep ordered,
+    # so the helper itself is not flagged (mirrors the databag/secret grading).
+    findings = lint_source(
+        """
+        class Charm:
+            def render_file(self, path, content: str, mode):
+                with open(path, "w") as fh:
+                    fh.write(content)
+        """
+    )
+    assert [f for f in findings if f.kind == "sink"] == []
+
+
+def test_unordered_caller_into_file_wrapper_is_flagged(lint_source):
+    # The end-to-end postgresql shape: a caller serialises an unordered collection
+    # and hands it to a ``render_file`` wrapper that writes it to disk. Even with a
+    # ``content: str`` annotation (no helper-side sink finding), the caller's
+    # unstable argument is a confirmed finding pointing at the helper's write.
+    findings = lint_source(
+        """
+        class Charm:
+            def render_file(self, path, content: str, mode):
+                with open(path, "w") as fh:
+                    fh.write(content)
+
+            def reconcile(self):
+                self.render_file("/x", ",".join(list({"a", "b"})), 0o600)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller" and f.sink == "file"]
+    assert len(callers) == 1
+    assert callers[0].confidence == "high"
+    # points the fix at the caller's materialization, and the write at the helper.
+    assert callers[0].sink_line  # a distinct downstream write location was recorded
+
+
+def test_stable_caller_into_file_wrapper_is_not_flagged(lint_source):
+    # A caller passing an already-ordered value to the same wrapper is clean -- the
+    # contract only fires when the actual argument is demonstrably unstable.
+    findings = lint_source(
+        """
+        class Charm:
+            def render_file(self, path, content: str, mode):
+                with open(path, "w") as fh:
+                    fh.write(content)
+
+            def reconcile(self):
+                self.render_file("/x", ",".join(sorted({"a", "b"})), 0o600)
+        """
+    )
+    assert [f for f in findings if f.sink == "file"] == []
+
+
+def test_plan_param_still_gets_no_contract_sink(lint_source):
+    # Only databag/secret/file fold into parameter summaries; a plan write does not
+    # (it is structurally compared), so a param written to a plan is not a sink.
+    findings = lint_source(
+        """
+        class Charm:
+            def _plan(self, container, layer):
+                container.add_layer("l", layer, combine=True)
+        """
+    )
+    assert [f for f in findings if f.kind == "sink" and f.sink == "plan"] == []
+
+
+# --- return-type inference (a ``-> set`` accessor is trusted as unordered) ------
+# A function/property annotated ``-> set[str]`` promises an unordered collection,
+# so a caller that materialises/serialises its result without ``sorted()`` flaps --
+# even when the body is opaque (a cross-object call). This is the postgresql
+# ``_peer_members_ips -> set[str]`` case, generalised to the annotation.
+
+
+def test_set_returning_property_is_trusted_unordered(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            @property
+            def addrs(self) -> set:
+                return self._opaque()
+
+            def reconcile(self):
+                self.relation.data[self.app]["v"] = ",".join(self.addrs)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].confidence == "high"
+
+
+def test_set_returning_method_materialized_to_file_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            def get_addrs(self) -> set[str]:
+                return self._opaque()
+
+            def render_file(self, path, content):
+                open(path, "w").write(content)
+
+            def reconcile(self):
+                self.render_file("/x", ",".join(self.get_addrs()))
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller" and f.sink == "file"]
+    assert len(callers) == 1
+
+
+def test_frozenset_return_annotation_is_trusted(lint_source):
+    findings = lint_source(
+        """
+        from typing import FrozenSet
+
+        class Charm:
+            def names(self) -> FrozenSet[str]:
+                return self._opaque()
+
+            def reconcile(self):
+                self.relation.data[self.app]["v"] = ",".join(self.names())
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"]
+
+
+def test_list_return_annotation_is_not_trusted_unordered(lint_source):
+    # A ``-> list[str]`` accessor is ordered by contract: an opaque body is trusted
+    # to be stable, so no finding (only a genuine set/frozenset return is unordered).
+    findings = lint_source(
+        """
+        class Charm:
+            def get_addrs(self) -> list[str]:
+                return self._opaque()
+
+            def reconcile(self):
+                self.relation.data[self.app]["v"] = ",".join(self.get_addrs())
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"] == []
+
+
+def test_iterable_return_annotation_is_not_trusted_unordered(lint_source):
+    # ``-> Iterable`` as a *return* type is usually an ordered generator/view, so it
+    # is deliberately excluded from return-type inference (unlike a parameter).
+    findings = lint_source(
+        """
+        from typing import Iterable
+
+        class Charm:
+            def get_addrs(self) -> Iterable[str]:
+                return self._opaque()
+
+            def reconcile(self):
+                self.relation.data[self.app]["v"] = ",".join(self.get_addrs())
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"] == []

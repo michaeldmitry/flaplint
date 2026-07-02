@@ -20,6 +20,7 @@ from .constants import (
     FILE_WRITE_DESCS,
     HASH_CALLS,
     ISINSTANCE_ORDERED_TYPES,
+    MAPPING_MERGE_METHODS,
     MAPPING_WRITE_METHODS,
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
@@ -28,6 +29,7 @@ from .constants import (
     PROPAGATE_CALLS,
     RENDER_SERIALIZERS,
     SANITIZER_CALLS,
+    SECRET_WRITE_DESC,
     SET_MUTATION_METHODS,
     STR_SPLIT_METHODS,
     TEMPLATE_RENDER_METHODS,
@@ -36,7 +38,7 @@ from .constants import (
     VOLATILE_CALLS,
 )
 from . import databag
-from .handlers import Handler
+from .handlers import Handler, _RemoteSite
 from .model import FuncInfo, Origin, Registry
 from .taint import TaintEngine, _promote_to_sequence
 
@@ -94,6 +96,10 @@ class Context:
     #: ``.add()`` / ``.update()`` on one is known to keep it an unordered set even
     #: when it started from an otherwise-stable empty ``set()``.
     set_vars: Set[str] = field(default_factory=set)
+    #: variables currently holding a ``dict`` value, so a later ``.update()`` /
+    #: ``.setdefault()`` on one is known to merge another mapping's key-insertion
+    #: order into it -- even when it started from an otherwise-stable empty ``{}``.
+    dict_vars: Set[str] = field(default_factory=set)
     cls: Optional[str] = None  # enclosing class of the analyzed function
     #: local variable -> its databag-provenance kind (relation/relation_data/databag)
     databag_kinds: Dict[str, str] = field(default_factory=dict)
@@ -141,6 +147,10 @@ class FunctionAnalyzer:
     # -- helpers ------------------------------------------------------------
 
     def _eval(self, node, ctx: Context) -> Set[Origin]:
+        # Give the engine this function's live variable -> class map (params by
+        # annotation, locals by constructor) so an attribute read can resolve its
+        # receiver's class -- ``event.certificates`` -> ``CertificatesAvailableEvent``.
+        self.engine.set_var_types({**ctx.param_annotations, **ctx.types})
         return self.engine.eval(node, ctx.env, ctx.cls)
 
     def _resolve_methods(self, call: ast.Call, ctx: Context) -> List[FuncInfo]:
@@ -177,6 +187,12 @@ class FunctionAnalyzer:
             ctx.set_vars.add(target.id)
         else:
             ctx.set_vars.discard(target.id)
+        # Track dict-valued bindings so a later ``.update()`` / ``.setdefault()``
+        # on this name is known to merge another mapping's key-order into it.
+        if astutils.is_dict_construction(value):
+            ctx.dict_vars.add(target.id)
+        else:
+            ctx.dict_vars.discard(target.id)
 
     def _record_databag_alias(
         self, target: ast.AST, value: ast.AST, ctx: Context
@@ -406,14 +422,17 @@ class FunctionAnalyzer:
                         "fields flaplint doesn't fully track (e.g. one buried in a "
                         "dict, or rebuilt by a method)"
                     )
-        # Content scan: does the *whole* value depend on an untraced parameter? File/
-        # plan/hash writes get no caller-contract check, so an unordered caller would
-        # slip through. Computed from the content's taint (not a textual name match),
+        # Content scan: does the *whole* value depend on an untraced parameter? Plan/
+        # hash writes get no caller-contract check, so an unordered caller would
+        # slip through. (Databag, secret and *file* writes do fold into parameter
+        # summaries -- see ``SummaryHandler.sink`` -- so they are a real finding, not
+        # a blind spot, and are excluded here.) Computed from the content's taint
+        # (not a textual name match),
         # so a parameter that's already neutralised on the way in -- ``template.format(
         # **ctx)`` (template-ordered) -- is *not* a gap. A parameter the caller already
         # promises to keep ordered (``data: list``/``str``) is the caller's job, not a
         # blind spot, so an ordered annotation is skipped.
-        if sink in ("file", "plan", "hash", "render"):
+        if sink in ("plan", "hash", "render"):
             origins = self._eval(content, ctx)
             seen_params = set()
             for o in origins:
@@ -612,6 +631,18 @@ class FunctionAnalyzer:
             name = astutils.final_attr(sub.func)
             if name in HASH_CALLS and sub.args:
                 origins = self._eval(sub.args[0], ctx)
+                # The *builtin* ``hash()`` is PYTHONHASHSEED-salted for str/bytes
+                # content, so it returns a different int every process -- every Juju
+                # hook is a fresh interpreter -- even when the content is identical.
+                # A hash that is persisted and compared across reconciles then trips
+                # every time (``hash(json.dumps(x))`` is the classic "I sorted it so
+                # it's stable" trap). hashlib (sha256/md5/...) is stable, so this
+                # applies only to ``hash`` and only when a string is provably hashed.
+                # A ``saltedhash`` origin is its own nondeterministic flavor: the
+                # instability is the *hash call itself*, not any single value inside
+                # it, so the finding is reported against the hash, not a content var.
+                if name == "hash" and astutils.contains_provable_string(sub.args[0]):
+                    origins = origins | {"saltedhash"}
                 if origins:
                     handler.sink(
                         sub,
@@ -661,6 +692,26 @@ class FunctionAnalyzer:
                     )
                 if pwargs:
                     self._gap_check(pwargs[0], "plan", ctx, handler)
+            swrite = astutils.secret_write_args(sub)
+            if swrite is not None:
+                _, swargs = swrite
+                origins = set()
+                for content in swargs:
+                    origins |= self._eval(content, ctx)
+                # A Juju secret value is byte-compared like a databag value: an
+                # unstable ``json.dumps(<unordered>)`` string churns revisions. Use
+                # raw (not structural) survival, matching the databag write.
+                if origins:
+                    handler.sink(
+                        sub,
+                        origins,
+                        "direct",
+                        SECRET_WRITE_DESC,
+                        swargs[0],
+                        "secret",
+                    )
+                if swargs:
+                    self._gap_check(swargs[0], "secret", ctx, handler)
             margs = None
             if (
                 isinstance(sub.func, ast.Attribute)
@@ -741,14 +792,27 @@ class FunctionAnalyzer:
                     if didx in fi.dangerous:
                         origins = self._eval(arg, ctx)
                         if origins:
-                            handler.sink(
-                                sub,
-                                origins,
-                                "via",
-                                f"{fi.name}() parameter '{fi.params[didx]}'",
-                                arg,
-                                "databag",
-                            )
+                            # The param may reach several Juju stores (a databag
+                            # *and* a secret); emit one finding per store so each
+                            # churn source is surfaced, each pointing at that store's
+                            # actual write inside the callee (not the call site).
+                            for st in sorted(
+                                fi.dangerous_sinks.get(didx) or {"databag"}
+                            ):
+                                site = fi.dangerous_sites.get(didx, {}).get(st)
+                                wn = (
+                                    _RemoteSite(site[0], site[1], site[2])
+                                    if site else None
+                                )
+                                handler.sink(
+                                    sub,
+                                    origins,
+                                    "via",
+                                    f"{fi.name}() parameter '{fi.params[didx]}'",
+                                    arg,
+                                    st,
+                                    write_node=wn,
+                                )
 
     # -- statement walk -----------------------------------------------------
 
@@ -920,6 +984,27 @@ class FunctionAnalyzer:
         ):
             name = call.func.value.id
             ctx.env[name] = set(ctx.env.get(name, ())) | {("local", None, call, None)}
+        # Mapping-merge mutation on a plain dict variable: ``certs.update(other)``
+        # / ``certs.setdefault(k, v)`` merges another mapping's items -- and its
+        # key-insertion order -- into ``certs``, so ``certs`` inherits the
+        # argument's instability (a later ``json.dumps(certs)`` without
+        # ``sort_keys`` then flaps). Gated to a *known dict* (``dict_vars``) so it
+        # never absorbs onto an arbitrary ``.update()`` receiver; the loop form is
+        # already covered by ``loop_accumulators``, this is the same idiom outside a
+        # loop (the ``certs.update(self._get_certs_from_relation())`` shape).
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in MAPPING_MERGE_METHODS
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id in ctx.dict_vars
+        ):
+            name = call.func.value.id
+            argtaint: Set[Origin] = set()
+            for arg in call.args:
+                argtaint |= self._eval(arg, ctx)
+            if argtaint:
+                ctx.env[name] = set(ctx.env.get(name, ())) | argtaint
         # Builder mutation: ``obj.add(<unordered>)`` on a locally-constructed
         # object absorbs the argument's instability into the object's state, so a
         # later ``obj.as_dict()`` / ``obj.render()`` is order-unstable. Gated to a

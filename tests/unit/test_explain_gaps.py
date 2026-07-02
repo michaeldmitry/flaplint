@@ -2,8 +2,10 @@
 
 A *gap* is a write whose content flaplint couldn't fully trace — an unresolved
 library call, a value-object field it doesn't model, or an untraced parameter into a
-file/plan/hash write. Gaps are diagnostics, not findings: they never fail the run,
-they're a worklist of where a missed flap (a false negative) could hide.
+plan/hash write. Gaps are diagnostics, not findings: they never fail the run,
+they're a worklist of where a missed flap (a false negative) could hide. (A
+parameter into a *file* write is no longer a gap: file writes fold into parameter
+summaries, so an unordered caller is a real contract finding — see test_sink.py.)
 """
 
 from __future__ import annotations
@@ -68,9 +70,11 @@ def test_fully_traced_write_has_no_gap(tmp_path):
     assert gaps == []
 
 
-def test_untraced_parameter_into_file_write_is_a_gap(tmp_path):
-    # A helper that writes a parameter to a file gets no caller-contract check, so
-    # an unordered caller would slip through — flag it as a blind spot.
+def test_untraced_parameter_into_file_write_is_not_a_gap(tmp_path):
+    # A helper writing a parameter to a file now *does* get a caller-contract check
+    # (file writes fold into parameter summaries), so it is a real finding, not a
+    # blind spot — it must NOT be reported as a gap. (The finding itself is asserted
+    # in test_sink.py::test_helper_writing_param_to_file_is_a_contract_sink.)
     gaps = _gaps(
         tmp_path,
         """
@@ -79,7 +83,21 @@ def test_untraced_parameter_into_file_write_is_a_gap(tmp_path):
                 container.push("/etc/app.conf", data)
         """,
     )
-    assert any("parameter `data`" in g.reason and g.sink == "file" for g in gaps)
+    assert not any("parameter `data`" in g.reason for g in gaps)
+
+
+def test_untraced_parameter_into_plan_write_is_still_a_gap(tmp_path):
+    # A plan write gets no caller-contract check (a plan is structurally compared),
+    # so an untraced parameter into one is still a genuine blind spot.
+    gaps = _gaps(
+        tmp_path,
+        """
+        class Charm:
+            def _plan(self, container, layer):
+                container.add_layer("l", layer, combine=True)
+        """,
+    )
+    assert any("parameter `layer`" in g.reason and g.sink == "plan" for g in gaps)
 
 
 def test_self_is_not_reported_as_an_untraced_parameter(tmp_path):

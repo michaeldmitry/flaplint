@@ -16,6 +16,7 @@ from .constants import (
     MAPPING_WRITE_METHODS,
     PLAN_WRITE_METHODS,
     PROPAGATE_CALLS,
+    SECRET_WRITE_METHODS,
     UNORDERED_CALLS,
 )
 from .model import FuncInfo
@@ -333,6 +334,65 @@ def is_set_construction(node: ast.AST) -> bool:
     return False
 
 
+def is_dict_construction(node: ast.AST) -> bool:
+    """True if ``node`` builds a ``dict`` value.
+
+    A dict literal (``{}`` / ``{"k": v}``), a dict comprehension, or a ``dict(...)``
+    call. Used to tag a variable as dict-valued so a later ``.update()`` /
+    ``.setdefault()`` on it is known to merge another mapping's *key-insertion
+    order* into it -- even when it started from an empty ``{}`` that is otherwise
+    stable (mirrors :func:`is_set_construction`).
+    """
+    if isinstance(node, (ast.Dict, ast.DictComp)):
+        return True
+    if isinstance(node, ast.Call):
+        return final_attr(node.func) == "dict"
+    return False
+
+
+#: Calls whose result is a ``str``/``bytes`` -- used by :func:`contains_provable_string`
+#: to decide whether a builtin ``hash()`` is hashing string content (and so is
+#: PYTHONHASHSEED-salted). ``dumps``/``dump``/``safe_dump`` (json/yaml → text),
+#: ``str``/``repr``/``format``/``join`` (→ str), ``hexdigest`` (hashlib digest → str),
+#: ``encode``/``decode`` (str↔bytes -- both salted).
+_STRING_PRODUCING_CALLS = frozenset(
+    {"dumps", "dump", "safe_dump", "str", "repr", "format", "join",
+     "hexdigest", "encode", "decode"}
+)
+
+
+def is_string_valued(node: ast.AST) -> bool:
+    """True if ``node`` is *provably* a ``str``/``bytes`` value.
+
+    Conservative: an f-string, a str/bytes literal, a string-concatenation, or a
+    call to a known text-producer (``json.dumps(...)``, ``str(...)``,
+    ``",".join(...)``, ``x.format(...)``, ...). A bare name/attribute is *not*
+    provable (its type is unknown), so it returns ``False``.
+    """
+    if isinstance(node, ast.JoinedStr):  # f-string
+        return True
+    if isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+        return True
+    if isinstance(node, ast.Call):
+        return final_attr(node.func) in _STRING_PRODUCING_CALLS
+    if isinstance(node, ast.BinOp):  # ``"prefix" + x`` / ``a + b`` string concat
+        return is_string_valued(node.left) or is_string_valued(node.right)
+    return False
+
+
+def contains_provable_string(node: ast.AST) -> bool:
+    """True if ``node``, or an element of a tuple/list/set it builds, is a string.
+
+    ``hash(json.dumps(x))`` and ``hash((addr, routing, json.dumps(x)))`` both hash
+    string content; the tuple case is why this recurses into literal collections.
+    """
+    if is_string_valued(node):
+        return True
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        return any(contains_provable_string(e) for e in node.elts)
+    return False
+
+
 def ctor_class(node: ast.AST) -> Optional[str]:
     """If ``node`` looks like ``ClassName(...)``, return the class name."""
     if isinstance(node, ast.Call):
@@ -527,6 +587,19 @@ def file_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
     if attr == "write" and module_root(call.func) == "os":
         key = "os_write"  # os.write(fd, data) -- content is the 2nd positional
     return _content_args(call, FILE_WRITE_METHODS, key)
+
+
+def secret_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:
+    """``(method, content exprs)`` written by a Juju secret call (the ``secret`` sink).
+
+    Recognises ``Secret.set_content(content)`` and
+    ``Application/Unit.add_secret(content, ...)`` from :data:`SECRET_WRITE_METHODS`
+    and returns the method key plus the *content* argument -- an order-unstable value
+    there churns secret revisions. Returns ``None`` when ``call`` is not such a write.
+    """
+    if not isinstance(call.func, ast.Attribute):
+        return None
+    return _content_args(call, SECRET_WRITE_METHODS, call.func.attr)
 
 
 def plan_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:

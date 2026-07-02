@@ -194,6 +194,8 @@ HASH_CALLS: Set[str] = {
     "sha3_512",
     "blake2b",
     "blake2s",
+    "shake_128",
+    "shake_256",
     "hash",
 }
 
@@ -210,6 +212,25 @@ UNORDERED_ANNOTATIONS: Set[str] = {
     "KeysView",
     "ValuesView",
     "ItemsView",
+}
+
+#: Return annotations that assert the returned value is an *unordered collection*.
+#: A function/property annotated ``-> set[str]`` (or ``frozenset`` / ``AbstractSet``
+#: / ``MutableSet``) promises a set: iterating or serialising its result without
+#: ``sorted()`` flaps, even when flaplint can't trace the body (an opaque helper, a
+#: cross-object call). The set family only -- deliberately *not* the broad
+#: ``Iterable`` / ``Collection`` / ``KeysView`` of :data:`UNORDERED_ANNOTATIONS`,
+#: which as a *return* type is usually an ordered generator/view and would over-fire
+#: (a return-type inference asserts the value *is* unordered and drives concrete
+#: caller findings, so it must stay tight; a *parameter* of those types is only a
+#: graded contract boundary, so the broader set is safe there).
+UNORDERED_RETURN_ANNOTATIONS: Set[str] = {
+    "set",
+    "Set",
+    "frozenset",
+    "FrozenSet",
+    "AbstractSet",
+    "MutableSet",
 }
 
 #: Parameter annotations that are ordered/irrelevant: dumping them is the
@@ -267,6 +288,14 @@ ACCUMULATOR_METHODS: Set[str] = {
     "update",
     "setdefault",
 }
+
+#: Dict methods that merge *another mapping's* items -- and its key-insertion
+#: order -- into the receiver. A plain ``certs.update(other)`` / ``certs.setdefault(
+#: k, v)`` outside a loop makes ``certs`` inherit the argument's instability, so a
+#: later ``json.dumps(certs)`` (no ``sort_keys``) flaps. Kept narrow (mapping-only)
+#: so it never absorbs a *list* ``.append``'s nested-field taint (which an
+#: order-preserving pass-through would legitimately launder).
+MAPPING_MERGE_METHODS: Set[str] = {"update", "setdefault"}
 
 #: The subset of :data:`ACCUMULATOR_METHODS` that build a *list* (sequence). A list
 #: filled by iterating an unordered source bakes the iteration order into its
@@ -374,6 +403,24 @@ FILE_WRITE_DESCS: Dict[str, str] = {
     "writelines": "on-disk file write (change-detector gate)",
     "os_write": "on-disk file write (change-detector gate)",
 }
+
+#: Juju secret writes (the ``secret`` sink): ``Secret.set_content(content)`` and
+#: ``Application/Unit.add_secret(content, ...)``. Juju stores the content mapping
+#: and creates a **new revision** whenever it differs from the current one, firing
+#: ``secret-changed`` on every observer -- the same spurious-churn problem as a
+#: databag write, just on a different Juju object. So an order-unstable value in the
+#: content (a ``json.dumps(<unordered>)`` string, a set, a positional pick, a
+#: volatile value) churns secret revisions every reconcile.
+#:
+#: Content is the first positional (``content`` keyword). Like a databag, the outer
+#: mapping is compared by Juju structurally, but an unstable *value* string flaps.
+SECRET_WRITE_METHODS: Dict[str, "tuple[int, tuple[str, ...]]"] = {
+    "set_content": (0, ("content",)),  # Secret.set_content(content)
+    "add_secret": (0, ("content",)),   # Application/Unit.add_secret(content, ...)
+}
+
+#: Human-readable sink description for a Juju secret write.
+SECRET_WRITE_DESC = "juju secret write (new revision → secret-changed churn)"
 
 #: Pebble-plan emission APIs (the ``plan`` sink): ``Container.add_layer(label,
 #: layer)`` (and the lower-level ``pebble.Client.add_layer``). Unstable content in

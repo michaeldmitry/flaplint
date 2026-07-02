@@ -154,7 +154,7 @@ class Finding:
     confidence: str  # how sure flaplint is: "low" | "medium" | "high"
     rule: str  # failure mode: nondeterministic | unordered-collection |
     #            unordered-pick
-    sink: str  # where the value lands: "databag" | "file" | "hash" | "plan" | "render"
+    sink: str  # where it lands: "databag"|"file"|"hash"|"plan"|"render"|"secret"
     variable: str  # offending variable / collection name ("" if anonymous)
     level: str = "error"  # blocking status: "error" (charm-owned fix) | "warning"
     #: provenance pointer: where the unstable value is *born* -- the ``set()`` /
@@ -220,7 +220,7 @@ class Gap:
     path: str
     line: int
     col: int
-    sink: str  # the write target reached: "databag" | "file" | "plan" | "hash" | "render"
+    sink: str  # target reached: "databag"|"file"|"plan"|"hash"|"render"|"secret"
     reason: str  # plain-English description of what couldn't be traced
     snippet: str = ""  # the un-traced expression, for quick scanning
 
@@ -264,6 +264,19 @@ class FuncInfo:
     #: parameter index -> "direct" (written to a sink here) | "via" (forwarded
     #: into another dangerous function).
     dangerous: Dict[int, str] = field(default_factory=dict)
+    #: for each dangerous parameter, the set of sink families it reaches --
+    #: ``"databag"``, ``"secret"`` and/or ``"file"`` (the byte-compared destinations
+    #: that fold into parameter summaries). Lets a caller passing an unstable value
+    #: get one finding per destination (a param written to *both* a databag and a
+    #: file churns both). Empty/absent is read as ``{"databag"}`` for back-compat.
+    dangerous_sinks: Dict[int, Set[str]] = field(default_factory=dict)
+    #: for each dangerous parameter and sink family, the ``(path, lineno, col)`` of
+    #: the *actual write* inside this function -- so a caller's finding can point at
+    #: the real databag / secret write (e.g. the ``set_content`` line), not just the
+    #: call site. Earliest write per (param, sink) is kept.
+    dangerous_sites: Dict[int, Dict[str, Tuple[str, int, int]]] = field(
+        default_factory=dict
+    )
     #: whether the function returns a locally-unordered value.
     returns_unordered: bool = False
     #: whether the function returns a value-position (``"element"``) unstable

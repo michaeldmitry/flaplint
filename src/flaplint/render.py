@@ -86,6 +86,7 @@ _SINK_TARGET: Dict[str, str] = {
     "hash": "a content hash",
     "plan": "a pebble plan",
     "render": "rendered workload config",
+    "secret": "a Juju secret",
 }
 
 
@@ -97,6 +98,7 @@ _SINK_LABEL: Dict[str, str] = {
     "hash": "content hash",
     "plan": "pebble plan",
     "render": "rendered config",
+    "secret": "juju secret",
 }
 
 #: The exit-code axis (``level``) is about *responsibility*, not severity -- yet
@@ -179,7 +181,20 @@ def _describe(f: Finding) -> str:
                 f"annotate {subject} as dict/list if callers already guarantee order."
             )
     elif f.rule == "nondeterministic":
-        if is_detector:
+        if f.sink == "hash" and f.variable == "hash()":
+            # Salted builtin hash(): the instability is the hash *call* itself, not
+            # any value inside it, so don't name a single subject -- explain that the
+            # builtin hash() is nondeterministic across Juju hooks.
+            core = (
+                "The builtin hash() is salted per process (PYTHONHASHSEED) for str/bytes "
+                "content, so it returns a different value on every Juju hook -- each hook "
+                "is a fresh interpreter -- even when the hashed content is identical. A "
+                "hash that is persisted and compared across reconciles therefore trips "
+                "every time; sorting the content cannot fix it, because the hash() call "
+                "is the source of the randomness. Hash stable, sorted bytes with "
+                "hashlib.sha256 instead."
+            )
+        elif is_detector:
             core = (
                 f"{subject} is freshly generated each time this code runs, so when this "
                 f"path executes it feeds a different value into {target_at} and any "

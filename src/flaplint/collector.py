@@ -12,7 +12,11 @@ import ast
 from typing import Dict, List, Optional, Set
 
 from . import astutils
-from .constants import SEQUENCE_FIELD_ANNOTATIONS
+from .constants import (
+    SEQUENCE_FIELD_ANNOTATIONS,
+    UNORDERED_ANNOTATIONS,
+    UNORDERED_RETURN_ANNOTATIONS,
+)
 from .model import FileImports, FuncInfo, Registry
 
 
@@ -27,6 +31,7 @@ class Collector(ast.NodeVisitor):
         attr_types: Dict[str, Dict[str, str]],
         file_imports: Optional[Dict[str, FileImports]] = None,
         model_seq_fields: Optional[Dict[str, Set[str]]] = None,
+        class_set_fields: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.path = path
         self.primary = primary
@@ -35,6 +40,10 @@ class Collector(ast.NodeVisitor):
         #: pydantic-model class name -> sequence-typed field names, so a set
         #: coerced into such a field is promoted ``local`` -> ``itercaller``.
         self.model_seq_fields = model_seq_fields if model_seq_fields is not None else {}
+        #: class name -> ``Set``/``frozenset``-typed attribute names, so a read of
+        #: ``x.attr`` (where ``x``'s type is known) is treated as unordered -- e.g.
+        #: ``event.certificates`` on a ``CertificatesAvailableEvent``.
+        self.class_set_fields = class_set_fields if class_set_fields is not None else {}
         self.functions: List[FuncInfo] = []
         self.class_stack: List[str] = []
         #: this file's import aliases, filled as ``import``/``from`` are visited.
@@ -84,6 +93,19 @@ class Collector(ast.NodeVisitor):
             class_name=cls_name,
             primary=self.primary,
         )
+        # Return-type inference: a ``-> set[str]`` (or frozenset / AbstractSet ...)
+        # promises an unordered collection. Trust the annotation the same way a
+        # ``: Set`` *parameter* is trusted, so a caller that materialises or
+        # serialises the result without ``sorted()`` is caught even when the body is
+        # opaque (a cross-object call, an unresolved helper). Seeded once here and
+        # only ever *grown* by the summary fixed point (booleans flip once), so it
+        # coexists with any body-derived taint. The born-site points at the ``def``
+        # so a finding blames the annotated accessor, not the caller's serializer.
+        if astutils.annotation_root(
+            getattr(node, "returns", None)
+        ) in UNORDERED_RETURN_ANNOTATIONS:
+            fi.returns_unordered = True
+            fi.unordered_site = (self.path, node, fi.name)
         self.registry.setdefault(fi.name, []).append(fi)
         self.functions.append(fi)
         if cls_name:
@@ -107,9 +129,59 @@ class Collector(ast.NodeVisitor):
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._record_model_seq_fields(node)
+        self._record_class_set_fields(node)
         self.class_stack.append(node.name)
         self.generic_visit(node)
         self.class_stack.pop()
+
+    def _record_class_set_fields(self, node: ast.ClassDef) -> None:
+        """Record a class's ``Set``/``frozenset``-typed attributes.
+
+        Two shapes are recognised, covering dataclasses/pydantic models and the ops
+        event idiom (``CertificatesAvailableEvent.certificates: Set[str]``):
+
+        * a class-body annotation -- ``certificates: Set[str]``;
+        * an ``__init__`` that stores a ``Set``-annotated parameter on ``self`` --
+          ``def __init__(self, certificates: Set[str], ...): self.certificates =
+          certificates``.
+
+        A read of such an attribute (``event.certificates``) then reads as unordered,
+        so joining/serialising it without ``sorted()`` is caught even though the
+        attribute's element type lives on another class.
+        """
+        fields = {
+            stmt.target.id
+            for stmt in node.body
+            if isinstance(stmt, ast.AnnAssign)
+            and isinstance(stmt.target, ast.Name)
+            and astutils.annotation_root(stmt.annotation) in UNORDERED_ANNOTATIONS
+        }
+        for stmt in node.body:
+            if not (
+                isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and stmt.name == "__init__"
+            ):
+                continue
+            args = stmt.args
+            set_params = {
+                a.arg
+                for a in list(args.args) + list(args.kwonlyargs)
+                if a.annotation is not None
+                and astutils.annotation_root(a.annotation) in UNORDERED_ANNOTATIONS
+            }
+            for s in ast.walk(stmt):
+                if (
+                    isinstance(s, ast.Assign)
+                    and len(s.targets) == 1
+                    and isinstance(s.targets[0], ast.Attribute)
+                    and isinstance(s.targets[0].value, ast.Name)
+                    and s.targets[0].value.id in ("self", "cls")
+                    and isinstance(s.value, ast.Name)
+                    and s.value.id in set_params
+                ):
+                    fields.add(s.targets[0].attr)
+        if fields:
+            self.class_set_fields.setdefault(node.name, set()).update(fields)
 
     def _record_model_seq_fields(self, node: ast.ClassDef) -> None:
         """Record a pydantic model's sequence-typed fields (``hosts: list[str]``).

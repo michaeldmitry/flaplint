@@ -91,6 +91,18 @@ flaplint can't see what `items` will actually hold, but it can see that if any c
 
 If a caller is traced passing an unstable `items`, a higher-confidence **`caller`** finding is emitted at the call site.
 
+**The mirror image — a helper that promises a set.** An accessor annotated to *return* a set is trusted the same way a `: Set` parameter is:
+
+```python
+@property
+def peer_addresses(self) -> set[str]:      # promises an unordered collection
+    return self._compute()                 # …even though the body is opaque
+
+databag["peers"] = ",".join(self.peer_addresses)   # caught: joins a set unsorted
+```
+
+flaplint can't trace `_compute()`, but the `-> set[str]` annotation asserts the result is unordered — so a caller that materialises or serialises it without `sorted()` is flagged, pointing back at the annotated `def`. Only the **set family** (`set`, `frozenset`, `Set`, `FrozenSet`, `AbstractSet`, `MutableSet`) counts here: a `-> Iterable`/`-> Collection` return is usually an ordered generator, so — unlike for a *parameter* — it is deliberately not treated as unordered (return-type inference asserts the value *is* unordered and drives concrete findings, so it stays tight).
+
 ### Pattern 6: Unstable value stored in a field or on `self`
 
 Storing an unstable value in a dataclass field, a Pydantic model field, or on `self` doesn't make it stable. Flaplint tracks the taint through field reads and across method boundaries.
@@ -242,6 +254,7 @@ The single most common bug this tool exists to catch — and the one simpler che
 - **Set math**: `a | b`, `a & b`, `a - b`, and so on
 - **Directory listings**: `glob`, `listdir`, `scandir`, `walk`, `iterdir`, … — filesystem order is not guaranteed
 - **`relation.units`** — the set of units in a relation; order varies run-to-run
+- **A `Set`-typed attribute on a known class** — reading `x.attr` where `x`'s declared type is a class with `attr` annotated `Set`/`frozenset` (`event.certificates` on an event whose `__init__` takes `certificates: Set[str]`, or a class-body `hosts: Set[str]`). The class is resolved from the variable's own type (a parameter annotation or a constructor call) — no class or attribute name is special-cased. An untyped receiver, or a `list`-typed attribute, stays conservative (no finding).
 
 ### Values that differ every run → `volatile`
 
@@ -277,6 +290,7 @@ Three operations promote a value to a more severe label:
    Two subtle cases:
    - **`enumerate` on a flapping list** carries the taint through, so an index-keyed dict (`{f"k-{i}": e for i, e in enumerate(eps)}`) still flaps even though the keys sort.
    - **Mutating a nested element** (`template["sinks"].update(eps)`) makes the root `template` unstable, so a later `yaml.dump(template)` is caught.
+   - **Merging one mapping into another** (`certs.update(other)` / `certs.setdefault(k, v)` on a plain `dict` variable) folds `other`'s key-insertion order into `certs`, so `certs` inherits its instability — the same absorption a loop already does (`for …: certs.update(…)`), but for the single-call form outside a loop (the `certs.update(self._get_certs_from_relation())` shape).
 
 3. **Looping a parameter into a list → `iterparam`**: the caller decides the order, so this is flagged as a `sink` finding at the loop.
 

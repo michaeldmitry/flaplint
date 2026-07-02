@@ -52,6 +52,8 @@ Recognised writes:
 | `f.write(data)` / `f.writelines(lines)` | `data` / `lines` |
 | `os.write(fd, data)` | `data` |
 
+Because a file is a byte-compared change-detector, a helper that writes *a parameter* to one is a contract boundary — exactly like a databag or secret. So the common `render_file(path, content)` / `write_text(content)` wrapper propagates: a caller passing an unstable value is flagged, pointing at the helper's actual write. (Plan and hash writes are the exception — a plan is compared structurally and a hash's content is its intended change-detector input, so those stay `--explain-gaps` blind spots rather than parameter contracts.)
+
 ### `render` — a returned, rendered config blob
 
 One case looks like a file but isn't provably one: a function that **returns** `yaml.dump(...)` or `json.dumps(...)`. The rendered text is handed to *some* caller that compares it — a container push, a file write, a databag — but flaplint can't see which, so it reports the `render` family. An unstable value that survives key-sorting still changes the output run-to-run, so it's caught the same way; only the label is more cautious.
@@ -72,6 +74,14 @@ That's why `add_layer` is its own kind of write: its content is compared by stru
 `sha256`, `md5`, the built-in `hash`, and so on. A charm hashes some content and compares the result to last time to decide whether to act. Hashing an unstable value gives a different result for the same real content, so that check fires every reconcile.
 
 Hashing the unstable content **is** the write — the tool flags it and assumes the result gates something, without tracing exactly what. (A `hash()` inside a `__hash__` / `__eq__` method is ordinary in-memory hashing, not a change-detector across reconciles, so it's ignored.)
+
+There's one extra trap unique to the **builtin `hash()`**: it is `PYTHONHASHSEED`-salted for `str`/`bytes` content, so `hash("...")` returns a *different integer every process* — and every Juju hook is a fresh interpreter. A hash that is persisted and compared across reconciles therefore flaps **even when the content is perfectly stable and sorted**. So `hash(json.dumps(x, sort_keys=True))` — the classic "I sorted it, so it's stable" fix — still churns every hook. flaplint flags a builtin `hash()` as `nondeterministic` whenever a string is *provably* in what it hashes (a `json.dumps(...)`, `str(...)`, `",".join(...)`, an f-string, a str/bytes literal, or a tuple containing one). `hashlib.sha256`/`md5`/… are process-stable, so they're unaffected; the fix is to hash sorted, stable bytes with `hashlib` rather than the builtin `hash()`.
+
+### `secret` — a Juju secret
+
+`Secret.set_content(content)` and `Application`/`Unit.add_secret(content, …)`. Juju stores the content mapping and creates a **new revision** whenever it differs from the current one, firing `secret-changed` on every observer — the same spurious-churn problem as a databag, on a different Juju object. So an unstable value in the content — most often a `json.dumps(<unordered>)` string — churns secret revisions every reconcile.
+
+A secret is its own sink because it's a distinct store with a distinct fix, but it follows the **same rules as a databag**: the content argument is evaluated with raw-byte survival (a `json.dumps` string that flaps is caught), and because a secret is a Juju store whose content churns observers, a helper that writes *a parameter* into one is a contract boundary — so a caller passing an unstable value is flagged, exactly as for a databag. A parameter written to *both* a databag and a secret yields one finding per store.
 
 ---
 

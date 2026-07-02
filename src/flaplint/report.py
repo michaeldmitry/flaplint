@@ -57,7 +57,7 @@ def report(
     """Produce the deduplicated, suppression-aware findings (and, optionally, gaps)."""
     findings: List[Finding] = []
     gaps: List[Gap] = []
-    seen: Set[Tuple[str, int, int, str]] = set()
+    seen: Set[Tuple[str, int, int, str, str]] = set()
 
     def emit(
         path: str,
@@ -74,7 +74,10 @@ def report(
         if line in suppressed.get(path, ()):
             return
         col = getattr(node, "col_offset", 0) + 1
-        key = (path, line, col, kind)
+        # Include ``sink`` so a value that reaches *two* stores at the same spot
+        # (a param written to both a databag and a secret) yields one finding per
+        # store -- they're distinct churn sources with distinct fixes.
+        key = (path, line, col, kind, sink)
         if key in seen:
             return
         seen.add(key)
@@ -158,15 +161,16 @@ def report(
             conf = _grade_param(fi.param_annotations.get(pname))
             if conf is None:
                 continue
-            emit(
-                fi.path,
-                fi.node,
-                "sink",
-                conf,
-                "unordered-collection",
-                "databag",
-                pname,
-            )
+            for st in sorted(fi.dangerous_sinks.get(idx) or {"databag"}):
+                emit(
+                    fi.path,
+                    fi.node,
+                    "sink",
+                    conf,
+                    "unordered-collection",
+                    st,
+                    pname,
+                )
 
         # iteration-site candidates: a helper iterates one of its parameters
         # unsorted into an order-dependent sequence that escapes (the

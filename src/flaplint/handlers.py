@@ -30,6 +30,23 @@ from .model import (
 )
 
 
+class _RemoteSite:
+    """A node-shaped location for a write in *another* function.
+
+    Lets a caller-side finding point its sink pointer at the callee's actual write
+    line (a databag/secret write inside the helper) instead of the call site. Quacks
+    like an AST node (``lineno``/``col_offset``) and also carries the ``path``, which
+    ``ReportHandler.sink`` prefers over the caller's own file when present.
+    """
+
+    __slots__ = ("path", "lineno", "col_offset")
+
+    def __init__(self, path: str, lineno: int, col_offset: int) -> None:
+        self.path = path
+        self.lineno = lineno
+        self.col_offset = col_offset
+
+
 def _loc_key(site: Tuple) -> Tuple[str, int, int]:
     """Sort key ``(path, line, col)`` for a ``(path, node, ...)`` pick site."""
     path, node = site[0], site[1]
@@ -263,7 +280,21 @@ class SummaryHandler(Handler):
         self.fi = fi
         self.changed = False
 
-    def _mark(self, idx: int, kind: str) -> None:
+    def _mark(
+        self, idx: int, kind: str, sink_type: str = "databag", site=None
+    ) -> None:
+        sinks = self.fi.dangerous_sinks.setdefault(idx, set())
+        if sink_type not in sinks:
+            sinks.add(sink_type)
+            self.changed = True
+        if site is not None:
+            # Keep the earliest write per (param, sink) so the caller-side finding
+            # points at a stable, first-offending location.
+            by_sink = self.fi.dangerous_sites.setdefault(idx, {})
+            prev_site = by_sink.get(sink_type)
+            if prev_site is None or (site[1], site[2]) < (prev_site[1], prev_site[2]):
+                by_sink[sink_type] = site
+                self.changed = True
         prev = self.fi.dangerous.get(idx)
         if prev is None:
             self.fi.dangerous[idx] = kind
@@ -285,14 +316,27 @@ class SummaryHandler(Handler):
             self.changed = True
 
     def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None) -> None:
-        # Hash sinks are reported only at concrete local-origin sites, not folded
-        # into parameter summaries (which describe relation-data writes).
-        if sink_type != "databag":
+        # Databag, secret and on-disk *file* writes fold into *parameter* summaries:
+        # each is a byte-compared destination (a Juju store, or a config file a
+        # workload diffs to decide whether to restart), so a helper that writes a
+        # parameter into one is a contract boundary its callers can trip -- the
+        # ``render_file(path, content)`` / ``write_text(content)`` wrapper idiom. A
+        # caller passing an unordered value then gets a finding pointing at the
+        # helper's actual write. Plan/hash writes still get no such summary (they're
+        # gap-checked instead): a plan is structurally compared and a hash's content
+        # is its intended change-detector input, so a param-contract there over-fires.
+        if sink_type not in ("databag", "secret", "file"):
             return
         marker = "direct" if kind == "direct" else "via"
+        wn = write_node or node
+        site = (
+            self.fi.path,
+            getattr(wn, "lineno", 0),
+            getattr(wn, "col_offset", 0),
+        )
         for origin in origins:
             if isinstance(origin, tuple) and origin[0] == "param":
-                self._mark(origin[1], marker)
+                self._mark(origin[1], marker, sink_type, site)
             elif is_iterparam(origin):
                 # A sequence built from a parameter reaches a relation-data write:
                 # the strongest evidence that the iteration order escapes.
@@ -456,10 +500,12 @@ class ReportHandler(Handler):
         # traced from a concrete unstable argument through a callee's unsorted
         # iteration.
         volatile = "volatile" in origins
+        saltedhash = "saltedhash" in origins
         if (
             not has_local(origins)
             and not has_element(origins)
             and not volatile
+            and not saltedhash
             and not has_itercaller(origins)
         ):
             return
@@ -472,6 +518,24 @@ class ReportHandler(Handler):
             fname = self.fi.name or ""
             if fname.startswith("__") and fname.endswith("__"):
                 return
+        if saltedhash:
+            # The builtin hash() is salted per process, so it flaps every hook
+            # regardless of what (or how sorted) the content is. The bug is the hash
+            # *call*, not a value inside it -- so name the call, not a content var,
+            # and let render explain the salting. Still ``nondeterministic`` in kind.
+            self.out.append(
+                (
+                    node,
+                    "high",
+                    "nondeterministic",
+                    sink_type,
+                    "hash()",  # the offending thing is the hash itself
+                    self.fi.path,
+                    None,
+                    None,
+                )
+            )
+            return
         if volatile:
             # A fresh nondeterministic value (uuid/time/random) churns on *every*
             # reconcile and sorting cannot fix it -- strictly worse than order
@@ -511,7 +575,7 @@ class ReportHandler(Handler):
                     _variable(site_node),
                     site_path,
                     None,
-                    (self.fi.path, write_node),  # the write is downstream of the pick
+                    (getattr(write_node, "path", self.fi.path), write_node),  # write is downstream of the pick
                 )
             )
             return
@@ -552,7 +616,7 @@ class ReportHandler(Handler):
                         _variable(site_node),
                         site_path,
                         self._born_origin(born),
-                        (self.fi.path, write_node),  # the write is downstream of the iteration
+                        (getattr(write_node, "path", self.fi.path), write_node),  # write is downstream of the iteration
                     )
                 )
             return
