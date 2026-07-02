@@ -817,3 +817,88 @@ def test_enumerate_index_used_alone_is_clean(lint_source):
         """
     )
     assert findings == []
+
+
+# --- a field read off a value-position pick inherits the pick -------------------
+# Picking an element by position from an unstable collection (``list(peers)[0]``)
+# and then reading a *field* of it (``[0]["ip"]``) is still position-dependent:
+# the whole object flaps, so every field does. A fixed-key subscript must inherit
+# that ``element`` taint -- mirroring ``.get("ip")``, which already does via the
+# method-call path. Narrow to ``element``: a plain param / local dict stays
+# field-sensitive (its individual keys are order-stable).
+
+
+def test_field_read_off_a_pick_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            def go(self):
+                addr = list(self.model.get_relation("p").units)[0]
+                self.relation.data[self.app]["v"] = addr["ip"]
+        """
+    )
+    picks = [f for f in findings if f.rule == "unordered-pick"]
+    assert len(picks) == 1
+
+
+def test_subscript_and_get_field_read_are_consistent(lint_source):
+    # ``[0]["ip"]`` and ``[0].get("ip")`` must both be caught -- findings can't
+    # depend on which spelling of the field access was used.
+    sub = lint_source(
+        """
+        class Charm:
+            def go(self):
+                self.relation.data[self.app]["v"] = list(
+                    self.model.get_relation("p").units
+                )[0]["ip"]
+        """
+    )
+    get = lint_source(
+        """
+        class Charm:
+            def go(self):
+                self.relation.data[self.app]["v"] = list(
+                    self.model.get_relation("p").units
+                )[0].get("ip")
+        """
+    )
+    assert [f.rule for f in sub] == [f.rule for f in get] == ["unordered-pick"]
+
+
+def test_deep_field_chain_off_a_pick_is_flagged(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            def go(self):
+                cfg = list(self.model.get_relation("p").units)[0]
+                self.relation.data[self.app]["v"] = cfg["scrape"]["targets"]
+        """
+    )
+    assert any(f.rule == "unordered-pick" for f in findings)
+
+
+def test_field_read_off_a_param_dict_stays_clean(lint_source):
+    # The field-sensitivity guard: a fixed-key read off a plain parameter is not a
+    # flap (a mapping's individual keys are order-stable), so it must stay clean.
+    findings = lint_source(
+        """
+        class Charm:
+            def go(self, config):
+                self.relation.data[self.app]["v"] = config["endpoint"]
+        """
+    )
+    assert findings == []
+
+
+def test_field_read_off_a_local_dict_stays_clean(lint_source):
+    # A fixed-key read off a dict built locally (even one holding unstable values
+    # under *other* keys) is field-sensitive: a clean key stays clean.
+    findings = lint_source(
+        """
+        class Charm:
+            def go(self):
+                d = {"a": ",".join(sorted(self.x)), "b": list(self.y)}
+                self.relation.data[self.app]["v"] = d["a"]
+        """
+    )
+    assert findings == []

@@ -880,6 +880,12 @@ class FunctionAnalyzer:
                     self._gap_check(v.args[0], "render", ctx, handler)
             handler.ret(self._eval(stmt.value, ctx))
             handler.ret_fields(self._returned_field_map(stmt.value, ctx))
+            if isinstance(stmt.value, (ast.Tuple, ast.List)):
+                # ``return ",".join(rw), ",".join(ro), ...`` -- record each position's
+                # taint so a caller unpacking the result binds it element-wise.
+                handler.ret_tuple(
+                    [self._eval(e, ctx) for e in stmt.value.elts]
+                )
             return
 
         if isinstance(stmt, ast.For):
@@ -912,6 +918,8 @@ class FunctionAnalyzer:
                 self._record_databag_alias(tgt, stmt.value, ctx)
                 self._record_field_taint(tgt.id, stmt.value, ctx)
                 self._record_dict_key_taint(tgt.id, stmt.value, ctx)
+            elif isinstance(tgt, (ast.Tuple, ast.List)):
+                self._unpack_assign(tgt, stmt.value, ctx)
             elif self._is_databag_target(tgt, ctx):
                 continue  # the databag write is reported as a sink above
             else:
@@ -936,6 +944,51 @@ class FunctionAnalyzer:
                     base = astutils.root_name(tgt)
                     if base is not None and base not in ("self", "cls"):
                         ctx.env[base] = set(ctx.env.get(base, ())) | set(taint)
+
+    def _unpack_assign(
+        self, target: ast.AST, value: ast.AST, ctx: Context
+    ) -> None:
+        """Bind a tuple/list unpacking target ``a, b, _ = <value>`` *per position*.
+
+        Without this the instability of a returned tuple (``get_cluster_endpoints``
+        returning three ``",".join(set)`` strings) never reaches ``rw`` / ``ro``, so
+        the later ``set_endpoints(rw)`` databag write reads clean. Precision is by
+        position so a stable element unpacked next to an unstable one stays clean
+        (``cert, key = get_assigned_certificate()`` -- the ``key`` must not inherit the
+        certificate's SAN instability). Positions come from a matching-arity literal
+        RHS, or a resolved call's ``returns_tuple_origins`` summary; anything else
+        leaves the targets clean rather than smearing the whole taint across them.
+        """
+        elts = target.elts
+        if any(isinstance(e, ast.Starred) for e in elts):
+            positions: "Optional[List[Set[Origin]]]" = None
+        elif isinstance(value, (ast.Tuple, ast.List)) and len(value.elts) == len(elts):
+            positions = [
+                self._eval(v, ctx) | self._ctor_field_taint(v, ctx) for v in value.elts
+            ]
+        elif isinstance(value, ast.Call):
+            positions = next(
+                (
+                    [set(s) for s in fi.returns_tuple_origins]
+                    for fi in self._resolve_methods(value, ctx)
+                    if fi.returns_tuple_origins is not None
+                    and len(fi.returns_tuple_origins) == len(elts)
+                ),
+                None,
+            )
+        else:
+            positions = None
+        for i, te in enumerate(elts):
+            origins = positions[i] if positions is not None else set()
+            if isinstance(te, ast.Name):
+                ctx.env[te.id] = set(origins)
+            elif isinstance(te, (ast.Tuple, ast.List)):
+                sub = (
+                    value.elts[i]
+                    if isinstance(value, (ast.Tuple, ast.List)) and i < len(value.elts)
+                    else value
+                )
+                self._unpack_assign(te, sub, ctx)
 
     def _visit_ann_assign(
         self, stmt: ast.AnnAssign, ctx: Context, handler: Handler

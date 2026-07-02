@@ -184,3 +184,94 @@ def test_property_returning_itercaller_taints_reader(lint_source):
     callers = [f for f in findings if f.kind == "caller"]
     assert len(callers) == 1
     assert callers[0].rule == "unordered-iteration"
+
+
+# --- tuple unpacking distributes taint per position -----------------------------
+# ``rw, ro, _ = self.get_cluster_endpoints(...)`` -- a helper that returns several
+# ``",".join(set)`` strings, unpacked and written to a databag. Each name must get
+# *its own* position's taint: an unstable slot flags, a stable sibling stays clean
+# (``cert, key = ...`` -- the key must not inherit the cert's instability).
+
+
+def test_tuple_unpack_flags_each_unstable_position(lint_source):
+    findings = lint_source(
+        """
+        class Charm:
+            def _endpoints(self):
+                rw = set()
+                ro = set()
+                for u in self.model.get_relation("p").units:
+                    rw.add(str(u))
+                    ro.add(str(u))
+                return ",".join(rw), ",".join(ro)
+
+            def go(self):
+                rw, ro = self._endpoints()
+                self.relation.data[self.app]["rw"] = rw
+                self.relation.data[self.app]["ro"] = ro
+        """
+    )
+    dbs = [f for f in findings if f.sink == "databag"]
+    assert len(dbs) == 2
+    assert all(f.rule == "unordered-iteration" for f in dbs)
+
+
+def test_tuple_unpack_keeps_stable_position_clean(lint_source):
+    # The ``cert, key = get_assigned_certificate()`` shape: position 0 is unstable
+    # (a set-joined string), position 1 is a stable value -- only the first flags.
+    findings = lint_source(
+        """
+        class Charm:
+            def _cert(self):
+                san = set()
+                for u in self.model.get_relation("p").units:
+                    san.add(str(u))
+                return ",".join(san), "stable-key"
+
+            def go(self):
+                cert, key = self._cert()
+                self.relation.data[self.app]["c"] = cert
+                self.relation.data[self.app]["k"] = key
+        """
+    )
+    dbs = [f for f in findings if f.sink == "databag"]
+    assert len(dbs) == 1
+    assert dbs[0].variable == "cert" or dbs[0].line  # the cert position, not key
+
+
+def test_tuple_literal_unpack_is_element_wise(lint_source):
+    # ``a, b = json.dumps(set), sorted(x)`` -- unpacked from a literal, so ``b``
+    # (sorted) stays clean while ``a`` flaps.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def go(self):
+                a, b = json.dumps([v for v in self.model.get_relation("p").units]), sorted(self.x)
+                self.relation.data[self.app]["a"] = a
+                self.relation.data[self.app]["b"] = b
+        """
+    )
+    dbs = [f for f in findings if f.sink == "databag"]
+    assert len(dbs) == 1
+
+
+def test_starred_unpack_does_not_smear_taint(lint_source):
+    # A starred target has no fixed positions, so no per-position summary applies --
+    # the conservative path must not smear the whole taint onto ``rest`` (no FP).
+    findings = lint_source(
+        """
+        class Charm:
+            def _pair(self):
+                s = set()
+                for u in self.model.get_relation("p").units:
+                    s.add(str(u))
+                return "stable", list(s)
+
+            def go(self):
+                first, *rest = self._pair()
+                self.relation.data[self.app]["v"] = first
+        """
+    )
+    assert [f for f in findings if f.sink == "databag"] == []

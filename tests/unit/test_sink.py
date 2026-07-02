@@ -624,6 +624,57 @@ def test_pebble_add_layer_volatile_value_is_a_plan_sink(lint_source):
     assert callers[0].rule == "nondeterministic"
 
 
+def test_pebble_layer_wrapper_carries_taint_across_functions(lint_source):
+    # The mysql-k8s binlog-collector shape: a property builds a plan dict with an
+    # order-baked ``HOSTS`` string, wraps it in ``ops.pebble.Layer(dict)``, and a
+    # *different* method feeds that Layer to ``add_layer(..., combine=True)``. The
+    # ``Layer(...)`` wrapper must carry the dict's instability across the return, or
+    # the plan flap (a replan() restart every hook) is a false negative.
+    findings = lint_source(
+        """
+        from ops.pebble import Layer
+
+        class Charm:
+            @property
+            def _pebble_layer(self):
+                layer = {
+                    "services": {
+                        "collector": {
+                            "environment": {"HOSTS": ",".join(self._members())},
+                        },
+                    },
+                }
+                return Layer(layer)
+
+            def _members(self):
+                return [self.unit_address] + [
+                    self.addr(u) for u in self.model.get_relation("p").units
+                ]
+
+            def reconcile(self, container):
+                container.add_layer("app", self._pebble_layer, combine=True)
+        """
+    )
+    plans = [f for f in findings if f.sink == "plan"]
+    assert len(plans) == 1
+    assert plans[0].rule == "unordered-iteration"
+
+
+def test_pebble_layer_from_yaml_string_stays_clean(lint_source):
+    # ``Layer(yaml_string)`` carries no ordering taint (a string is scalar), so a
+    # Layer built from text must not be flagged -- Layer only propagates a dict's taint.
+    findings = lint_source(
+        """
+        from ops.pebble import Layer
+
+        class Charm:
+            def reconcile(self, container, raw):
+                container.add_layer("app", Layer(raw), combine=True)
+        """
+    )
+    assert [f for f in findings if f.sink == "plan"] == []
+
+
 def test_secret_set_content_of_unordered_is_a_secret_sink(lint_source):
     # ``secret.set_content({..: json.dumps(<unordered>)})`` -- Juju creates a new
     # revision when the content differs, firing secret-changed on every observer.

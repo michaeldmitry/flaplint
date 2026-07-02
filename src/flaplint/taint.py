@@ -19,6 +19,7 @@ from .constants import (
     BYTES_SERIALIZER_METHODS,
     MODEL_SERIALIZERS,
     NONSORTING_SERIALIZERS,
+    ORDER_INDEPENDENT_CALLS,
     PROPAGATE_CALLS,
     FILE_READ_METHODS,
     SANITIZER_CALLS,
@@ -173,6 +174,18 @@ class TaintEngine:
         class_set_fields: Optional[Dict[str, Set[str]]] = None,
     ) -> None:
         self.registry = registry
+        #: class names flaplint has *method summaries* for -- i.e. user-defined
+        #: collaborators (a ``Patroni`` / ``ConfigBuilder``), as opposed to opaque
+        #: library wrappers (``ops.pebble.Layer``) or pure dataclasses. A constructor
+        #: of one of these is a *stateful collaborator* whose methods are traced, so
+        #: the generic constructor-propagation (Phase 1 in :meth:`_call`) must skip it
+        #: -- otherwise storing it as ``self._patroni = Patroni(peer_ips, ...)`` would
+        #: taint the object and, via the receiver-inheritance rule, poison every
+        #: unrelated ``self._patroni.method()`` call. Opaque wrappers keep no state we
+        #: trace, so propagating their argument (``Layer(plan_dict)``) is correct.
+        self._method_classes: Set[str] = {
+            fi.class_name for fns in registry.values() for fi in fns if fi.class_name
+        }
         self.class_attr_types = class_attr_types
         #: pydantic-model class name -> sequence-typed field names (``list``/
         #: ``tuple``/``Sequence``). A ``set`` coerced into one of these fields has
@@ -375,7 +388,10 @@ class TaintEngine:
             if path is not None:
                 if path in env:
                     return set(env[path])
-                return self._instance_attr_subscript_taint(node, cls_ctx)
+                inst = self._instance_attr_subscript_taint(node, cls_ctx)
+                if inst:
+                    return inst
+                # per-key provenance absent: fall through to the element rule below.
             # Sequence indexing/slicing picks an *order-dependent* element of an
             # unstable collection: ``unordered_list[0]`` is a different element
             # across reconciles (the classic "pick the first address" churn bug).
@@ -390,7 +406,20 @@ class TaintEngine:
                 return _as_value_position(
                     self.eval(node.value, env, cls_ctx, _depth + 1), node
                 )
-            return set()
+            # A key read *off a value-position pick* inherits the pick: if the whole
+            # object was selected by position from an unstable collection
+            # (``list(peers)[0]``), then every field of it (``[0]["ip"]``, and any
+            # depth of chaining) is equally position-dependent. Only ``element``
+            # propagates -- a plain param/local dict stays field-sensitive (its
+            # individual keys are order-stable), so the guard that keeps
+            # ``config["endpoint"]`` clean is untouched. Mirrors ``x.get("ip")``,
+            # which already inherits the receiver's taint via the method-call path:
+            # the subscript spelling must not decide whether the flap is seen.
+            return {
+                o
+                for o in self.eval(node.value, env, cls_ctx, _depth + 1)
+                if is_element(o)
+            }
 
         if isinstance(node, ast.Attribute):
             # ``relation.units`` and friends are unordered ops collections.
@@ -565,7 +594,9 @@ class TaintEngine:
 
         # User-defined function: consult its return summary.
         out: Set[Origin] = set()
+        resolved = False
         for fi in self._resolve_summary_candidates(call, name, cls_ctx):
+            resolved = True
             out |= self._summary_return_origins(fi, call)
             if fi.returns_params or fi.iter_params:
                 mapping = astutils.map_call_args(call, fi)
@@ -613,9 +644,44 @@ class TaintEngine:
                 # field's *value* order: a list field built from an unordered source
                 # is still emitted in element order (the cos_agent ``_dashboards``
                 # shape). So keep concrete content taint and drop only the
-                # field-name-order / param-boundary flavors.
-                recv_taint = {o for o in recv_taint if o[0] not in ("param", "iterparam")}
+                # field-name-order / param-boundary flavors. Return here: the dump's
+                # output is the receiver's field taint, and its keyword args
+                # (``exclude``/``include``/``mode`` -- often *sets* of field names) are
+                # control parameters that do NOT flow into the output, so they must not
+                # be arg-propagated by the default rule below.
+                return out | {o for o in recv_taint if o[0] not in ("param", "iterparam")}
             out |= recv_taint
+
+        # Default-propagate (the inverted taint model): an unknown call carries its
+        # arguments' instability forward rather than dropping it -- a wrapper, a
+        # constructor, a formatter, a codec all *hold* or *reformat* their input, so
+        # order instability survives. This replaces the open-ended allowlist of
+        # transparent propagators (``Layer``, ``public_bytes``, the next lib wrapper)
+        # with a *bounded denylist*: only genuine launderers stop it, and those are
+        # matched earlier (``sorted``/``split``/``read``/key-sorting dumps) or listed
+        # in :data:`ORDER_INDEPENDENT_CALLS` (``len``/``min``/``max``/... that reduce a
+        # collection to an order-independent scalar). Two exclusions:
+        #
+        # * a *user collaborator* (a class we have method summaries for -- a
+        #   ``Patroni`` / ``ConfigBuilder``) is stateful; tainting its constructor
+        #   would, via the receiver-inheritance rule, poison every ``self._x.method()``
+        #   call on it, so its methods' own summaries are trusted instead;
+        # * a call that *resolved* to a user method is trusted to its own summary --
+        #   which already models its arg-flow (``returns_params``) and any laundering
+        #   (a ``render`` that ``sorted()``s internally) -- so its raw args are not
+        #   re-propagated on top.
+        if (
+            name
+            and not resolved
+            and name not in ORDER_INDEPENDENT_CALLS
+            and name not in self._method_classes
+        ):
+            for a in call.args:
+                if not isinstance(a, ast.Starred):
+                    out |= self.eval(a, env, cls_ctx, depth + 1)
+            for kw in call.keywords:
+                if kw.value is not None:
+                    out |= self.eval(kw.value, env, cls_ctx, depth + 1)
         return out
 
     def _resolve_summary_candidates(self, call, name, cls_ctx):

@@ -100,6 +100,31 @@ SEQUENCE_MATERIALIZERS: Set[str] = {
 #: Callables that neutralize ordering taint.
 SANITIZER_CALLS: Set[str] = {"sorted"}
 
+#: Calls whose result is *order-independent* regardless of the input's order -- they
+#: collapse a collection to a scalar (an aggregate, a boolean, a coerced number), so
+#: any ordering instability is laundered. This is the bounded *sanitizer* list that
+#: makes the default-propagate model safe: an unknown call carries its arguments'
+#: taint forward UNLESS it is one of these (see the constructor/call propagation in
+#: ``TaintEngine._call``). ``sorted``/``split``/``read`` are laundering too but are
+#: handled by their own earlier branches. Deliberately *excludes* content-preserving
+#: transforms (``format``/``encode``/``str``/a hash digest) -- those propagate.
+ORDER_INDEPENDENT_CALLS: Set[str] = {
+    "len",
+    "min",
+    "max",
+    "sum",
+    "any",
+    "all",
+    "count",
+    "bool",
+    "int",
+    "float",
+    "abs",
+    "round",
+    "ord",
+    "index",
+}
+
 #: String-splitting methods (``str.split``/``rsplit``/``splitlines``). They return
 #: a list whose element order is fixed by the *content* of the string -- left to
 #: right -- not by any collection's iteration order. So iterating their result is

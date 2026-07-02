@@ -268,11 +268,19 @@ A reference to a parameter is recorded as "as unstable as parameter N" — a pla
 
 ## How a value changes as it moves (propagation)
 
-### Things that pass instability through unchanged
+### Instability propagates by default
 
-`list`, `tuple`, `reversed`, `dict`, `copy`, `deepcopy` carry the input's instability forward. A plain (non-key-sorting) serializer passes it through too: `json.dumps(x)` is only as stable as `x`.
+flaplint follows the standard taint model: **an unknown call carries its arguments' instability forward unless something explicitly launders it.** A wrapper, constructor, formatter, or codec all *hold* or *reformat* their input, so order instability survives — `ops.pebble.Layer(plan_dict)`, `SomeConfig(hosts=set)`, `codec.encode(x)` are all as unstable as what went in. This is a *denylist*, not an allowlist: rather than enumerating every transparent wrapper (which is open-ended — every new library adds one), only the bounded set of **launderers** stops propagation:
+
+- explicit sorts (`sorted`, `.sort()`) and key-sorting serializers (`yaml.dump`, `json.dumps(sort_keys=True)`) — remove order instability;
+- **order-independent reducers** (`len`, `min`, `max`, `sum`, `any`, `all`, `count`, `bool`, …) — collapse a collection to a scalar the order can't affect;
+- content re-determined from elsewhere (`.split()`, `.read()`).
+
+So `ops.pebble.Layer({… "HOSTS": ",".join(set) …})` carries that instability across a property return to the `add_layer(…)` plan sink (the mysql-k8s binlog-collector `replan()`-every-hook flap) with no special-casing, while `len(set)` or `sorted(x)` launder cleanly. Two things are *not* propagated: a call that resolves to a **user method** trusts that method's own summary (a `render()` that sorts internally stays clean), and a **user collaborator** constructor (`Patroni(peer_ips, …)`) is not tainted — it's stateful, and tainting it would poison every method call on it.
 
 A template render (`template.render(x=…)`) is treated the same way — flaplint can't see inside the template, so it assumes the rendered text is as unstable as the values handed in. This catches the common pattern of rendering a config from Jinja and writing it to a file.
+
+**Tuple unpacking is tracked per position.** `rw, ro, _ = self.get_cluster_endpoints(...)` binds each name its *own* slot's taint: if the helper returns `",".join(rw_set), ",".join(ro_set), …` (three joins of sets), both `rw` and `ro` flap into the databag while the discarded `_` is ignored — the mysql "self-defeating endpoint guard" flap. Position taint comes from a matching-arity literal (`a, b = x, sorted(y)`) or a resolved callee's per-position return summary; a *stable* slot unpacked alongside an unstable one stays clean (`cert, key = get_assigned_certificate()` — the `key` doesn't inherit the certificate's SAN instability). When neither is available (a starred target, an opaque callee), the targets are left clean rather than smeared.
 
 ### Things that make a value stable (sanitisers)
 
@@ -285,7 +293,7 @@ A template render (`template.render(x=…)`) is treated the same way — flaplin
 
 Three operations promote a value to a more severe label:
 
-1. **Picking by position → `element`**: `unordered[0]` grabs one item whose identity depends on the run-to-run ordering. Can't be fixed by sorting keys.
+1. **Picking by position → `element`**: `unordered[0]` grabs one item whose identity depends on the run-to-run ordering. Can't be fixed by sorting keys. Reading a **field off that pick** stays unstable — `list(peers)[0]["ip"]` (and any depth of chaining) flaps just as `list(peers)[0]` does, because the whole picked object flaps. This inheritance is `element`-only: a fixed-key read off a plain parameter or a locally-built dict (`config["endpoint"]`) stays field-sensitive and clean, since a mapping's individual keys are order-stable. (It matches `[0].get("ip")`, which already inherits the pick — the subscript spelling mustn't decide whether the flap is seen.)
 
 2. **Building a list from a set → `itercaller`**: `list(some_set)`, `tuple(relation.units)`, `[x for x in some_set]`, a loop accumulator (`for u in relation.units: eps.append(…)`). The list's item order now carries the disorder. A `set` or `dict` accumulator stays `local` — its disorder is key-order, which a key-sorting serializer does fix.
 

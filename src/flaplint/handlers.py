@@ -272,6 +272,9 @@ class Handler:
     def ret_fields(self, field_map: "dict[str, Set[Origin]]") -> None:
         """Called for each ``return <value object>`` with its per-field taint."""
 
+    def ret_tuple(self, position_origins: "list[Set[Origin]]") -> None:
+        """Called for each ``return a, b, ...`` with the per-position taint."""
+
 
 class SummaryHandler(Handler):
     """Accumulate a function's interprocedural summary from one analysis pass."""
@@ -410,6 +413,36 @@ class SummaryHandler(Handler):
                 if origin[1] not in self.fi.returns_params:
                     self.fi.returns_params.add(origin[1])
                     self.changed = True
+
+    def ret_tuple(self, position_origins) -> None:
+        # A returned tuple/list literal's per-position taint becomes this function's
+        # ``returns_tuple_origins`` summary, so a caller unpacking the result binds
+        # each name's own instability (not the whole tuple's smeared across all).
+        # Born-sites are resolved to this function (mirrors ``ret_fields``); param
+        # flavors are dropped -- not cross-function-resolvable here. Arity conflicts
+        # across returns mark the summary permanently unreliable. Monotone -> the
+        # fixed point terminates.
+        fi = self.fi
+        if fi.returns_tuple_unreliable:
+            return
+        resolved = [
+            {r for r in (_resolve_field_origin(o, fi) for o in origins) if r is not None}
+            for origins in position_origins
+        ]
+        if fi.returns_tuple_origins is None:
+            fi.returns_tuple_origins = [set(s) for s in resolved]
+            self.changed = True
+            return
+        if len(fi.returns_tuple_origins) != len(resolved):
+            fi.returns_tuple_origins = None
+            fi.returns_tuple_unreliable = True
+            self.changed = True
+            return
+        for i, s in enumerate(resolved):
+            merged = fi.returns_tuple_origins[i] | s
+            if merged != fi.returns_tuple_origins[i]:
+                fi.returns_tuple_origins[i] = merged
+                self.changed = True
 
     def ret_fields(self, field_map) -> None:
         # A returned value object's per-field taint becomes this function's

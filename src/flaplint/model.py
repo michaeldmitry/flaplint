@@ -319,6 +319,16 @@ class FuncInfo:
     #: sink). Reported as a contract-boundary ``sink`` finding pointing at the
     #: iteration, so the fix (``sorted()``) lands where the churn is created.
     iter_params: Dict[int, Tuple[str, ast.AST]] = field(default_factory=dict)
+    #: per-*position* taint of a returned tuple/list literal, so a caller unpacking
+    #: the result (``rw, ro, _ = self.get_cluster_endpoints(...)``) gets each name's
+    #: own instability -- position 0 (a ``",".join(set)``) is unstable while a stable
+    #: sibling position (``cert, key = ...``: the ``key``) stays clean. ``None`` until
+    #: a tuple return is seen; born-sites are resolved to this function. Set back to
+    #: ``None`` and :attr:`returns_tuple_unreliable` on an arity conflict.
+    returns_tuple_origins: Optional[List[Set["Origin"]]] = None
+    #: True once returns of *differing* arity were seen -- the per-position summary is
+    #: then meaningless and must not be consumed (a terminal state).
+    returns_tuple_unreliable: bool = False
 
 
 #: Function table keyed by *bare* name (``"as_dict"``), since a call site only
