@@ -75,3 +75,88 @@ def test_returns_unordered_propagates_to_caller(lint_source):
     callers = [f for f in findings if f.kind == "caller"]
     assert len(callers) == 1
     assert callers[0].confidence == "high"
+
+
+# --- cross-object member resolution (n-hop receiver chains) --------------------
+# A collaborator object reached through a typed member chain -- the charm idiom
+# where a manager holds a ``self.charm`` back-reference and the charm holds the
+# manager. Resolving the chain lets a call like
+# ``self.charm.async_replication.get_addrs()`` consult the callee's summary.
+
+
+def test_annotated_back_reference_types_a_member(lint_source):
+    # ``self.charm = charm`` where ``charm: TheCharm`` types the attribute from the
+    # parameter annotation, so ``self.charm.<set-property>`` resolves cross-object.
+    findings = lint_source(
+        """
+        class Charm:
+            @property
+            def peer_ips(self) -> set:
+                return self._opaque()
+
+        class Replication:
+            def __init__(self, charm: "Charm"):
+                self.charm = charm
+
+            def go(self):
+                self.relation.data[self.app]["v"] = ",".join(self.charm.peer_ips)
+        """
+    )
+    callers = [f for f in findings if f.kind == "caller"]
+    assert len(callers) == 1
+    assert callers[0].confidence == "high"
+
+
+def test_two_hop_cross_object_chain_resolves(lint_source):
+    # ``self.charm.repl.partner_addrs()`` -- two member hops, both typed (a
+    # constructor collaborator and an annotated back-reference) -- resolves to the
+    # callee's summary, so its unordered return is traced to the databag write.
+    findings = lint_source(
+        """
+        class Charm:
+            def __init__(self):
+                self.repl = Replication(self)
+
+            @property
+            def peer_ips(self) -> set:
+                return self._opaque()
+
+        class Replication:
+            def __init__(self, charm: "Charm"):
+                self.charm = charm
+
+            def partner_addrs(self):
+                return list(self.charm.peer_ips)
+
+        class Cluster:
+            def __init__(self, charm: "Charm"):
+                self.charm = charm
+
+            def render(self):
+                self.relation.data[self.app]["v"] = ",".join(
+                    self.charm.repl.partner_addrs()
+                )
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"]
+
+
+def test_unannotated_back_reference_stays_unresolved(lint_source):
+    # Without an annotation, ``self.charm``'s class is unknown (a bare parameter),
+    # so a cross-object property read off it cannot resolve -- the documented limit.
+    findings = lint_source(
+        """
+        class Charm:
+            @property
+            def peer_ips(self) -> set:
+                return self._opaque()
+
+        class Cluster:
+            def __init__(self, charm):          # no annotation
+                self.charm = charm
+
+            def render(self):
+                self.relation.data[self.app]["v"] = ",".join(self.charm.peer_ips)
+        """
+    )
+    assert [f for f in findings if f.kind == "caller"] == []

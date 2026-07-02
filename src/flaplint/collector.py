@@ -109,15 +109,38 @@ class Collector(ast.NodeVisitor):
         self.registry.setdefault(fi.name, []).append(fi)
         self.functions.append(fi)
         if cls_name:
-            self._record_member_types(node, cls_name)
+            self._record_member_types(node, cls_name, annotations)
 
-    def _record_member_types(self, node: ast.AST, cls_name: str) -> None:
-        """Record ``self.<attr> = ClassName(...)`` so members resolve to a class."""
+    def _record_member_types(
+        self, node: ast.AST, cls_name: str, param_annotations: Dict[str, Optional[str]]
+    ) -> None:
+        """Record ``self.<attr>``'s class so member accesses resolve to it.
+
+        Two shapes are recorded, both keyed by the attribute name on ``cls_name``:
+
+        * ``self.<attr> = ClassName(...)`` -- a constructor assignment (the
+          collaborator idiom, ``self.async_replication = PostgreSQLAsyncReplication(...)``);
+        * ``self.<attr> = <param>`` where ``<param>`` is a *class-annotated* parameter
+          of the enclosing method (``def __init__(self, charm: TheCharm): self.charm =
+          charm``). This is the near-universal *back-reference* every charm library
+          holds, and without it a cross-object call ``self.charm.<manager>.<method>()``
+          can't resolve its receiver. Trusting the annotation mirrors how a ``: Set``
+          parameter is trusted elsewhere.
+
+        Recording a spurious type is harmless: it is only ever consulted to look up a
+        method/property *by class name*, so a non-class annotation resolves to nothing.
+        """
         for sub in ast.walk(node):
             if not isinstance(sub, ast.Assign):
                 continue
-            ctor = astutils.ctor_class(sub.value)
-            if not ctor:
+            cls = astutils.ctor_class(sub.value)
+            if cls is None and isinstance(sub.value, ast.Name):
+                # ``self.charm = charm`` -- type the attribute from the parameter's
+                # class annotation (a capitalised root is a class, not a scalar/builtin).
+                ann = param_annotations.get(sub.value.id)
+                if ann and ann[:1].isupper():
+                    cls = ann
+            if cls is None:
                 continue
             for tgt in sub.targets:
                 if (
@@ -125,7 +148,7 @@ class Collector(ast.NodeVisitor):
                     and isinstance(tgt.value, ast.Name)
                     and tgt.value.id in ("self", "cls")
                 ):
-                    self.attr_types.setdefault(cls_name, {})[tgt.attr] = ctor
+                    self.attr_types.setdefault(cls_name, {})[tgt.attr] = cls
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._record_model_seq_fields(node)

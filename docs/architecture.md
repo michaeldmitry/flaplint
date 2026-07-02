@@ -189,6 +189,30 @@ a link that goes through a call or an index isn't a stable slot flaplint can nam
 the chain stops being tracked there — the value effectively becomes "rebuilt by a
 method" (the gap above).
 
+### A cross-object call through an *untyped* member
+
+```python
+class Manager:
+    def __init__(self, charm: "MyCharm"):   # ← annotated: self.charm resolves
+        self.charm = charm
+    def go(self): push(",".join(self.charm.peer_ips))   # ← caught
+
+class Cluster:
+    def __init__(self, charm):              # ← no annotation: self.charm is opaque
+        self.charm = charm
+    def go(self): push(",".join(self.charm.peer_ips))   # ← NOT caught
+```
+
+A member chain of any depth (`self.charm.replication.get_addrs()`) resolves its
+receiver one hop at a time, as long as **every** intermediate attribute's class is
+known — from a constructor assignment (`self.x = ClassName(...)`) or a *class-annotated*
+back-reference (`self.charm = charm` where `charm: MyCharm`). The near-universal
+`self.charm` back-reference is the usual first hop, so annotating it is what lets a
+manager reach back into the charm's accessors. An **unannotated** back-reference leaves
+that hop opaque and the chain stops there — the value becomes "rebuilt by a method". (A
+uniquely-named method still resolves by name regardless, so this only bites when the
+receiver's *type* is the only way to pick the right same-named method or property.)
+
 ### A value looked up by a variable key
 
 ```python

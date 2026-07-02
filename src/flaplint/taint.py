@@ -675,18 +675,26 @@ class TaintEngine:
     def _receiver_class(self, recv: ast.AST, cls_ctx: Optional[str]) -> Optional[str]:
         """Infer the class behind a (property) attribute-access receiver.
 
-        Handles ``self``/``cls`` (the enclosing class) and ``self.<member>``
-        typed via a recorded ``self.<member> = ClassName(...)`` assignment.
+        Walks a member chain of *any depth*, resolving one hop at a time against the
+        recorded ``self.<member>`` types (``class_attr_types``):
+
+        * ``self`` / ``cls`` -> the enclosing class ``cls_ctx``;
+        * a typed local/parameter ``x`` -> its class from ``_var_types``;
+        * ``<base>.<attr>`` -> the class recorded for ``<attr>`` on ``<base>``'s class.
+
+        So ``self.charm`` (1 hop), ``self.charm.async_replication`` (2 hops), and
+        deeper chains all resolve, as long as every intermediate attribute's class is
+        known (a constructor assignment or a class-annotated back-reference). A hop
+        whose class is unknown stops the walk (returns ``None``).
         """
-        if isinstance(recv, ast.Name) and recv.id in ("self", "cls"):
-            return cls_ctx
-        if (
-            isinstance(recv, ast.Attribute)
-            and isinstance(recv.value, ast.Name)
-            and recv.value.id in ("self", "cls")
-            and cls_ctx is not None
-        ):
-            return self.class_attr_types.get(cls_ctx, {}).get(recv.attr)
+        if isinstance(recv, ast.Name):
+            if recv.id in ("self", "cls"):
+                return cls_ctx
+            return self._var_types.get(recv.id)
+        if isinstance(recv, ast.Attribute):
+            base_cls = self._receiver_class(recv.value, cls_ctx)
+            if base_cls is not None:
+                return self.class_attr_types.get(base_cls, {}).get(recv.attr)
         return None
 
     def _property_taint(
