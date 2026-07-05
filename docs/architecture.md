@@ -154,109 +154,92 @@ Order only changes **how many passes** it takes. If `A` calls `B` and `A` is wal
 
 ### Contract-boundary findings land on the direct writer, not on forwarders
 
-When a function writes one of its *parameters* to a sink, it gets a `kind=sink` finding graded by that parameter's annotation. But this only applies to the function that writes to the sink **directly**. A function that merely passes a parameter *along* to another writer does not get its own finding.
+A `kind=sink` finding — "this function writes one of its parameters unsorted" — only fires on the function that does the write **directly**. A function that just passes the parameter along to another writer doesn't get its own finding, even if its own parameter had a more useful type hint. Flagging every forwarder along the way would multiply one bug into many findings, so the tool deliberately reports it once, at the actual write. See [what this looks like in practice](#a-forwarded-parameters-finding-lands-on-the-writer-not-the-forwarder) in the limitations below.
 
-That means the finding lands on whichever helper does the actual write — often a generic one (`write_to_file(content)`, `set_data(data)`) where the parameter is unannotated — rather than on the caller that gave the value a meaningful annotation (`enabled_log_files: Iterable`). So a precise, high-confidence finding on the well-annotated parameter several calls up isn't produced. Surfacing it would mean flagging every forwarded parameter, which would be far too noisy, so the tool deliberately doesn't.
+## What flaplint misses
 
-## Known gaps
+flaplint follows a value as far as its code makes that possible — through local variables, function calls, return values, and one level into object fields. Past that, tracking loses the thread and the value looks stable even though it isn't. That's a **false negative**: no crash, no wrong finding, just silence where there should have been one. Nothing below produces an incorrect finding — they're all things that stay quiet when they shouldn't.
 
-flaplint follows values it can see directly — local variables, function arguments, return values, and (one level deep) object fields. Here are the patterns it misses.
+The common thread: **a value that takes an unusual detour on its way to a write** — through a call, an index, an untyped `self.x`, or a variable dict key — can lose flaplint partway through. A value that goes straight from where it's built to where it's written is always caught; it's the indirection in between that matters.
 
-### A value rebuilt by a method
+### A value rebuilt inside another method
 
 ```python
-# tracked: self._hosts assigned and returned directly
+# caught — the method just hands back what it stored
 def __init__(self): self._hosts = set(self.peers)
-def reconcile(self): push(",".join(self._hosts))   # ← caught
+def reconcile(self): push(",".join(self._hosts))
 
-# NOT tracked: a method rebuilds from internal state
-def reconcile(self): push(",".join(self._render()))  # _render() builds from self._hosts internally
+# missed — the method recomputes it from state flaplint can't see into
+def reconcile(self): push(",".join(self._render()))   # _render() rebuilds from self._hosts internally
 ```
 
-flaplint sees `_render()` return something but can't trace what it rebuilds from. If the method returned `self._hosts` directly it would be caught.
+If a helper method's *body* isn't itself traceable — because it derives its result from state in a way flaplint can't follow — the value it hands back looks stable even if it isn't. This is also why a **config-builder** pattern (components added one at a time via `builder.add(name, value)`, then assembled by a separate `builder.build()`) can slip through: the individual values are still caught wherever *they* were built (e.g. at the point a set gets enumerated into it), but the assembled whole isn't re-checked at `build()`.
 
-The same limit hides a **config-builder object** that accumulates components and is dumped elsewhere: `self.config.add_component(name, {…})` stores the value under `self._config[section][name]` (a nested-subscript instance attribute flaplint doesn't track), and a separate `build()` re-serializes the whole thing with `yaml.safe_dump`. Two things break the chain, so a value handed to `add_component` isn't followed to the dump: the nested-subscript instance-attr write isn't tracked, and the value usually enters as a *field* of a loop variable (`endpoint["url"]` in `for i, endpoint in enumerate(endpoints)`), which flaplint's field-sensitive fixed-key lookup treats as its own slot rather than inheriting the positional instability of `endpoint`. The instability *arriving* at the builder is still caught at its source (e.g. a set enumerated into `.../{idx}` component names is flagged at the `enumerate`, before the `add_component` call), and a helper that passes a *whole* unstable parameter straight into the config (`config={"scrape_configs": jobs}`) is followed normally.
-
-### A value reached through a call or subscript in the field chain
+### A value reached through a call or an index
 
 ```python
-self.ctx.config.targets = set(x)   # ← caught (a pure attribute chain, any depth)
-self.get_ctx().targets = set(x)    # ← NOT caught (a call breaks the chain)
-self.items[0].targets = set(x)     # ← NOT caught (a subscript breaks the chain)
+self.ctx.config.targets = set(x)   # caught — a plain chain of attributes, any depth
+self.get_ctx().targets = set(x)    # missed — a call breaks the chain
+self.items[0].targets = set(x)     # missed — an index breaks the chain
 ```
 
-Field taint is tracked along a pure attribute chain rooted at a name, to any depth
-(`self.ctx.config.targets` is followed both within a method and across methods). But
-a link that goes through a call or an index isn't a stable slot flaplint can name, so
-the chain stops being tracked there — the value effectively becomes "rebuilt by a
-method" (the gap above).
+flaplint follows a chain of plain attribute access (`self.ctx.config.targets`) to any depth, in one method or across several. But as soon as a link in that chain is a function call or a subscript instead of a plain `.attr`, tracking can't name that link as a stable slot, and the value becomes the "rebuilt inside another method" case above.
 
-### A cross-object call through an *untyped* member
+### A cross-object call through an unannotated attribute
 
 ```python
 class Manager:
-    def __init__(self, charm: "MyCharm"):   # ← annotated: self.charm resolves
+    def __init__(self, charm: "MyCharm"):   # type hint present: resolves
         self.charm = charm
-    def go(self): push(",".join(self.charm.peer_ips))   # ← caught
+    def go(self): push(",".join(self.charm.peer_ips))   # caught
 
 class Cluster:
-    def __init__(self, charm):              # ← no annotation: self.charm is opaque
+    def __init__(self, charm):              # no type hint: opaque
         self.charm = charm
-    def go(self): push(",".join(self.charm.peer_ips))   # ← NOT caught
+    def go(self): push(",".join(self.charm.peer_ips))   # missed
 ```
 
-A member chain of any depth (`self.charm.replication.get_addrs()`) resolves its
-receiver one hop at a time, as long as **every** intermediate attribute's class is
-known — from a constructor assignment (`self.x = ClassName(...)`) or a *class-annotated*
-back-reference (`self.charm = charm` where `charm: MyCharm`). The near-universal
-`self.charm` back-reference is the usual first hop, so annotating it is what lets a
-manager reach back into the charm's accessors. An **unannotated** back-reference leaves
-that hop opaque and the chain stops there — the value becomes "rebuilt by a method". (A
-uniquely-named method still resolves by name regardless, so this only bites when the
-receiver's *type* is the only way to pick the right same-named method or property.)
+Reaching into another object's data (`self.charm.peer_ips`) only works when flaplint knows what class `self.charm` actually is. That's usually obvious (`self.x = SomeClass(...)`), but for the common "hold a reference back to the charm" pattern, it depends on a type hint on the parameter that gets assigned to `self.charm`. Add the hint and the call resolves; leave it off and the call looks opaque.
 
-### A value looked up by a variable key
+### A value looked up by a variable dict key
 
 ```python
-cfg["peers"] = set(x)         # ← caught (constant key "peers" is tracked)
-cfg[key] = set(x)             # ← NOT caught (variable key — can't know which slot)
+cfg["peers"] = set(x)         # caught — the constant key "peers" is tracked
+cfg[key] = set(x)             # missed — a variable key: which slot even is this?
 ```
 
-### A model whose base class isn't a direct `BaseModel`
+flaplint tracks which dict *key* holds an unstable value, so a sibling key stays clean even when this one isn't. That only works for a literal string key — once the key itself is a variable, there's no fixed slot to remember.
 
+### A Pydantic model two or more subclasses away from `BaseModel`
 
 ```python
 class _Base(BaseModel): ...
-class Cfg(_Base):           # ← indirect base — not recognised as a coercing model
+class Cfg(_Base):           # one step removed from BaseModel — not recognised
     hosts: list[str]
-cfg = Cfg(hosts=some_set)   # the set→list promotion is missed at this path
+cfg = Cfg(hosts=some_set)   # the set → list coercion is missed here
 ```
 
-An intermediate project base class (`class Cfg(_Base)` where `_Base(BaseModel)`) isn't
-followed transitively, so the field's coercion isn't known. The common direct-subclass
-shape is covered.
+Pydantic silently turns a `set` handed to a `list`-typed field into an ordered list — which flaplint treats as its own small flap. It recognises that coercion for a model that subclasses `BaseModel` directly. An intermediate base class in between isn't followed, so this specific promotion is missed (everything else about the model is still tracked normally).
 
-### A finding for a forwarded parameter lands on the writer, not the typed caller
-
-When a function writes one of its parameters to a sink, it gets a `kind=sink` finding. But only the function that does the **actual write** — not intermediate forwarders. If a well-annotated helper passes a parameter along to a generic writer, the finding lands on the generic writer (often unannotated) rather than on the annotated helper:
+### A forwarded parameter's finding lands on the writer, not the forwarder
 
 ```python
 def set_endpoints(self, endpoints: Iterable[str]):
-    self._write_databag("endpoints", endpoints)   # forwards — no finding here
+    self._write_databag("endpoints", endpoints)   # just forwards — no finding here
 
-def _write_databag(self, key, value):             # kind=sink finding lands here
-    self.relation.data[self.app][key] = json.dumps(value)   # unannotated param
+def _write_databag(self, key, value):             # the finding lands here instead
+    self.relation.data[self.app][key] = json.dumps(value)   # value has no type hint
 ```
 
-The precise, high-confidence finding on `endpoints: Iterable[str]` is not produced. Surfacing it would require flagging every forwarded parameter, which would be far too noisy, so the tool deliberately doesn't. See [Design decisions](architecture.md#design-decisions) for the full rationale.
+By design, not an accident: only the function doing the **actual write** gets a "this parameter is written unsorted" finding, even when an earlier, better-annotated function in the chain would have made a clearer one. Flagging every forwarder along the way would turn one bug into a pile of findings, so the tool reports it once, where the write happens — see [why](architecture.md#contract-boundary-findings-land-on-the-direct-writer-not-on-forwarders).
 
-### Values from library code not included in the scan
+### Anything defined in a dependency you didn't include in the scan
 
-If a library function returns an unordered value and flaplint hasn't analysed that library (no `--venv` / `--python`), the return appears stable. Use `--venv` or `--python` to include your dependencies in the scan.
+If a library function returns something unstable and that library wasn't part of the scan, the return value looks stable — flaplint has nothing to read. Point `--venv` or `--python` at your dependencies (usually auto-detected already) so their code is included.
 
 ---
 
-`--explain-gaps` lists writes flaplint could see but couldn't fully trace — a worklist for manual review of where a missed flap might hide.
+Run with `--explain-gaps` to get a worklist of writes flaplint could see but couldn't fully trace — a starting point for manually checking the spots above.
 
 ---
 

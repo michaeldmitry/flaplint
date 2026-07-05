@@ -1,6 +1,5 @@
 # flaplint
 
-> **Keep your charm's databags steady, your reconcilers quiet.**
 
 `flaplint` is a static analyser for Juju charms. It reads your charm's source code and flags every place a value that has no stable byte-order — a set, a glob, a uuid4(), … — reaches a churn-sensitive write: a relation databag, an on-disk file, a pebble plan, or a content-hash change-detector.
 
