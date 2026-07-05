@@ -28,9 +28,11 @@ def test_local_set_rendered_into_databag_is_flagged(lint_source):
 
 def test_collection_param_rendered_into_databag_is_a_contract_sink(lint_source):
     # A parameter annotated as unordered, rendered into text and written to a
-    # databag: the helper owns a contract-boundary ``sink`` finding, graded high by
-    # the annotation. (The render is what carries the parameter's taint to the
-    # write -- without it the flow is invisible.)
+    # databag: the helper owns a contract-boundary ``sink`` finding. ``Iterable`` is
+    # *ambiguous* (it admits ``list``), so the grade is ``medium`` -- a "if a caller
+    # passes an unordered value" contract concern, not a proven high-confidence bug.
+    # (The render is what carries the parameter's taint to the write -- without it
+    # the flow is invisible.)
     findings = lint_source(
         """
         import jinja2
@@ -45,8 +47,28 @@ def test_collection_param_rendered_into_databag_is_a_contract_sink(lint_source):
     )
     sinks = [f for f in findings if f.kind == "sink"]
     assert len(sinks) == 1
-    assert sinks[0].confidence == "high"          # Iterable annotation
+    assert sinks[0].confidence == "medium"        # Iterable is ambiguous, not the set family
     assert sinks[0].variable == "enabled_log_files"
+
+
+def test_set_param_rendered_into_databag_is_high_confidence(lint_source):
+    # The set family *is* definitely unordered, so the same contract-boundary sink
+    # grades high -- the split from the ambiguous ``Iterable`` case above.
+    findings = lint_source(
+        """
+        import jinja2
+        from typing import Set
+
+        class Charm:
+            def publish(self, enabled_log_files: Set):
+                template = jinja2.Template(open("t.j2").read())
+                rendered = template.render(files=enabled_log_files)
+                self.relation.data[self.app]["cfg"] = rendered
+        """
+    )
+    sinks = [f for f in findings if f.kind == "sink"]
+    assert len(sinks) == 1
+    assert sinks[0].confidence == "high"
 
 
 def test_local_set_rendered_into_file_is_flagged(lint_source):

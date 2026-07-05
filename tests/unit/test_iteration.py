@@ -48,6 +48,28 @@ def test_param_iterated_into_returned_sequence_is_flagged(lint_source):
     assert iters[0].line == 9
 
 
+def test_bound_unordered_call_is_named_by_its_full_expression(lint_source):
+    # The cos_agent ``_dashboards`` shape: iterating ``Path(d).glob("*")`` into a list
+    # that reaches a databag. The offending source is an anonymous expression (no
+    # variable), so the label shows the whole thing -- what you'd wrap in ``sorted()``
+    # -- not the receiver chain's root constructor ``Path``. (``ast.unparse`` renders
+    # the string literal with single quotes.)
+    findings = lint_source(
+        """
+        import json
+        from pathlib import Path
+
+        class Charm:
+            def reconcile(self, relation, d):
+                paths = [str(p) for p in Path(d).glob("*")]
+                relation.data[self.app]["dashboards"] = json.dumps(paths)
+        """
+    )
+    iters = [f for f in findings if f.rule == "unordered-iteration"]
+    assert len(iters) == 1
+    assert iters[0].variable == "Path(d).glob('*')"
+
+
 def test_param_iterated_with_stable_arg_is_precautionary_medium(lint_source):
     # Even when the (only visible) caller passes a plain dict literal, the
     # iteration of an unannotated parameter into an escaping sequence is a
@@ -426,7 +448,9 @@ def test_enumerate_index_keyed_dict_is_flagged(lint_source):
                 relation.data[self.app]["v"] = yaml.safe_dump(sinks)
         """
     )
-    assert any(f.rule == "unordered-iteration" for f in findings)
+    # Each ``e`` is the element at position ``idx`` -- a value-position pick, so the
+    # dict values carry ``element`` taint (rule ``unordered-pick``) key-sorting can't fix.
+    assert any(f.rule == "unordered-pick" for f in findings)
 
 
 def test_enumerate_element_keyed_dict_is_not_flagged(lint_source):
@@ -490,7 +514,7 @@ def test_nested_container_element_mutation_taints_root(lint_source):
                 relation.data[self.app]["v"] = yaml.safe_dump(template)
         """
     )
-    assert any(f.rule == "unordered-iteration" for f in findings)
+    assert any(f.rule == "unordered-pick" for f in findings)
 
 
 
@@ -746,7 +770,8 @@ def test_enumerate_value_written_to_numbered_file_is_flagged(lint_source):
     )
     files = [f for f in findings if f.sink == "file"]
     assert len(files) == 1
-    assert files[0].rule == "unordered-iteration"
+    # ``cert`` is the element at position ``i`` -- a value-position pick.
+    assert files[0].rule == "unordered-pick"
     assert files[0].confidence == "high"
 
 
@@ -765,7 +790,7 @@ def test_enumerate_value_pushed_to_workload_is_flagged(lint_source):
                     container.push(f"/certs/{i}.crt", cert, make_dirs=True)
         """
     )
-    assert any(f.sink == "file" and f.rule == "unordered-iteration" for f in findings)
+    assert any(f.sink == "file" and f.rule == "unordered-pick" for f in findings)
 
 
 def test_enumerate_sorted_source_direct_write_is_clean(lint_source):
@@ -786,9 +811,12 @@ def test_enumerate_sorted_source_direct_write_is_clean(lint_source):
     assert findings == []
 
 
-def test_enumerate_over_plain_param_direct_write_is_clean(lint_source):
-    # Enumerating a bare parameter is the caller's ordering contract, not a concrete
-    # flap here -- the value target is not seeded on a plain ``param`` source.
+def test_enumerate_over_plain_param_is_a_contract_boundary(lint_source):
+    # Enumerating a bare parameter materialises it into positional bindings: the value
+    # under each index (``cert``) is a contract-boundary pick the caller controls
+    # (``iterparam``). Like ``[x for x in param]``, this is a *medium* contract-boundary
+    # finding at the iteration -- a caller passing an unordered ``items`` would flap the
+    # numbered files -- not the clean pass it used to be (that was a false negative).
     findings = lint_source(
         """
         class Charm:
@@ -797,7 +825,8 @@ def test_enumerate_over_plain_param_direct_write_is_clean(lint_source):
                     folder.joinpath(f"{i}.crt").write_text(cert)
         """
     )
-    assert findings == []
+    iters = [f for f in findings if f.rule == "unordered-iteration"]
+    assert iters and iters[0].confidence == "medium"
 
 
 def test_enumerate_index_used_alone_is_clean(lint_source):

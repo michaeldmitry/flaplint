@@ -42,7 +42,11 @@ from .constants import (
 from . import databag
 from .handlers import Handler, _RemoteSite
 from .model import FuncInfo, Origin, Registry
-from .taint import TaintEngine, _as_local_sequence, _promote_to_sequence
+from .taint import (
+    TaintEngine,
+    _as_value_position,
+    _promote_to_sequence,
+)
 
 
 #: Call names that don't introduce ordering/volatility instability, so a call to one
@@ -164,9 +168,25 @@ class FunctionAnalyzer:
         if isinstance(call.func, ast.Attribute):
             cls = astutils.infer_class(call.func.value, ctx.types)
             if cls:
-                matched = [fi for fi in candidates if fi.class_name == cls]
+                # Include inherited definitions: a method resolved on a subclass
+                # receiver may be defined on a base (``LokiPushApiConsumer`` ->
+                # ``ConsumerBase.loki_endpoints``).
+                chain = self.engine._class_chain(cls)
+                matched = [fi for fi in candidates if fi.class_name in chain]
                 if matched:
                     return matched
+            # Receiver precisely typed to a class we have *no definition* for -- an
+            # external library type (``self._krm = KubernetesResourceManager(...)`` from
+            # lightkube). Do NOT fall back to the same-name union of *unrelated* user
+            # methods: that imports a wrong summary (``Nginx.reconcile`` pushes a TLS
+            # key to a file, colliding with an external ``krm.reconcile`` that only
+            # applies k8s objects). Only for *external* classes -- an *untyped* receiver
+            # (no ``cls``) keeps the union (the load-bearing case that resolves real
+            # findings through imperfect typing), and one of *our* classes with an
+            # imperfect method match also keeps it.
+            recv_cls = cls or self.engine._receiver_class(call.func.value, ctx.cls)
+            if recv_cls and recv_cls not in self.engine._analyzed_classes:
+                return []
             # A builtin collection method (``subnets.update(...)``) on a receiver of
             # unknown class must NOT fall back to a same-named user method -- that is
             # a cross-class collision (e.g. the charm's own ``update``). Without a
@@ -181,6 +201,18 @@ class FunctionAnalyzer:
         if not isinstance(target, ast.Name):
             return
         cls = astutils.ctor_class(value)
+        if cls is None and isinstance(value, ast.Call):
+            # ``x = helper()`` where ``helper``'s ``-> Ret`` annotation names a class we
+            # analysed: type ``x`` as ``Ret`` so a later ``x.method()`` resolves on that
+            # class instead of the same-name union (which collides across classes). Only
+            # an analysed class is trusted -- an external/typing return annotation
+            # (``-> List`` / ``-> KubernetesResourceManager``) leaves ``x`` untyped, as
+            # before.
+            for fi in self._resolve_methods(value, ctx):
+                rc = fi.returns_class
+                if rc and rc in self.engine._analyzed_classes:
+                    cls = rc
+                    break
         if cls:
             ctx.types[target.id] = cls
         elif target.id in ctx.types:
@@ -523,10 +555,28 @@ class FunctionAnalyzer:
             return set()
         seq_fields = self.engine.model_seq_fields.get(ctor, ())
         out: Set[Origin] = set()
-        for arg in value.args:
-            if isinstance(arg, ast.Starred):
-                continue
-            out |= self._eval(arg, ctx)
+        # *Positional* args carry field taint only when the class is a *known value
+        # object* (dataclass / pydantic / NamedTuple): its declared fields, in order,
+        # are its constructor's positional parameters, so ``ScrapeJobContext(job)``
+        # fills ``updated_job`` exactly as ``ScrapeJobContext(updated_job=job)`` does.
+        # A plain class (a stateful collaborator) is absent from ``value_object_fields``,
+        # so its positional args (config -- ``ClusterProvider(frozenset(roles), ...)``)
+        # are NOT absorbed: tainting the object from them would, via the receiver-
+        # inheritance rule, mis-flag every unrelated ``self._cluster.method()`` call
+        # (``.grant_privkey()`` -> a false ``unordered-collection``).
+        vo_fields = self.engine.value_object_fields.get(ctor)
+        if vo_fields is not None:
+            for i, arg in enumerate(value.args):
+                if isinstance(arg, ast.Starred) or i >= len(vo_fields):
+                    continue
+                t = self._eval(arg, ctx)
+                if vo_fields[i] in seq_fields:
+                    t = self.engine.coerce_to_sequence_field(t, arg)
+                out |= t
+        # *Keyword* args carry field taint for any constructor -- the ``Model(field=
+        # <unordered>)`` value-object idiom works even for an external model class we
+        # never see defined (so cannot list in ``value_object_fields``). A keyword arg
+        # names a field explicitly, so it is unambiguous where a bare positional is not.
         for kw in value.keywords:
             if kw.value is None:
                 continue
@@ -537,6 +587,73 @@ class FunctionAnalyzer:
                 t = self.engine.coerce_to_sequence_field(t, kw.value)
             out |= t
         return out
+
+    def _absorb_into_constructor(self, value: ast.AST, ctx: Context) -> None:
+        """Constructor analogue of :meth:`_absorb_into_callee`.
+
+        A *stateful class* whose ``__init__`` stores a constructor argument into
+        ``self.<attr>`` (``def __init__(self, roles): self._roles = roles``) makes
+        that attribute carry the argument's instability -- so a *later* method that
+        dumps it (``def publish(self): write(json.dumps(list(self._roles)))``) or
+        returns it (``def get_roles(self): return list(self._roles)``) flaps. The
+        surfacing half already works for setter-absorbed attributes; this wires the
+        *construction site* into the same path, which method calls (``builder.add(x)``)
+        already use but constructors (``Prov(frozenset(roles))``) did not.
+
+        ``__init__.absorbs`` (computed for every function) gives ``{param_idx -> attr}``.
+        We map each absorbed parameter to its construction argument (positional by
+        offset -- the constructor supplies ``self`` implicitly, so arg *N* is param
+        *N+1* -- or by keyword) and record the argument's *concrete* taint onto the
+        class's ``instance_attr_taint``. Bare ``param``/``iterparam`` origins are
+        dropped (a keyed lookup that merely touches a parameter is order-stable),
+        mirroring the setter barrier -- so this is field-precise: a method that does
+        not read the attribute (``grant_privkey`` on a ``ClusterProvider`` built with
+        an unordered arg) never inherits it.
+        """
+        if not isinstance(value, ast.Call):
+            return
+        cls = astutils.ctor_class(value)
+        if cls is None:
+            return
+        chain = self.engine._class_chain(cls)
+        for init in self.registry.get("__init__", []):
+            if not (init.class_name and init.absorbs):
+                continue
+            if init.class_name != cls and not (chain and init.class_name in chain):
+                continue
+            for pidx, attr in init.absorbs.items():
+                arg = self._constructor_arg(value, init, pidx)
+                if arg is None or isinstance(arg, ast.Starred):
+                    continue
+                argtaint = self._eval(arg, ctx)
+                if not argtaint:
+                    continue
+                resolved = {
+                    self._resolve_attr_origin(o, ctx)
+                    for o in argtaint
+                    if not (isinstance(o, tuple) and o[0] in ("param", "iterparam"))
+                }
+                self.engine.record_instance_attr(
+                    init.class_name, attr, {o for o in resolved if o}
+                )
+
+    @staticmethod
+    def _constructor_arg(
+        call: ast.Call, init: FuncInfo, pidx: int
+    ) -> "Optional[ast.expr]":
+        """The construction argument filling ``__init__`` parameter ``pidx``.
+
+        A constructor call binds ``self`` implicitly, so positional arg *N* fills
+        parameter *N+1*; a keyword arg is matched by the parameter's name.
+        """
+        argpos = pidx - 1
+        if 0 <= argpos < len(call.args):
+            return call.args[argpos]
+        pname = init.params[pidx] if pidx < len(init.params) else None
+        for kw in call.keywords:
+            if kw.arg is not None and kw.arg == pname:
+                return kw.value
+        return None
 
     def _escape_content_taint(self, call: ast.Call, ctx: Context) -> Set[Origin]:
         """Taint written into a databag handed to a writer call.
@@ -905,6 +1022,7 @@ class FunctionAnalyzer:
 
     def _visit_assign(self, stmt: ast.Assign, ctx: Context, handler: Handler) -> None:
         self._scan_expr(stmt.value, ctx, handler)
+        self._absorb_into_constructor(stmt.value, ctx)
         taint = self._eval(stmt.value, ctx) | self._ctor_field_taint(stmt.value, ctx)
         for tgt in stmt.targets:
             if self._is_databag_target(tgt, ctx):
@@ -994,6 +1112,8 @@ class FunctionAnalyzer:
         self, stmt: ast.AnnAssign, ctx: Context, handler: Handler
     ) -> None:
         self._scan_expr(stmt.value, ctx, handler)
+        if stmt.value is not None:
+            self._absorb_into_constructor(stmt.value, ctx)
         if self._is_databag_target(stmt.target, ctx):
             origins = self._eval(stmt.value, ctx)
             if origins:
@@ -1077,9 +1197,34 @@ class FunctionAnalyzer:
             and call.func.value.id in ctx.types
         ):
             recv = call.func.value.id
+            # When the receiver's *concrete* class is known and its setter is in the
+            # registry, trust the per-parameter absorb summary instead of blanket-
+            # tainting from every argument. A setter that *launders* its argument
+            # (``def add(self, k, v): self._c[k] = sorted(v)``) leaves that param out
+            # of ``absorbs``, so a local ``b.add(some_set)`` into a sorting builder no
+            # longer taints ``b`` -- the local analogue of the ``_absorb_into_callee``
+            # gate. Only the args the summary marks absorbed contribute. The receiver
+            # is a locally-constructed object, so ``infer_class`` is exact (not the
+            # imperfect ``self.<member>`` typing that made a broad union worth keeping);
+            # if the class is known but its setter isn't registered (defined elsewhere /
+            # unanalyzed), fall back to the broad match for recall.
+            recv_cls = astutils.infer_class(call.func.value, ctx.types)
+            chain = self.engine._class_chain(recv_cls) if recv_cls else None
+            own_methods = (
+                [fi for fi in self.registry.get(call.func.attr, [])
+                 if fi.class_name in chain]
+                if chain is not None else []
+            )
             argtaint: Set[Origin] = set()
-            for arg in call.args:
-                argtaint |= self._eval(arg, ctx)
+            if own_methods:
+                absorbed = {pidx for fi in own_methods for pidx in fi.absorbs}
+                for i, arg in enumerate(call.args):
+                    # bound call arg ``i`` maps to param ``i + 1`` (param 0 is ``self``).
+                    if (i + 1) in absorbed:
+                        argtaint |= self._eval(arg, ctx)
+            else:
+                for arg in call.args:
+                    argtaint |= self._eval(arg, ctx)
             if argtaint:
                 ctx.env[recv] = set(ctx.env.get(recv, ())) | argtaint
         # Nested container-element mutation: ``template["sinks"].update(x)`` /
@@ -1102,7 +1247,91 @@ class FunctionAnalyzer:
                     argtaint |= self._eval(arg, ctx)
                 if argtaint:
                     ctx.env[root] = set(ctx.env.get(root, ())) | argtaint
+        self._absorb_into_callee(call, ctx, handler)
         self._scan_expr(stmt.value, ctx, handler)
+
+    def _absorb_into_callee(self, call: ast.AST, ctx: Context, handler: Handler) -> None:
+        """Cross-object config-builder chain: a setter call that stores an unstable
+        argument into the *callee's* own state taints that callee class's attribute.
+
+        ``self.config.add_component(..., {"endpoint": <unstable>})`` resolves to
+        ``ConfigBuilder.add_component``, whose summary says it absorbs param 3 into
+        ``self._config`` (:attr:`FuncInfo.absorbs`). We record the argument's taint on
+        ``instance_attr_taint[ConfigBuilder]["_config"]`` -- the same class-level map
+        the within-class barrier uses -- so ``ConfigBuilder.build()`` (which returns
+        ``yaml.safe_dump(self._config)``) surfaces it, and a caller writing
+        ``config_manager.config.build()`` to a file is flagged. The fixed point re-runs
+        on the resulting ``instance_attr_changed``.
+        """
+        if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)):
+            return
+        # When the receiver's class is known (a ``self.<member>`` builder), only that
+        # class's setter absorbs -- so two builders that both define ``add_component``
+        # don't cross-contaminate. Unknown receiver keeps the broad match (an absorb is
+        # a no-op unless the arg is actually unstable, so over-matching is harmless).
+        recv_cls = astutils.infer_class(
+            call.func.value, ctx.types
+        ) or self.engine._receiver_class(call.func.value, ctx.cls)
+        chain = self.engine._class_chain(recv_cls) if recv_cls else None
+        for fi in self._resolve_methods(call, ctx):
+            if not fi.absorbs or not fi.class_name:
+                continue
+            if chain is not None and fi.class_name not in chain:
+                continue
+            # The builder's real render-write (byte-sink type + location), or ``None``
+            # if its state is never rendered to a byte-sink (then the setter is not a
+            # contract sink -- Path B stays silent).
+            render = self.engine.render_sites.get(fi.class_name)
+            for pidx, attr in fi.absorbs.items():
+                # param 0 is ``self``; a bound-call arg N maps to param N+1.
+                argpos = pidx - 1
+                if argpos < 0 or argpos >= len(call.args):
+                    continue
+                if isinstance(call.args[argpos], ast.Starred):
+                    continue
+                argtaint = self._eval(call.args[argpos], ctx)
+                if not argtaint:
+                    continue
+                # (A) Concrete surfacing: record the argument's *concrete* instability
+                # on the callee class's attribute so its state-returning method
+                # (``build()``) surfaces it -- catching an unstable value born in the
+                # same object as the absorb. A bare ``param`` origin is dropped: a keyed
+                # lookup that merely touches a param set (``secrets.get(id).get(k)``) is
+                # order-stable, so forwarding the param would over-taint the absorb.
+                resolved = {
+                    self._resolve_attr_origin(o, ctx)
+                    for o in argtaint
+                    if not (isinstance(o, tuple) and o[0] in ("param", "iterparam"))
+                }
+                self.engine.record_instance_attr(
+                    fi.class_name, attr, {o for o in resolved if o}
+                )
+                # (B) Param boundary: an ``iterparam`` argument is *positionally
+                # derived from this helper's parameter* (``enumerate(endpoints)`` ->
+                # ``endpoint["url"]``) -- order-dependent, unlike a field-sensitive
+                # ``param``. Absorbed into a builder that renders to a byte-sink, the
+                # parameter reaches that sink: mark it ``dangerous`` with the *real*
+                # sink type + location so a caller passing a concrete-unstable value
+                # (``add_log_forwarding(loki_endpoints)``) is flagged -- the caller-side
+                # signal, which unlike the helper-side ``iter_params`` contract is not
+                # silenced by an ``endpoints: List[dict]`` annotation (a list the caller
+                # nonetheless built from unordered data). The ``render`` gate keeps a
+                # private, never-rendered cache from becoming a sink; the ``iterparam``
+                # gate keeps a keyed ``param`` lookup (``secrets.get(id).get(k)``) out.
+                if render is not None:
+                    param_origins = {
+                        ("param", o[1], None, None)
+                        for o in argtaint
+                        if isinstance(o, tuple) and o[0] == "iterparam"
+                    }
+                    if param_origins:
+                        sink_type, site = render[0], render[1:]
+                        handler.sink(
+                            call, param_origins, "via", "config builder",
+                            None, sink_type=sink_type, write_node=call,
+                            sink_site=site,
+                        )
+
 
     def _visit_if(self, stmt: ast.If, ctx: Context, handler: Handler) -> None:
         """Walk an ``if``, applying ``isinstance``-to-ordered narrowing to the body.
@@ -1148,9 +1377,20 @@ class FunctionAnalyzer:
             and isinstance(stmt.target, ast.Tuple)
             and len(stmt.target.elts) >= 2
         ):
-            pick = _as_local_sequence(self._eval(enum_arg, ctx), stmt.iter)
-            # Only genuine ordering instability, not a bare parameter: enumerating a
-            # plain param is the caller's ordering contract, not a concrete flap here.
+            # ``e`` is the *element at position idx*. A concrete unordered source ->
+            # ``element`` (the unambiguous value-position pick, so a field read
+            # ``e["url"]`` inherits it via the subscript rule). A *parameter* source ->
+            # ``iterparam``: enumerating a param materialises it into positional
+            # bindings, so the value under each index is a contract-boundary pick the
+            # caller controls -- not dropped (that was a false negative), but a medium
+            # contract finding, not a concrete flap at the helper. The raw ``param``
+            # origin is filtered so a plain ``param`` still means "a value the caller
+            # passes", distinct from "positionally derived from the param".
+            raw = self._eval(enum_arg, ctx)
+            pick = _as_value_position(raw, stmt.iter)
+            for o in raw:
+                if isinstance(o, tuple) and o[0] == "param":
+                    pick.add(("iterparam", o[1], None, stmt.iter))
             pick = {o for o in pick if not (isinstance(o, tuple) and o[0] == "param")}
             if pick:
                 for value_elt in stmt.target.elts[1:]:

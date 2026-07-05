@@ -155,10 +155,21 @@ def _describe(f: Finding) -> str:
         else:
             core = f"{subject} is an unordered collection written to {target_at}."
     elif f.rule == "unordered-pick":
-        core = (
-            f"{subject} is selected by position from an unordered collection before "
-            f"reaching {target_at}, so a different element may be selected on different runs."
-        )
+        if f.origin_path and _relpath(f.origin_path) != _relpath(f.path):
+            # Re-attributed downstream of the pick (cross-file): the subject is the
+            # value that *carries* the picked element to the sink here, not the pick
+            # itself -- so don't claim it "is selected by position". The upstream
+            # trail below names where the positional pick actually happens.
+            core = (
+                f"{subject} carries a value picked by position from an unordered "
+                f"collection upstream before reaching {target_at}, so a different "
+                f"element may be selected on different runs."
+            )
+        else:
+            core = (
+                f"{subject} is selected by position from an unordered collection before "
+                f"reaching {target_at}."
+            )
     elif f.rule == "unordered-iteration":
         if f.kind == "caller":
             # Confirmed: an unordered value was traced *into* this iteration. The
@@ -168,8 +179,7 @@ def _describe(f: Finding) -> str:
             # source is born.
             core = (
                 f"{subject} is an unordered source iterated without sorted() to "
-                f"build a sequence written to {target_at}, so the sequence's element "
-                f"order can differ from one reconcile to the next."
+                f"build a sequence written to {target_at}."
             )
         else:
             # Precautionary contract boundary: we cannot see, from this function,
@@ -186,13 +196,8 @@ def _describe(f: Finding) -> str:
             # any value inside it, so don't name a single subject -- explain that the
             # builtin hash() is nondeterministic across Juju hooks.
             core = (
-                "The builtin hash() is salted per process (PYTHONHASHSEED) for str/bytes "
-                "content, so it returns a different value on every Juju hook -- each hook "
-                "is a fresh interpreter -- even when the hashed content is identical. A "
-                "hash that is persisted and compared across reconciles therefore trips "
-                "every time; sorting the content cannot fix it, because the hash() call "
-                "is the source of the randomness. Hash stable, sorted bytes with "
-                "hashlib.sha256 instead."
+                "The builtin hash() returns a different value on every Juju hook even "
+                "when the hashed content is identical. "
             )
         elif is_detector:
             core = (

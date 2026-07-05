@@ -71,6 +71,45 @@ def test_relation_units_iteration_is_unordered(lint_source):
     assert findings[0].confidence == "high"
 
 
+def test_self_units_is_not_mistaken_for_relation_units(lint_source):
+    # ``self.units`` on the charm's own class is a bare-name collision with the ops
+    # ``Relation.units`` set. Since ``self`` resolves to a known user class that does
+    # not declare ``units`` as a set field, the framework guess must be suppressed --
+    # a charm's own unit count / ordered value is not an unordered ops collection.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def __init__(self):
+                self.units = ["a", "b", "c"]
+
+            def _on_changed(self, event):
+                self.relation.data[self.app]["u"] = json.dumps(self.units)
+        """
+    )
+    assert findings == []
+
+
+def test_self_units_still_unordered_when_declared_as_a_set(lint_source):
+    # ...but if the class actually declares ``units`` as a set field, the read is
+    # genuinely unordered and must still fire (deferring to ``class_set_fields``).
+    findings = lint_source(
+        """
+        import json
+        from typing import Set
+
+        class Charm:
+            units: Set[str]
+
+            def _on_changed(self, event):
+                self.relation.data[self.app]["u"] = json.dumps(self.units)
+        """
+    )
+    assert len(findings) == 1
+    assert findings[0].confidence == "high"
+
+
 def test_loop_accumulator_inherits_unordered_source(lint_source):
     findings = lint_source(
         """

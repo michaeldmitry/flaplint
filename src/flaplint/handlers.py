@@ -164,6 +164,27 @@ def _variable(node: ast.AST) -> str:
             if name:
                 return name
         return ""
+    # A method call whose receiver is itself a call has no readable variable at the
+    # root of its chain: ``Path(d).glob("*")`` would otherwise be named after the
+    # constructor ``Path`` rather than the unordered operation. There is no variable
+    # to name, so show the *whole expression* -- what a user would have to wrap in
+    # ``sorted()`` -- rendered from source (``ast.unparse``, 3.9+; on 3.8 fall back to
+    # the method name ``glob``).
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Call)
+    ):
+        if hasattr(ast, "unparse"):
+            try:
+                snippet = ast.unparse(node)
+            except Exception:
+                snippet = ""
+            if snippet:
+                return snippet if len(snippet) <= 70 else snippet[:67] + "…"
+        attr = astutils.final_attr(node.func)
+        if attr:
+            return attr
     name = astutils.root_name(node)
     if name in ("self", "cls"):
         # A deep ``self``/``cls``-rooted access whose root_name is the useless
@@ -318,7 +339,7 @@ class SummaryHandler(Handler):
             self.fi.iter_params[idx] = site
             self.changed = True
 
-    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None) -> None:
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None, sink_site=None) -> None:
         # Databag, secret and on-disk *file* writes fold into *parameter* summaries:
         # each is a byte-compared destination (a Juju store, or a config file a
         # workload diffs to decide whether to restart), so a helper that writes a
@@ -332,7 +353,10 @@ class SummaryHandler(Handler):
             return
         marker = "direct" if kind == "direct" else "via"
         wn = write_node or node
-        site = (
+        # ``sink_site`` overrides the write location when the real write is elsewhere
+        # (a builder absorb: the value enters at ``add_component`` here but is written
+        # downstream by ``push(config.build())`` in another file).
+        site = sink_site or (
             self.fi.path,
             getattr(wn, "lineno", 0),
             getattr(wn, "col_offset", 0),
@@ -522,9 +546,11 @@ class ReportHandler(Handler):
         via = "" if func == self.fi.name else func
         return (path, line, via)
 
-    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None) -> None:
+    def sink(self, node, origins, kind, desc, arg, sink_type="databag", write_node=None, sink_site=None) -> None:
         # ``write_node`` pins the exact databag write for the downstream pointer;
         # falls back to ``node`` (the write and the statement usually coincide).
+        # ``sink_site`` (a builder's downstream render-write location) is consumed only
+        # in the summary pass, so it is accepted and ignored here.
         write_node = write_node or node
         # Only locally-born unstable values are concrete bugs at this site;
         # parameter-only flows are reported on the helper that owns the sink.
@@ -588,29 +614,51 @@ class ReportHandler(Handler):
             return
         if has_element(origins):
             # Value-position instability: a value picked by *position* from an
-            # unordered collection (``addrs[0]``). It survives key-sorting, so the
-            # serializer / write site is NOT where to fix it. Report *at the pick*
-            # (its own file:line), not at the blameless sink.
-            site_path, site_node = min(
-                (
-                    (o[1] or self.fi.path, o[2])
-                    for o in origins
-                    if is_element(o)
-                ),
-                key=_loc_key,
-            )
-            self.out.append(
-                (
-                    site_node,
-                    "high",
-                    "unordered-pick",
-                    sink_type,
-                    _variable(site_node),
-                    site_path,
-                    None,
-                    (getattr(write_node, "path", self.fi.path), write_node),  # write is downstream of the pick
+            # unordered collection (``addrs[0]``, or an ``enumerate`` value target).
+            # It survives key-sorting, so the serializer / write site is NOT where to
+            # fix it. Report *at each distinct pick* (its own file:line), not at the
+            # blameless sink -- one finding per pick site (two ``enumerate`` loops over
+            # the same source are two places a ``sorted()`` is needed), each carrying
+            # the born-site of its underlying unordered value (4th slot) so the finding
+            # still points ``origin=`` at where the value was created.
+            sites = {}
+            for o in origins:
+                if is_element(o):
+                    site = (o[1] or self.fi.path, o[2])
+                    sites.setdefault(_loc_key(site), (site, o[3]))
+            for (site_path, site_node), born in sorted(
+                sites.values(), key=lambda s: _loc_key(s[0])
+            ):
+                # Cross-file pick: the value was picked by position in *another* file
+                # (a vendored lib the charm only consumes), but the charm author's
+                # actionable site is their own use here -- anchor at this consuming
+                # site (``node``) and point ``origin=`` upstream at the pick, mirroring
+                # the itercaller branch below. A same-file pick keeps the original
+                # "report at the pick" behaviour.
+                if site_path != self.fi.path:
+                    anchor_node, anchor_path = node, self.fi.path
+                    var = _variable(arg) if arg is not None else _variable(node)
+                    origin = (
+                        site_path,
+                        getattr(site_node, "lineno", 0),
+                        _variable(site_node),
+                    )
+                else:
+                    anchor_node, anchor_path = site_node, site_path
+                    var = _variable(site_node)
+                    origin = self._born_origin(born)
+                self.out.append(
+                    (
+                        anchor_node,
+                        "high",
+                        "unordered-pick",
+                        sink_type,
+                        var,
+                        anchor_path,
+                        origin,
+                        (getattr(write_node, "path", self.fi.path), write_node),  # write is downstream of the pick
+                    )
                 )
-            )
             return
         if has_itercaller(origins):
             # Confirmed iteration instability: either a traced unstable argument
@@ -640,15 +688,35 @@ class ReportHandler(Handler):
             for (site_path, site_node), born in sorted(
                 sites.values(), key=lambda s: _loc_key(s[0])
             ):
+                # Cross-file materialization: the sequence was built in *another* file
+                # -- a vendored lib the charm only consumes (``send_loki_logs()`` ->
+                # the lib's ``loki_endpoints``). Pointing the finding into the lib is
+                # right for ``sorted()`` there, but the charm author's actionable site
+                # is their own use here, so anchor at this consuming site (``node``)
+                # and point ``origin=`` upstream at the materialization. A same-file
+                # materialization keeps the original "report at the ``list(...)``"
+                # behaviour.
+                if site_path != self.fi.path:
+                    anchor_node, anchor_path = node, self.fi.path
+                    var = _variable(arg) if arg is not None else _variable(node)
+                    origin = (
+                        site_path,
+                        getattr(site_node, "lineno", 0),
+                        _variable(site_node),
+                    )
+                else:
+                    anchor_node, anchor_path = site_node, site_path
+                    var = _variable(site_node)
+                    origin = self._born_origin(born)
                 self.out.append(
                     (
-                        site_node,
+                        anchor_node,
                         "high",
                         "unordered-iteration",
                         sink_type,
-                        _variable(site_node),
-                        site_path,
-                        self._born_origin(born),
+                        var,
+                        anchor_path,
+                        origin,
                         (getattr(write_node, "path", self.fi.path), write_node),  # write is downstream of the iteration
                     )
                 )

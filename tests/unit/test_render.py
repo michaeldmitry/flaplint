@@ -246,6 +246,35 @@ def test_upstream_iteration_description_omits_redundant_fix_hint():
     assert "994" in text  # still shows where it lands
 
 
+def test_reattributed_pick_description_does_not_call_the_subject_the_pick():
+    # A cross-file re-attributed ``unordered-pick`` anchors at the *consuming* value
+    # (``config``, a rendered blob), not at the positional pick (which is upstream).
+    # So the description must not claim ``config`` "is selected by position" -- it
+    # *carries* an upstream pick. Discriminated by origin_path being a different file.
+    f = Finding(
+        path="src/charm.py", line=637, col=13, kind="caller", confidence="high",
+        rule="unordered-pick", sink="file", variable="config",
+        origin_path="src/vector.py", origin_line=247, via="loki_endpoints",
+    )
+    text = _describe_of(f)
+    assert "config` carries a value picked by position" in text
+    assert "config` is selected by position" not in text
+    assert "Fix at the source" in text
+
+
+def test_same_file_pick_description_still_names_the_subject_as_the_pick():
+    # A same-file pick anchors *at* the pick, so the subject genuinely is the
+    # positionally-selected value -- keep the direct "is selected by position" wording.
+    f = Finding(
+        path="charm.py", line=10, col=5, kind="caller", confidence="high",
+        rule="unordered-pick", sink="databag", variable="addr",
+        origin_path="charm.py", origin_line=8,
+    )
+    text = _describe_of(f)
+    assert "addr` is selected by position" in text
+    assert "carries a value picked by position" not in text
+
+
 def test_confirmed_iteration_description_does_not_blame_the_caller():
     # A ``kind=caller`` iteration finding is *confirmed* here -- the source was
     # traced -- so it must not hedge with "if a caller passes an unordered

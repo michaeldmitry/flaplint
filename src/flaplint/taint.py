@@ -10,7 +10,7 @@ with different settings never interfere.
 from __future__ import annotations
 
 import ast
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 
 from . import astutils
 from .constants import (
@@ -79,11 +79,21 @@ def _as_value_position(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     likewise demoted to a *pick*: subscripting it selects one position-dependent
     element, which reports as ``unordered-pick`` at the subscript rather than as a
     whole-sequence ``unordered-iteration``.
+
+    The born-site of the underlying unordered value is carried in the 4th slot --
+    ``(born_path, born_node, born_func)`` for a ``local``, or the trail already on an
+    ``itercaller`` -- so a pick finding can still point ``origin=`` at the ``set()`` /
+    helper that created the churn (mirrors :func:`_as_local_sequence`).
     """
-    return {
-        ("element", None, node, None) if (is_local(o) or is_itercaller(o)) else o
-        for o in origins
-    }
+    out: Set[Origin] = set()
+    for o in origins:
+        if is_local(o):
+            out.add(("element", None, node, (o[1], o[2], o[3])))
+        elif is_itercaller(o):
+            out.add(("element", None, node, o[3]))
+        else:
+            out.add(o)
+    return out
 
 
 def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
@@ -130,6 +140,22 @@ def _promote_to_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     return out
 
 
+def _sole_set_element(elts: "list[ast.expr]") -> Optional[ast.expr]:
+    """The single element of a *provably one-element* set, else ``None``.
+
+    A one-element set has no iteration-order ambiguity -- ``{x}`` / ``set([x])`` /
+    ``frozenset((x,))`` serialize deterministically -- so it is not an unordered
+    collection. Given a collection's element list, this returns the sole element
+    when there is exactly one and it is not a ``*starred`` unpack (which may expand
+    to several). The caller then evaluates *that element's* own taint, so a
+    ``{str(uuid4())}`` still surfaces its volatile content while the empty
+    set-order ``local`` flavor is dropped.
+    """
+    if len(elts) == 1 and not isinstance(elts[0], ast.Starred):
+        return elts[0]
+    return None
+
+
 def _is_str_join(call: ast.Call) -> bool:
     """True for a ``<sep>.join(<iterable>)`` string join (not ``os.path.join``).
 
@@ -172,6 +198,9 @@ class TaintEngine:
         file_imports: Optional[Dict[str, "FileImports"]] = None,
         model_seq_fields: Optional[Dict[str, Set[str]]] = None,
         class_set_fields: Optional[Dict[str, Set[str]]] = None,
+        class_bases: Optional[Dict[str, "List[str]"]] = None,
+        value_object_fields: Optional[Dict[str, "List[str]"]] = None,
+        render_sites: Optional[Dict[str, "tuple[str, str, int, int]"]] = None,
     ) -> None:
         self.registry = registry
         #: class names flaplint has *method summaries* for -- i.e. user-defined
@@ -196,6 +225,28 @@ class TaintEngine:
         #: ``x.attr`` where ``x``'s type resolves to such a class reads as unordered
         #: (``event.certificates`` on a ``CertificatesAvailableEvent``).
         self.class_set_fields = class_set_fields or {}
+        #: class name -> base class names, so a method/property inherited from a base
+        #: resolves on a subclass receiver (``LokiPushApiConsumer(ConsumerBase)``).
+        self.class_bases = class_bases or {}
+        #: every class flaplint actually has a *definition* for -- one with a collected
+        #: method (``_method_classes``) or a recorded base. A receiver precisely typed
+        #: to a class *absent* here is an external library type (``lightkube``'s
+        #: ``KubernetesResourceManager``); a same-name method call on it must not fall
+        #: back to the union of unrelated user methods (see ``_resolve_methods``).
+        self._analyzed_classes = self._method_classes | set(self.class_bases)
+        #: value-object class name -> its fields in constructor (declaration) order,
+        #: so ``_ctor_field_taint`` can map a *positional* construction argument to
+        #: the field it fills -- exactly as a keyword one -- but only for a class
+        #: known to be a value bag (dataclass / pydantic / NamedTuple), never a
+        #: stateful collaborator built positionally.
+        self.value_object_fields = value_object_fields or {}
+        #: builder class -> ``(sink_type, path, line, col)`` of the byte-sink write that
+        #: renders its state. Gives a builder-absorb finding its real sink *type* (file /
+        #: databag / secret -- not an assumed ``file``) and *location* (the
+        #: ``push(config.build())`` write, not the ``add_component`` commit). A builder
+        #: absent here is never rendered to a byte-sink, so its setter is not a contract
+        #: sink at all -- both the type gate and the location come from this map.
+        self.render_sites = render_sites or {}
         #: variable name -> class name for the function currently being analysed
         #: (params by annotation, locals by constructor). Set per ``eval`` entry by
         #: the traversal so an attribute read can resolve its receiver's class.
@@ -324,7 +375,36 @@ class TaintEngine:
         if isinstance(node, ast.Name):
             return set(env.get(node.id, ()))
 
-        if isinstance(node, (ast.Set, ast.SetComp)):
+        if isinstance(node, ast.Set):
+            # A set *literal* with a single element has no ordering ambiguity: ``{x}``
+            # iterates deterministically, so it is not an unordered collection (the
+            # ``{auth_url}`` / ``{backend_url}`` idiom). It still carries its element's
+            # own taint -- ``{str(uuid4())}`` stays volatile -- but not set-order
+            # ``local``. A multi-element literal is genuinely hash-unstable.
+            sole = _sole_set_element(node.elts)
+            if sole is not None:
+                return self.eval(sole, env, cls_ctx, _depth + 1)
+            return {("local", None, node, None)}
+
+        if isinstance(node, ast.SetComp):
+            # A set comprehension that provably yields a single element -- one
+            # generator, no ``if`` filter, iterating a one-element collection literal
+            # (``{f(x) for x in [v]}``) -- is order-stable like a ``{x}`` literal. Drop
+            # the set-order ``local`` but keep the residual taint of the source element
+            # and of the body expression (``{str(uuid4()) for _ in [1]}`` stays
+            # volatile). Anything else stays a genuine unordered collection.
+            gens = node.generators
+            if (
+                len(gens) == 1
+                and not gens[0].ifs
+                and not gens[0].is_async
+                and isinstance(gens[0].iter, (ast.List, ast.Tuple, ast.Set))
+                and _sole_set_element(gens[0].iter.elts) is not None
+            ):
+                sole = _sole_set_element(gens[0].iter.elts)
+                return self.eval(node.elt, env, cls_ctx, _depth + 1) | self.eval(
+                    sole, env, cls_ctx, _depth + 1
+                )
             return {("local", None, node, None)}
 
         if isinstance(node, ast.DictComp):
@@ -406,25 +486,41 @@ class TaintEngine:
                 return _as_value_position(
                     self.eval(node.value, env, cls_ctx, _depth + 1), node
                 )
-            # A key read *off a value-position pick* inherits the pick: if the whole
-            # object was selected by position from an unstable collection
-            # (``list(peers)[0]``), then every field of it (``[0]["ip"]``, and any
-            # depth of chaining) is equally position-dependent. Only ``element``
-            # propagates -- a plain param/local dict stays field-sensitive (its
-            # individual keys are order-stable), so the guard that keeps
-            # ``config["endpoint"]`` clean is untouched. Mirrors ``x.get("ip")``,
-            # which already inherits the receiver's taint via the method-call path:
-            # the subscript spelling must not decide whether the flap is seen.
+            # A key read *off a positionally-derived element* inherits the pick: if
+            # the whole object was selected by position from an unstable collection
+            # (``list(peers)[0]``) or bound by ``enumerate`` (``for i, e in
+            # enumerate(seq): e["url"]``), then every field of it (``["ip"]``, and any
+            # depth of chaining) is equally position-dependent. ``element`` (a concrete
+            # pick) and ``iterparam`` (the same off a *parameter* the caller controls)
+            # propagate. ``itercaller`` deliberately does NOT: it is also what a *dict
+            # literal* carries when one of its values is a materialized sequence
+            # (``{"jobs": list(set(x)), "name": "fixed"}``), and a sibling-key read off
+            # such a container (``cfg["name"]``) must stay field-sensitive. The
+            # enumerate/pick element cases are seeded as ``element``, so they ride the
+            # unambiguous flavor; a plain ``param``/local dict stays clean.
             return {
                 o
                 for o in self.eval(node.value, env, cls_ctx, _depth + 1)
-                if is_element(o)
+                if is_element(o) or is_iterparam(o)
             }
 
         if isinstance(node, ast.Attribute):
-            # ``relation.units`` and friends are unordered ops collections.
+            # ``relation.units`` and friends are unordered ops collections. This is
+            # a *bare-name* recognizer: ops framework types (``Relation``) are never
+            # collected (flaplint is stdlib-only), so an untyped ``relation``
+            # receiver can only be matched by attribute name. But when the receiver
+            # is ``self``/``cls`` -- resolvable to a *known user class* -- the
+            # framework guess is wrong: fire only if that class actually declares
+            # the field as a set (via ``class_set_fields``), so a charm's own
+            # ``self.units`` (a unit count, a property) is not mistaken for the ops
+            # ``Relation.units``. Any other receiver keeps the untyped fallback.
             if node.attr in UNORDERED_ATTRS:
-                return {("local", None, node, None)}
+                recv = node.value
+                is_self = isinstance(recv, ast.Name) and recv.id in ("self", "cls")
+                if not (is_self and cls_ctx):
+                    return {("local", None, node, None)}
+                if node.attr in self.class_set_fields.get(cls_ctx, ()):
+                    return {("local", None, node, None)}
             # A ``Set``/``frozenset``-typed attribute on a known class -- e.g.
             # ``event.certificates`` where ``event: CertificatesAvailableEvent`` --
             # is unordered, so joining/serialising it without ``sorted()`` flaps.
@@ -487,11 +583,23 @@ class TaintEngine:
         if name in SANITIZER_CALLS:
             return set()
         if name in UNORDERED_CALLS:
-            # An *empty* collection constructor (``set()`` / ``frozenset()`` with
-            # no arguments) has a single, stable serialization -- it cannot
-            # reshuffle. Only a populated collection inherits hash-seed ordering.
-            if name in ("set", "frozenset") and not call.args and not call.keywords:
-                return set()
+            if name in ("set", "frozenset"):
+                # An *empty* constructor (``set()`` / ``frozenset()``) has a single,
+                # stable serialization -- it cannot reshuffle. And a single-element
+                # collection literal argument (``set([x])`` / ``frozenset((x,))``) is
+                # a one-element set: no ordering ambiguity, so carry the element's own
+                # taint rather than set-order ``local`` (mirrors the ``{x}`` literal).
+                if not call.args and not call.keywords:
+                    return set()
+                if (
+                    len(call.args) == 1
+                    and not call.keywords
+                    and isinstance(call.args[0], (ast.List, ast.Tuple, ast.Set))
+                ):
+                    sole = _sole_set_element(call.args[0].elts)
+                    if sole is not None:
+                        return self.eval(sole, env, cls_ctx, depth + 1)
+            # A populated collection inherits hash-seed ordering.
             return {("local", None, call, None)}
         if name in VOLATILE_CALLS:
             return {"volatile"}
@@ -784,8 +892,25 @@ class TaintEngine:
         recv_cls = self._receiver_class(node.value, cls_ctx)
         if recv_cls is None:
             return set()
+        chain = self._class_chain(recv_cls)
         out: Set[Origin] = set()
         for fi in self.registry.get(node.attr, ()):
-            if fi.is_property and fi.class_name == recv_cls:
+            if fi.is_property and fi.class_name in chain:
                 out |= self._summary_return_origins(fi, node)
         return out
+
+    def _class_chain(self, cls: Optional[str]) -> Set[str]:
+        """``cls`` plus its transitive base classes (for inherited method/property
+        resolution). Bounded by a ``seen`` set against cyclic/self-referential bases.
+        """
+        if not cls:
+            return set()
+        seen: Set[str] = set()
+        stack = [cls]
+        while stack:
+            c = stack.pop()
+            if c in seen:
+                continue
+            seen.add(c)
+            stack.extend(self.class_bases.get(c, ()))
+        return seen

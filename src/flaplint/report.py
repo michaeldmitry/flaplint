@@ -14,7 +14,11 @@ from __future__ import annotations
 import ast
 from typing import Dict, List, Set, Tuple
 
-from .constants import ORDERED_ANNOTATIONS, UNORDERED_ANNOTATIONS
+from .constants import (
+    DEFINITELY_UNORDERED_ANNOTATIONS,
+    ORDERED_ANNOTATIONS,
+    UNORDERED_ANNOTATIONS,
+)
 from .handlers import ReportHandler
 from .model import Finding, FuncInfo, Gap
 from .traversal import FunctionAnalyzer
@@ -33,8 +37,9 @@ def _grade_param(ann: "str | None") -> "str | None":
 
     ``None`` -> not a contract-boundary the helper owns: an ordered/mapping type
     (the caller's responsibility) or an opaque object type (no ``sorted()`` fix
-    applies). Otherwise ``high`` for a known-unordered annotation, ``medium`` for
-    an unannotated or genuinely-unknown one.
+    applies). Otherwise ``high`` only for a *definitely*-unordered annotation (the
+    set family), ``medium`` for an ambiguous iterable/view (``Iterable`` admits
+    ``list``), an unannotated, or a genuinely-unknown one.
     """
     if ann in ORDERED_ANNOTATIONS:
         return None
@@ -45,7 +50,7 @@ def _grade_param(ann: "str | None") -> "str | None":
         and ann[:1].isupper()
     ):
         return None  # a concrete object type, not a collection a caller can sort
-    return "high" if ann in UNORDERED_ANNOTATIONS else "medium"
+    return "high" if ann in DEFINITELY_UNORDERED_ANNOTATIONS else "medium"
 
 
 def report(
@@ -57,7 +62,7 @@ def report(
     """Produce the deduplicated, suppression-aware findings (and, optionally, gaps)."""
     findings: List[Finding] = []
     gaps: List[Gap] = []
-    seen: Set[Tuple[str, int, int, str, str]] = set()
+    seen: Set[Tuple] = set()
 
     def emit(
         path: str,
@@ -77,7 +82,22 @@ def report(
         # Include ``sink`` so a value that reaches *two* stores at the same spot
         # (a param written to both a databag and a secret) yields one finding per
         # store -- they're distinct churn sources with distinct fixes.
-        key = (path, line, col, kind, sink)
+        #
+        # Include the upstream *origin* too, but only when it is away from this
+        # anchor (a re-attributed cross-file pick/iteration, whose finding sits at
+        # the consuming write rather than at its own fix site). Two independent
+        # unstable sources that both flow into the *same* write collapse to one
+        # ``(path, line, col, kind, sink)`` otherwise -- and only one origin
+        # survives, hiding the second (e.g. postgresql's ``get_standby_endpoints``
+        # is masked by ``_peer_members_ips`` at the same ``patroni.yaml`` render).
+        # Each needs its own ``sorted()`` at its own source, so they are distinct
+        # findings. Same-source duplicates (identical/absent origin) still collapse.
+        origin_key = (
+            (origin[0], origin[1])
+            if origin and (origin[0], origin[1]) != (path, line)
+            else None
+        )
+        key = (path, line, col, kind, sink, origin_key)
         if key in seen:
             return
         seen.add(key)
@@ -202,6 +222,27 @@ def report(
         if site in confirmed_iter:
             continue  # a traced caller already reported this iteration at high conf
         emit(ipath, inode, "sink", conf, "unordered-iteration", "databag", pname)
+
+    # Collapse a bare (no-origin) finding into a sibling that carries a concrete
+    # upstream origin at the same anchor: they are the same flow whose provenance
+    # merely resolved differently on two downstream paths (e.g. one iteration
+    # reaching two databag writes -- one path names the born helper, the other
+    # doesn't). Distinct *non-empty* origins are kept: those are genuinely separate
+    # sources feeding one write (postgresql's patroni.yaml fed by both
+    # ``_peer_members_ips`` and ``get_standby_endpoints``), each needing its own
+    # sorted(). The streaming dedup above already keeps one finding per distinct
+    # origin; this only drops the redundant origin-less twin.
+    with_origin = {
+        (f.path, f.line, f.col, f.kind, f.sink)
+        for f in findings
+        if f.origin_path
+    }
+    findings = [
+        f
+        for f in findings
+        if f.origin_path
+        or (f.path, f.line, f.col, f.kind, f.sink) not in with_origin
+    ]
 
     # A gap on a line that already produced a finding is redundant -- the finding
     # already tells you to look there. Drop those, and de-duplicate the rest.

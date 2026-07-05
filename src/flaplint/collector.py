@@ -13,6 +13,7 @@ from typing import Dict, List, Optional, Set
 
 from . import astutils
 from .constants import (
+    ACCUMULATOR_METHODS,
     SEQUENCE_FIELD_ANNOTATIONS,
     UNORDERED_ANNOTATIONS,
     UNORDERED_RETURN_ANNOTATIONS,
@@ -32,11 +33,18 @@ class Collector(ast.NodeVisitor):
         file_imports: Optional[Dict[str, FileImports]] = None,
         model_seq_fields: Optional[Dict[str, Set[str]]] = None,
         class_set_fields: Optional[Dict[str, Set[str]]] = None,
+        class_bases: Optional[Dict[str, List[str]]] = None,
+        value_object_fields: Optional[Dict[str, List[str]]] = None,
     ) -> None:
         self.path = path
         self.primary = primary
         self.registry = registry
         self.attr_types = attr_types
+        #: class name -> its base class names (``LokiPushApiConsumer`` ->
+        #: ``["ConsumerBase"]``), so a method/property inherited from a base resolves
+        #: on a subclass receiver -- the ``loki_consumer.loki_endpoints`` idiom where
+        #: the property lives on ``ConsumerBase``.
+        self.class_bases = class_bases if class_bases is not None else {}
         #: pydantic-model class name -> sequence-typed field names, so a set
         #: coerced into such a field is promoted ``local`` -> ``itercaller``.
         self.model_seq_fields = model_seq_fields if model_seq_fields is not None else {}
@@ -44,6 +52,15 @@ class Collector(ast.NodeVisitor):
         #: ``x.attr`` (where ``x``'s type is known) is treated as unordered -- e.g.
         #: ``event.certificates`` on a ``CertificatesAvailableEvent``.
         self.class_set_fields = class_set_fields if class_set_fields is not None else {}
+        #: *value-object* class name -> its declared fields in constructor order
+        #: (dataclass / pydantic / NamedTuple). Lets a *positional* construction
+        #: (``ScrapeJobContext(job)``) map its args to fields the same way a keyword
+        #: one (``ScrapeJobContext(updated_job=job)``) does -- but only for a class
+        #: known to be a value bag, so a stateful collaborator built positionally
+        #: (``ClusterProvider(frozenset(roles), ...)``) is *not* absorbed.
+        self.value_object_fields = (
+            value_object_fields if value_object_fields is not None else {}
+        )
         self.functions: List[FuncInfo] = []
         self.class_stack: List[str] = []
         #: this file's import aliases, filled as ``import``/``from`` are visited.
@@ -106,10 +123,115 @@ class Collector(ast.NodeVisitor):
         ) in UNORDERED_RETURN_ANNOTATIONS:
             fi.returns_unordered = True
             fi.unordered_site = (self.path, node, fi.name)
+        fi.returns_class = astutils.annotation_root(getattr(node, "returns", None))
+        if is_method:
+            fi.absorbs = self._compute_absorbs(node, fi.param_index)
+            fi.returns_self_attrs = self._compute_returns_self_attrs(node)
         self.registry.setdefault(fi.name, []).append(fi)
         self.functions.append(fi)
         if cls_name:
             self._record_member_types(node, cls_name, annotations)
+
+    @staticmethod
+    def _compute_absorbs(node: ast.AST, param_index: Dict[str, int]) -> Dict[int, str]:
+        """Parameters this method stores into ``self.<attr>`` state (as a taint container).
+
+        Detects the setter/accumulator shape that makes a class a taint *container*:
+
+        * ``self.<attr> = <v>`` / ``self.<attr>[...] = <v>``  -- attr/subscript-assign;
+        * ``self.<attr>.append/extend/update/add/setdefault(<param>)`` -- accumulator.
+
+        The stored value ``<v>`` counts a parameter as absorbed when it *carries* the
+        param's content taint without laundering it: the bare param (``= config``), the
+        param as an element of a container literal (``= {"cfg": config}``), or wrapped
+        in an order-preserving constructor (``= dict(config)``). A launderer
+        (``= sorted(config)``) carries nothing. Returns ``{param_index -> attr}``.
+        """
+        #: order-preserving pass-through constructors -- a param wrapped in one still
+        #: flows its (dis)order in; ``sorted`` is deliberately absent.
+        wrappers = {"dict", "list", "tuple", "set", "frozenset", "copy", "deepcopy", "reversed"}
+
+        def self_attr_root(tgt: ast.AST) -> Optional[str]:
+            cur = tgt
+            while isinstance(cur, ast.Subscript):
+                cur = cur.value
+            if (
+                isinstance(cur, ast.Attribute)
+                and isinstance(cur.value, ast.Name)
+                and cur.value.id in ("self", "cls")
+            ):
+                return cur.attr
+            return None
+
+        def carried(value: ast.AST) -> "set[int]":
+            got: "set[int]" = set()
+            if isinstance(value, ast.Name) and value.id in param_index:
+                got.add(param_index[value.id])
+            elif isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+                for e in value.elts:
+                    if isinstance(e, ast.Name) and e.id in param_index:
+                        got.add(param_index[e.id])
+            elif isinstance(value, ast.Dict):
+                for v in value.values:
+                    if isinstance(v, ast.Name) and v.id in param_index:
+                        got.add(param_index[v.id])
+            elif (
+                isinstance(value, ast.Call)
+                and astutils.final_attr(value.func) in wrappers
+            ):
+                for a in value.args:
+                    if isinstance(a, ast.Name) and a.id in param_index:
+                        got.add(param_index[a.id])
+            return got
+
+        out: Dict[int, str] = {}
+        for stmt in ast.walk(node):
+            # ``self.<attr> = <v>`` / ``self.<attr>[...] = <v>``
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], (ast.Subscript, ast.Attribute))
+            ):
+                attr = self_attr_root(stmt.targets[0])
+                if attr is not None:
+                    for pi in carried(stmt.value):
+                        out[pi] = attr
+            # ``self.<attr>.append(<param>)`` / ``.update(<param>)`` / ...
+            elif (
+                isinstance(stmt, ast.Expr)
+                and isinstance(stmt.value, ast.Call)
+                and isinstance(stmt.value.func, ast.Attribute)
+                and stmt.value.func.attr in ACCUMULATOR_METHODS
+            ):
+                attr = self_attr_root(stmt.value.func.value)
+                if attr is not None:
+                    for a in stmt.value.args:
+                        if isinstance(a, ast.Name) and a.id in param_index:
+                            out[param_index[a.id]] = attr
+        return out
+
+    @staticmethod
+    def _compute_returns_self_attrs(node: ast.AST) -> Set[str]:
+        """``self.<attr>`` names any ``return`` in this method exposes.
+
+        A method whose return value reads ``self.<attr>`` (raw, or wrapped in a
+        serializer -- ``return yaml.safe_dump(self._config)``) exposes that attribute
+        to callers, marking the class a *renderable builder*. Gates the cross-object
+        absorb's contract-boundary sink: only a param absorbed into an attr that is
+        actually returned/rendered somewhere makes the enclosing helper a file sink.
+        """
+        out: Set[str] = set()
+        for stmt in ast.walk(node):
+            if not (isinstance(stmt, ast.Return) and stmt.value is not None):
+                continue
+            for sub in ast.walk(stmt.value):
+                if (
+                    isinstance(sub, ast.Attribute)
+                    and isinstance(sub.value, ast.Name)
+                    and sub.value.id in ("self", "cls")
+                ):
+                    out.add(sub.attr)
+        return out
 
     def _record_member_types(
         self, node: ast.AST, cls_name: str, param_annotations: Dict[str, Optional[str]]
@@ -153,6 +275,13 @@ class Collector(ast.NodeVisitor):
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
         self._record_model_seq_fields(node)
         self._record_class_set_fields(node)
+        self._record_value_object_fields(node)
+        bases = [b for b in (astutils.final_attr(x) for x in node.bases) if b]
+        if bases:
+            self.class_bases.setdefault(node.name, [])
+            for b in bases:
+                if b not in self.class_bases[node.name]:
+                    self.class_bases[node.name].append(b)
         self.class_stack.append(node.name)
         self.generic_visit(node)
         self.class_stack.pop()
@@ -230,6 +359,43 @@ class Collector(ast.NodeVisitor):
         }
         if fields:
             self.model_seq_fields.setdefault(node.name, set()).update(fields)
+
+    #: Decorators / bases that mark a class as a *value object* -- a bag of fields
+    #: whose constructor stores them positionally (in declaration order) as its
+    #: state. ``dataclass``/``attr.s``/``attrs``/``define``/``frozen`` decorators; a
+    #: ``BaseModel`` / ``NamedTuple`` base. A plain class (a stateful collaborator)
+    #: is deliberately absent: its positional ctor args are config, not fields.
+    _VALUE_OBJECT_DECORATORS = {"dataclass", "define", "frozen", "s", "attrs", "attrib"}
+    _VALUE_OBJECT_BASES = {"BaseModel", "NamedTuple"}
+
+    def _record_value_object_fields(self, node: ast.ClassDef) -> None:
+        """Record a value object's fields in declaration (= constructor) order.
+
+        A ``@dataclass`` / pydantic / ``NamedTuple`` synthesises an ``__init__``
+        whose positional parameters are the class-level annotated fields, in order.
+        Capturing that order lets ``_ctor_field_taint`` map a *positional* argument
+        to the field it fills -- so ``ScrapeJobContext(job)`` is absorbed exactly
+        like ``ScrapeJobContext(updated_job=job)``. Gated to value objects so a
+        stateful collaborator (a plain class) is never absorbed from its positional
+        (config) arguments -- that would re-taint the object and, via the receiver-
+        inheritance rule, mis-flag every unrelated method call on it.
+        """
+        decorated = any(
+            astutils.final_attr(d) in self._VALUE_OBJECT_DECORATORS
+            for d in getattr(node, "decorator_list", [])
+        )
+        based = any(
+            astutils.final_attr(b) in self._VALUE_OBJECT_BASES for b in node.bases
+        )
+        if not (decorated or based):
+            return
+        fields = [
+            stmt.target.id
+            for stmt in node.body
+            if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name)
+        ]
+        if fields:
+            self.value_object_fields.setdefault(node.name, fields)
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._add_function(node)

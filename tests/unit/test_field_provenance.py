@@ -194,6 +194,100 @@ def test_pydantic_model_dump_of_unstable_list_field_is_flagged(lint_source):
     assert any(f.kind == "caller" and f.sink == "databag" for f in findings)
 
 
+def test_positional_ctor_arg_to_a_collaborator_does_not_taint_its_methods(lint_source):
+    # A stateful collaborator constructed with an unordered *positional* arg
+    # (``ClusterProvider(frozenset(roles), ...)``) is not a value bag: the arg
+    # configures it, it does not become its serialised content. So an unrelated
+    # method call on it (``.grant_privkey()`` -> a secret id) must NOT inherit the
+    # arg's instability. Only *keyword* ctor args (the ``Model(field=...)`` value-
+    # object idiom) carry field taint; positional args do not.
+    findings = lint_source(
+        """
+        class Prov:
+            def grant_privkey(self, label):
+                return "secret-id-string"
+
+        class Charm:
+            def __init__(self, rc):
+                self.cluster = Prov(frozenset(rc.roles))
+            def publish(self):
+                self.relation.data[self.app]["k"] = self.cluster.grant_privkey("x")
+        """
+    )
+    assert findings == []
+
+
+def test_keyword_ctor_field_still_taints_a_dataclass_view_method(lint_source):
+    # Counterpart to the positional guard: a dataclass built with a *keyword* field
+    # from unordered data, whose view method folds that field into its result, still
+    # flaps at the databag (the cos-proxy ``ScrapeJobContext(updated_job=...)`` ->
+    # ``get_updated_jobs()`` -> ``json.dumps`` shape). Keyword ctor taint is kept.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Any, Dict, List
+
+        @dataclass
+        class Ctx:
+            updated_job: Dict[str, Any] = field(default_factory=dict)
+            def get_updated_jobs(self, existing: List) -> List:
+                jobs = list(existing)
+                jobs.append(self.updated_job)
+                return jobs
+
+        class Charm:
+            def _targets(self, rel):
+                t = {}
+                for u in rel.units:
+                    t[u.name] = rel.data[u]["host"]
+                return t
+            def publish(self, rel):
+                updated = build_job(self._targets(rel))
+                ctx = Ctx(updated_job=updated)
+                jobs = ctx.get_updated_jobs([])
+                rel.data[self.app]["scrape_jobs"] = json.dumps(jobs)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_positional_ctor_field_taints_a_known_value_object(lint_source):
+    # The value-object idiom works *positionally* too: a ``@dataclass`` field filled
+    # by position (``Ctx(updated)``) maps to the declared field the same way the
+    # keyword form does, because the class is a known value object (its fields are
+    # its constructor's positional params). Distinguishes it from a plain collaborator
+    # (previous test), whose positional args are config and stay unabsorbed.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Any, Dict, List
+
+        @dataclass
+        class Ctx:
+            updated_job: Dict[str, Any] = field(default_factory=dict)
+            def get_updated_jobs(self, existing: List) -> List:
+                jobs = list(existing)
+                jobs.append(self.updated_job)
+                return jobs
+
+        class Charm:
+            def _targets(self, rel):
+                t = {}
+                for u in rel.units:
+                    t[u.name] = rel.data[u]["host"]
+                return t
+            def publish(self, rel):
+                updated = build_job(self._targets(rel))
+                ctx = Ctx(updated)                       # positional, not keyword
+                jobs = ctx.get_updated_jobs([])
+                rel.data[self.app]["scrape_jobs"] = json.dumps(jobs)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
 def test_model_dump_of_opaque_param_is_still_laundered(lint_source):
     # Monotonicity guard: a dump of an *opaque model parameter* carries
     # only contract-boundary uncertainty (the model's field-NAME order), which the

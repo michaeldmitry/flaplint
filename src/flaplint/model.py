@@ -306,6 +306,12 @@ class FuncInfo:
     itercaller_site: Optional[Tuple[str, ast.AST, str]] = None
     #: parameter indices whose taint flows through to the return value.
     returns_params: Set[int] = field(default_factory=set)
+    #: the class this function's ``-> Ret`` annotation names, so a local bound to its
+    #: result (``prm = _get_policy_resource_manager()``) is typed for method resolution
+    #: -- turning an untyped ``prm.reconcile(...)`` (which would hit the same-name union
+    #: and collide with an unrelated ``Nginx.reconcile``) into a precise one. ``None``
+    #: when unannotated. Only used when it names a class flaplint actually analysed.
+    returns_class: Optional[str] = None
     #: for a function that returns a *value object* (a constructed dataclass /
     #: pydantic model / NamedTuple), the per-field taint of that object: ``field
     #: name -> origins``. Lets a caller read an unstable field back off the returned
@@ -329,6 +335,23 @@ class FuncInfo:
     #: True once returns of *differing* arity were seen -- the per-position summary is
     #: then meaningless and must not be consumed (a terminal state).
     returns_tuple_unreliable: bool = False
+    #: parameter index -> the ``self.<attr>`` name this method *absorbs* it into: a
+    #: setter/accumulator that stores a param directly into the receiver's own state
+    #: (``def add_component(self, ..., config): self._config[...][name] = config`` ->
+    #: ``{3: "_config"}``). At a call site ``self.builder.add_component(..., <unstable>)``
+    #: the argument's taint is recorded onto the *callee class*'s instance attribute, so
+    #: a later state-returning method on that class (``build()`` -> ``yaml.safe_dump(
+    #: self._config)``) surfaces it -- the cross-object config-builder chain. Kept
+    #: conservative (value must be the bare parameter, target a ``self``-rooted
+    #: subscript/accumulator) so it models a pass-through container, not a transform.
+    absorbs: Dict[int, str] = field(default_factory=dict)
+    #: ``self.<attr>`` names this method's *return* exposes (``build(): return
+    #: yaml.safe_dump(self._config)`` -> ``{"_config"}``). Marks a class as a
+    #: *renderable builder*: absorbing an order-dependent parameter (``iterparam``)
+    #: into one of these attrs is a contract-boundary file sink, so a caller passing an
+    #: unsorted value is flagged. The gate that keeps a private, never-returned cache's
+    #: setter from becoming a false sink.
+    returns_self_attrs: Set[str] = field(default_factory=set)
 
 
 #: Function table keyed by *bare* name (``"as_dict"``), since a call site only

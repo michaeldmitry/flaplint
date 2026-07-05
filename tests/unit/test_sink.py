@@ -1186,6 +1186,22 @@ def test_str_annotated_file_content_param_is_not_a_helper_sink(lint_source):
     assert [f for f in findings if f.kind == "sink"] == []
 
 
+def test_bytearray_annotated_file_content_param_is_not_a_helper_sink(lint_source):
+    # A ``data: bytearray`` parameter is an ordered sequence of bytes (indexed
+    # ``0..n``, like ``bytes``): its write order is deterministic and a caller cannot
+    # sort it. The ops ``pebble._process_body(data: bytearray)`` -> ``outfile.write``
+    # shape must not be graded a contract-boundary collection sink.
+    findings = lint_source(
+        """
+        class Charm:
+            def _process(self, path, data: bytearray):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+        """
+    )
+    assert [f for f in findings if f.kind == "sink"] == []
+
+
 def test_unordered_caller_into_file_wrapper_is_flagged(lint_source):
     # The end-to-end postgresql shape: a caller serialises an unordered collection
     # and hands it to a ``render_file`` wrapper that writes it to disk. Even with a

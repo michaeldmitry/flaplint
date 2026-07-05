@@ -271,6 +271,22 @@ UNORDERED_ANNOTATIONS: Set[str] = {
     "ItemsView",
 }
 
+#: The subset of :data:`UNORDERED_ANNOTATIONS` that is *definitely* unordered: the
+#: set family. A parameter of one of these types is unordered regardless of caller,
+#: so a sequence built from it and written to a sink is a *high*-confidence contract
+#: finding. The rest of :data:`UNORDERED_ANNOTATIONS` (``Iterable`` / ``Collection`` /
+#: the dict views) merely *may* be unordered -- they admit ordered types (an
+#: ``Iterable`` includes ``list``; a ``KeysView`` iterates in the dict's insertion
+#: order), so a parameter of those types grades *medium*, like an unannotated one.
+DEFINITELY_UNORDERED_ANNOTATIONS: Set[str] = {
+    "set",
+    "Set",
+    "frozenset",
+    "FrozenSet",
+    "AbstractSet",
+    "MutableSet",
+}
+
 #: Return annotations that assert the returned value is an *unordered collection*.
 #: A function/property annotated ``-> set[str]`` (or ``frozenset`` / ``AbstractSet``
 #: / ``MutableSet``) promises a set: iterating or serialising its result without
@@ -281,14 +297,7 @@ UNORDERED_ANNOTATIONS: Set[str] = {
 #: (a return-type inference asserts the value *is* unordered and drives concrete
 #: caller findings, so it must stay tight; a *parameter* of those types is only a
 #: graded contract boundary, so the broader set is safe there).
-UNORDERED_RETURN_ANNOTATIONS: Set[str] = {
-    "set",
-    "Set",
-    "frozenset",
-    "FrozenSet",
-    "AbstractSet",
-    "MutableSet",
-}
+UNORDERED_RETURN_ANNOTATIONS: Set[str] = set(DEFINITELY_UNORDERED_ANNOTATIONS)
 
 #: Parameter annotations that are ordered/irrelevant: dumping them is the
 #: caller's responsibility, so the helper itself is not at fault. Mappings live
@@ -306,6 +315,14 @@ ORDERED_ANNOTATIONS: Set[str] = {
     "Sequence",
     "str",
     "bytes",
+    # ``bytearray``/``memoryview``/``ByteString`` are ordered sequences of bytes,
+    # indexed ``0..n`` exactly like ``bytes`` -- their serialization/write order is
+    # deterministic, so a caller cannot (and need not) ``sorted()`` them. Left out
+    # here, a ``data: bytearray`` param written to a file graded as an unknown
+    # (medium) collection contract; it belongs with the ordered byte family.
+    "bytearray",
+    "memoryview",
+    "ByteString",
     "int",
     "float",
     "bool",
@@ -329,6 +346,7 @@ ISINSTANCE_ORDERED_TYPES: Set[str] = {
     "str",
     "bytes",
     "bytearray",
+    "memoryview",
     "dict",
     "int",
     "float",

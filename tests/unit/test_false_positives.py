@@ -96,6 +96,84 @@ def test_set_comprehension_joined_into_databag_is_still_flagged(lint_source):
     assert flagged and flagged[0].confidence == "high"
 
 
+def test_single_element_set_literal_is_not_unordered(lint_source):
+    # ``{x}`` has exactly one element: no iteration-order ambiguity, so serializing
+    # it is deterministic. The ``{"auth": {auth_url}}`` idiom must not be flagged.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def h(self, event):
+                self.relation.data[self.app]["u"] = json.dumps({"a": {self.addr}})
+        """
+    )
+    assert findings == []
+
+
+def test_single_element_set_constructor_is_not_unordered(lint_source):
+    # Same for the constructor spellings over a one-element collection literal:
+    # ``set([x])`` / ``frozenset((x,))`` build a singleton, not an unordered set.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def h(self, event):
+                self.relation.data[self.app]["a"] = json.dumps(set([self.addr]))
+                self.relation.data[self.app]["b"] = json.dumps(frozenset((self.addr,)))
+        """
+    )
+    assert findings == []
+
+
+def test_single_element_set_comprehension_is_not_unordered(lint_source):
+    # A set comp that provably yields one element (single generator, no filter, over a
+    # one-element literal) is order-stable like ``{x}``.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def h(self, event):
+                self.relation.data[self.app]["u"] = json.dumps(
+                    {p.strip() for p in [self.addr]}
+                )
+        """
+    )
+    assert findings == []
+
+
+def test_multi_element_set_literal_is_still_flagged(lint_source):
+    # Two distinct elements: hash-seeded iteration order is unstable, still a bug.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def h(self, event):
+                self.relation.data[self.app]["u"] = json.dumps({self.a, self.b})
+        """
+    )
+    assert len(findings) == 1
+
+
+def test_single_element_set_of_volatile_still_flagged(lint_source):
+    # Dropping set-order ``local`` must not launder the element's own instability: a
+    # singleton holding a volatile value still churns.
+    findings = lint_source(
+        """
+        import json, uuid
+
+        class Charm:
+            def h(self, event):
+                self.relation.data[self.app]["u"] = json.dumps({str(uuid.uuid4())})
+        """
+    )
+    assert len(findings) == 1
+    assert findings[0].rule == "nondeterministic"
+
+
 def test_isinstance_list_guard_makes_param_iteration_safe(lint_source):
     # A normalizer that only iterates a parameter inside `if isinstance(raw, list):`
     # is provably iterating a list there -- a caller passing a set can't reach it --
