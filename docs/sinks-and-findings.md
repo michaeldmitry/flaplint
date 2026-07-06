@@ -115,7 +115,7 @@ flowchart LR
 | `unordered-iteration` | a **list built from something unordered** (`list(some_set)`, `[… for … in …]`) — survives `sort_keys=True` | `sorted(...)` before the list is built |
 | `nondeterministic` | a value that's **different every run** (`uuid4()`, `time()`) | make it stable / don't write it to the bag |
 
-These map to the [six instability labels](taint-model.md#the-six-kinds-of-instability): `local` → `unordered-collection`, `element` → `unordered-pick`, `itercaller` and `iterparam` → `unordered-iteration`, `volatile` → `nondeterministic`.
+Each row here is one of the [patterns flaplint catches](taint-model.md#patterns-flaplint-catches) — see that page for a worked example of each, and why the fix differs between them.
 
 ### When a helper trusts its caller
 

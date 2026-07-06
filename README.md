@@ -190,7 +190,7 @@ The four write targets:
 | **pebble plan** | `container.add_layer(…)` — a changed plan triggers `replan()` and a workload restart |
 | **hash** | `sha256(content)` — a different hash fires the change-gate every reconcile |
 
-For the full story — the six instability kinds, how each serializer treats them, what gets followed through function calls, and where the analysis has blind spots — see **[docs/](docs/README.md)**.
+For the full story — every pattern it catches, how each serializer treats them, what gets followed through function calls, and where the analysis has blind spots — see **[docs/](docs/README.md)**.
 
 ---
 

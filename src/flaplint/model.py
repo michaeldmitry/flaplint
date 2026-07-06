@@ -352,6 +352,13 @@ class FuncInfo:
     #: unsorted value is flagged. The gate that keeps a private, never-returned cache's
     #: setter from becoming a false sink.
     returns_self_attrs: Set[str] = field(default_factory=set)
+    #: the ``self.<attr>`` sub-path a *pure getter* returns -- set only when every
+    #: ``return`` in the method is exactly ``return self.<attr>[.<attr>…]`` naming the
+    #: same attribute (``def _get_ctx(self): return self._ctx`` -> ``"_ctx"``). Unlike
+    #: :attr:`returns_self_attrs` (any self-attr *mentioned* in a return, including a
+    #: wrapped ``yaml.dump(self._config)``), this is the strict "the returned object
+    #: *is* that attribute" case, so a caller can treat the call as an alias of it.
+    returns_self_attr: Optional[str] = None
 
 
 #: Function table keyed by *bare* name (``"as_dict"``), since a call site only

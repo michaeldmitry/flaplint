@@ -22,7 +22,7 @@ flowchart LR
 
 flaplint's core analysis is a standard static-analysis technique called **taint analysis**: mark data from an untrusted **source**, follow it as it flows through the program, and raise an alarm if it reaches a dangerous **sink** without passing through a **sanitiser**. Classic taint analysis comes from security (source = user input; sink = SQL query; sanitiser = escaper). flaplint keeps that machinery and changes only what "tainted" *means*: here a value is tainted when it's **derived from an unordered or volatile source**. A `set` is a source, a databag is a sink, and `sorted()` is a sanitiser.
 
-What's specific to flaplint is the **abstract domain** — not one bit (tainted/not) but [six labels](taint-model.md#the-six-kinds-of-instability) describing *why* a value is unstable, because the right fix differs by kind. In particular, whether letting a serializer sort the keys is enough to save you — or whether the disorder has already been baked into a list and can only be fixed by sorting before the list is built.
+What's specific to flaplint is that "tainted" isn't one bit — it tracks *why* a value is unstable, because the right fix differs case by case. In particular, whether letting a serializer sort the keys is enough to save you, or whether the disorder has already been baked into a list and can only be fixed by sorting before the list is built. See [Patterns flaplint catches](taint-model.md#patterns-flaplint-catches) for the concrete cases.
 
 
 ## The four sinks
@@ -41,7 +41,7 @@ flowchart LR
     HASH --> WHY4["⚠ different hash → change-gate\nfires every reconcile"]
 ```
 
-Note: `file` writes are compared character-for-character (any instability matters), while `databag`, `plan`, and `hash` are compared structurally or key-first — so a bare `set` written to a plan may be harmless if pebble sorts it, but a `list(set)` is not. See [sinks-and-findings.md](sinks-and-findings.md#the-four-kinds-of-write-target) for how each sink interprets what it receives.
+Note: `file` writes are compared character-for-character (any instability matters), while `databag`, `plan`, and `hash` are compared structurally or key-first — so a bare `set` written to a plan may be harmless if pebble sorts it, but a `list(set)` is not. See [sinks-and-findings.md](sinks-and-findings.md#the-four-write-targets) for how each sink interprets what it receives.
 
 ## The pipeline
 
@@ -158,32 +158,20 @@ A `kind=sink` finding — "this function writes one of its parameters unsorted" 
 
 ## What flaplint misses
 
-flaplint follows a value as far as its code makes that possible — through local variables, function calls, return values, and one level into object fields. Past that, tracking loses the thread and the value looks stable even though it isn't. That's a **false negative**: no crash, no wrong finding, just silence where there should have been one. Nothing below produces an incorrect finding — they're all things that stay quiet when they shouldn't.
+flaplint follows a value as far as its code makes that possible — through local variables, function calls, return values, object fields (to any depth of plain attribute access, and across methods of the same object). Past that, tracking loses the thread and the value looks stable even though it isn't. That's a **false negative**: no crash, no wrong finding, just silence where there should have been one. Nothing below produces an incorrect finding — they're all things that stay quiet when they shouldn't.
 
-The common thread: **a value that takes an unusual detour on its way to a write** — through a call, an index, an untyped `self.x`, or a variable dict key — can lose flaplint partway through. A value that goes straight from where it's built to where it's written is always caught; it's the indirection in between that matters.
+The common thread: **a value that takes an unusual detour on its way to a write** — through an index or a variable dict key — can lose flaplint partway through. A value that goes straight from where it's built to where it's written is always caught; it's the indirection in between that matters.
 
-### A value rebuilt inside another method
-
-```python
-# caught — the method just hands back what it stored
-def __init__(self): self._hosts = set(self.peers)
-def reconcile(self): push(",".join(self._hosts))
-
-# missed — the method recomputes it from state flaplint can't see into
-def reconcile(self): push(",".join(self._render()))   # _render() rebuilds from self._hosts internally
-```
-
-If a helper method's *body* isn't itself traceable — because it derives its result from state in a way flaplint can't follow — the value it hands back looks stable even if it isn't. This is also why a **config-builder** pattern (components added one at a time via `builder.add(name, value)`, then assembled by a separate `builder.build()`) can slip through: the individual values are still caught wherever *they* were built (e.g. at the point a set gets enumerated into it), but the assembled whole isn't re-checked at `build()`.
-
-### A value reached through a call or an index
+### A value reached through an index
 
 ```python
 self.ctx.config.targets = set(x)   # caught — a plain chain of attributes, any depth
-self.get_ctx().targets = set(x)    # missed — a call breaks the chain
-self.items[0].targets = set(x)     # missed — an index breaks the chain
+ctx = self.get_ctx()               # caught — a getter that returns self.<attr> is
+ctx.targets = set(x)               #          followed as an alias of that attribute
+self.items[0].targets = set(x)     # missed — an index into a list breaks the chain
 ```
 
-flaplint follows a chain of plain attribute access (`self.ctx.config.targets`) to any depth, in one method or across several. But as soon as a link in that chain is a function call or a subscript instead of a plain `.attr`, tracking can't name that link as a stable slot, and the value becomes the "rebuilt inside another method" case above.
+flaplint follows a chain of plain attribute access (`self.ctx.config.targets`) to any depth, in one method or across several — including a value stored on `self` in one method and read back in another, through a builder object assembled by a separate `build()`, or through a *getter* that returns one of its own attributes (`return self._ctx`), whose result is treated as an alias of that attribute. What it still can't follow is a **subscript** in the middle of the chain: `self.items[0].targets` reaches a field on a *list element*, and which element `[0]` is isn't a stable slot flaplint can name — so a value stored there, and read back there, looks stable.
 
 ### A cross-object call through an unannotated attribute
 

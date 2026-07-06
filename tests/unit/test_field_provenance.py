@@ -572,3 +572,66 @@ def test_deep_self_field_respects_sorted(lint_source):
         """
     )
     assert [f for f in findings if f.kind == "caller"] == []
+
+
+def test_field_mutation_through_inline_getter_is_flagged(lint_source):
+    # A value reached through a *pure getter* call: ``self._get_ctx().targets = set(...)``
+    # writes into the object the getter returns (``return self._ctx``), so a later read
+    # of ``self._ctx.targets`` still sees the instability. Bridges the "value reached
+    # through a call" tracking gap for the getter-returns-self-attribute shape.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _get_ctx(self):
+                return self._ctx
+            def go(self, x):
+                self._get_ctx().targets = set(x)
+                self.relation.data[self.app]["t"] = json.dumps(list(self._ctx.targets))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_field_mutation_through_getter_aliased_local_is_flagged(lint_source):
+    # Same, via a local bound to the getter: ``ctx = self._get_ctx(); ctx.targets =
+    # set(...)`` -- the local is treated as an alias of ``self._ctx``, so the mutation
+    # is charged to the real attribute and a read of ``self._ctx.targets`` is flagged.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _get_ctx(self):
+                return self._ctx
+            def go(self, x):
+                ctx = self._get_ctx()
+                ctx.targets = set(x)
+                self.relation.data[self.app]["t"] = json.dumps(list(self._ctx.targets))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_getter_returning_a_copy_is_not_aliased(lint_source):
+    # Strictness guard: a getter that returns a *copy* of an attribute
+    # (``return list(self._ctx)``) is NOT an alias of it -- mutating the copy must not
+    # be charged back to ``self._ctx``. So writing the copy's field and then reading
+    # ``self._ctx.targets`` stays clean (the copy and the attribute are different
+    # objects). This is what distinguishes a true getter (``return self._ctx``, aliased
+    # in the tests above) from a value-returning method that merely mentions the attr.
+    findings = lint_source(
+        """
+        import json
+
+        class Charm:
+            def _get_ctx(self):
+                return list(self._ctx)
+            def go(self, x):
+                ctx = self._get_ctx()
+                ctx.targets = set(x)
+                self.relation.data[self.app]["t"] = json.dumps(list(self._ctx.targets))
+        """
+    )
+    assert not any(f.sink == "databag" for f in findings)

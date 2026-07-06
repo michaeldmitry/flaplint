@@ -127,6 +127,7 @@ class Collector(ast.NodeVisitor):
         if is_method:
             fi.absorbs = self._compute_absorbs(node, fi.param_index)
             fi.returns_self_attrs = self._compute_returns_self_attrs(node)
+            fi.returns_self_attr = self._compute_returns_self_attr(node)
         self.registry.setdefault(fi.name, []).append(fi)
         self.functions.append(fi)
         if cls_name:
@@ -232,6 +233,31 @@ class Collector(ast.NodeVisitor):
                 ):
                     out.add(sub.attr)
         return out
+
+    @staticmethod
+    def _compute_returns_self_attr(node: ast.AST) -> Optional[str]:
+        """The ``self.<attr>`` sub-path this method returns *as an alias*, or ``None``.
+
+        Strict form of :meth:`_compute_returns_self_attrs`: set only when the method is
+        a *pure getter* -- every ``return`` in it is exactly ``return self.<attr>[.<a>…]``
+        naming the same attribute path, with no wrapping call/serializer. The returned
+        object then *is* that attribute, so a caller (``ctx = self._get_ctx()``) can
+        treat the local as an alias and record a field mutation on it against the real
+        instance attribute. A wrapped return (``return list(self._x)``) or two returns
+        naming different attributes leave it ``None`` -- those are values, not aliases.
+        """
+        seen: Optional[str] = None
+        found = False
+        for stmt in ast.walk(node):
+            if not (isinstance(stmt, ast.Return) and stmt.value is not None):
+                continue
+            key = astutils.self_attr_key(stmt.value)
+            if key is None or key == "":
+                return None  # a return that isn't a bare self-attr chain -> not a getter
+            if found and key != seen:
+                return None  # returns disagree on which attribute
+            seen, found = key, True
+        return seen if found else None
 
     def _record_member_types(
         self, node: ast.AST, cls_name: str, param_annotations: Dict[str, Optional[str]]

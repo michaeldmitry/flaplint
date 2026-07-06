@@ -111,6 +111,12 @@ class Context:
     cls: Optional[str] = None  # enclosing class of the analyzed function
     #: local variable -> its databag-provenance kind (relation/relation_data/databag)
     databag_kinds: Dict[str, str] = field(default_factory=dict)
+    #: local variable -> the ``self.<attr>`` path it aliases, when it was bound from a
+    #: getter that returns exactly ``self.<attr>`` (``ctx = self._get_ctx()`` where
+    #: ``_get_ctx`` does ``return self._ctx`` -> ``{"ctx": "_ctx"}``). Lets a mutation
+    #: of a field on the alias (``ctx.targets = set(x)``) be recorded against the real
+    #: instance attribute, so a read of ``self._ctx.targets`` elsewhere still sees it.
+    self_aliases: Dict[str, str] = field(default_factory=dict)
     #: this function's parameter names (by index) and their annotations -- used by
     #: the ``--explain-gaps`` scan to grade an untraced-parameter blind spot.
     params: List[str] = field(default_factory=list)
@@ -229,6 +235,36 @@ class FunctionAnalyzer:
             ctx.dict_vars.add(target.id)
         else:
             ctx.dict_vars.discard(target.id)
+        # ``ctx = self._get_ctx()`` where ``_get_ctx`` is a pure getter (``return
+        # self._ctx``): record ``ctx`` as an alias of ``self._ctx``, so a later field
+        # mutation on it (``ctx.targets = set(x)``) is charged to the real attribute.
+        alias = self._self_getter_target(value, ctx)
+        if alias is not None:
+            ctx.self_aliases[target.id] = alias
+        else:
+            ctx.self_aliases.pop(target.id, None)
+
+    def _self_getter_target(self, value: ast.AST, ctx: Context) -> Optional[str]:
+        """``self.<attr>`` path a ``self.<getter>()`` call returns as an alias, else None.
+
+        ``self._get_ctx()`` -> ``"_ctx"`` when ``_get_ctx`` is a pure getter. Resolved on
+        the enclosing class so a same-named getter on an unrelated class can't hijack it.
+        """
+        if not (
+            isinstance(value, ast.Call)
+            and isinstance(value.func, ast.Attribute)
+            and isinstance(value.func.value, ast.Name)
+            and value.func.value.id in ("self", "cls")
+        ):
+            return None
+        for fi in self._resolve_methods(value, ctx):
+            if ctx.cls and fi.class_name and fi.class_name != ctx.cls:
+                chain = self.engine._class_chain(ctx.cls)
+                if not (chain and fi.class_name in chain):
+                    continue
+            if fi.returns_self_attr:
+                return fi.returns_self_attr
+        return None
 
     def _record_databag_alias(
         self, target: ast.AST, value: ast.AST, ctx: Context
@@ -377,12 +413,47 @@ class FunctionAnalyzer:
         the same taint to a read in a *different* method of the class.
         """
         key = astutils.self_attr_key(tgt) if ctx.cls else None
+        if key is None and ctx.cls:
+            # The target's base isn't a plain ``self.<attr>`` chain but reaches a real
+            # instance attribute through a *pure getter* -- either inline
+            # (``self._get_ctx().targets = …``) or via a local aliased to one
+            # (``ctx = self._get_ctx(); ctx.targets = …``). Charge the write to the
+            # attribute the getter returns, so a read of ``self._ctx.targets`` elsewhere
+            # sees it. Bridges the "value reached through a call" tracking gap.
+            key = self._aliased_self_attr_key(tgt, ctx)
         if key is None:
             return
         resolved = {self._resolve_attr_origin(o, ctx) for o in taint}
         self.engine.record_instance_attr(
             ctx.cls, key, {o for o in resolved if o}
         )
+
+    def _aliased_self_attr_key(self, tgt: ast.AST, ctx: Context) -> Optional[str]:
+        """``self``-relative attr path for a write target whose base is a getter/alias.
+
+        Walks the trailing ``.attr`` chain of ``tgt`` down to its base; resolves the
+        base to a ``self.<attr>`` path when it is a pure ``self.<getter>()`` call
+        (case A) or a local aliased to one (case C, via ``ctx.self_aliases``). Returns
+        the combined ``"<attr>.<trailing…>"`` key, or ``None`` if the base doesn't
+        resolve. Only fires for the getter/alias shapes -- a plain ``self`` chain is
+        handled by :func:`astutils.self_attr_key` before this is consulted.
+        """
+        trailing: List[str] = []
+        cur = tgt
+        while isinstance(cur, ast.Attribute):
+            trailing.append(cur.attr)
+            cur = cur.value
+        trailing.reverse()
+        if not trailing:
+            return None
+        base: Optional[str] = None
+        if isinstance(cur, ast.Name) and cur.id in ctx.self_aliases:
+            base = ctx.self_aliases[cur.id]
+        else:
+            base = self._self_getter_target(cur, ctx)
+        if base is None:
+            return None
+        return ".".join([base] + trailing)
 
     def _returned_field_map(self, value: ast.AST, ctx: Context):
         """Per-field taint of a returned value object: ``{field -> origins}``.
