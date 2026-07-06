@@ -62,10 +62,12 @@ def test_plan_sink_anchors():
     assert hasattr(ops.Container, "replan"), "plan-compare trigger `container.replan`"
 
 
-def test_unordered_source_anchors():
-    # constants.UNORDERED_CALLS: `container.list_files` is a directory listing
-    # (unspecified order), recognised like os.listdir.
-    assert hasattr(ops.Container, "list_files"), "unordered source `container.list_files`"
+def test_list_files_anchor():
+    # `container.list_files` is deliberately NOT an unordered source: pebble lists
+    # the directory with Go's os.ReadDir (sorted by filename), so the order is
+    # stable. The anchor guards that the method still exists -- if ops changed its
+    # listing contract we would want to revisit that decision.
+    assert hasattr(ops.Container, "list_files"), "`container.list_files` listing API"
 
 
 def test_relation_producer_anchors():

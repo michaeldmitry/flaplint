@@ -25,10 +25,11 @@ UNORDERED_CALLS: Set[str] = {
     "iglob",
     "iterdir",
     "rglob",
-    # ops Container.list_files / pebble list_files: a remote directory listing,
-    # returned in unspecified (readdir) order -- the workload-container analogue of
-    # ``os.listdir``. A config built by iterating it flaps the rendered file.
-    "list_files",
+    # NOTE: ops Container.list_files / pebble list_files is deliberately NOT here.
+    # Unlike ``os.listdir`` (Python, arbitrary order), pebble's server lists the
+    # directory with Go's ``os.ReadDir``, which returns entries *sorted by
+    # filename*. That order is stable across calls, so a config built by iterating
+    # a listing does not flap -- flagging it would be a false positive.
 }
 
 #: Callables that pass through the taint of their first argument. ``dict``/

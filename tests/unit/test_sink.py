@@ -1114,10 +1114,11 @@ def test_subscript_receiver_accumulator_returns_unordered(lint_source):
 
 
 
-def test_container_list_files_is_an_unordered_source(lint_source):
-    # ops Container.list_files is a directory listing (unspecified order), the
-    # workload-container analogue of os.listdir. A config built by iterating it and
-    # pushed to a file flaps -- the traefik dynamic-TLS-config shape.
+def test_container_list_files_is_not_an_unordered_source(lint_source):
+    # ops Container.list_files / pebble list_files is NOT unordered: unlike
+    # os.listdir, the pebble server lists the directory with Go's os.ReadDir, which
+    # returns entries sorted by filename. That order is stable across calls, so a
+    # config built by iterating a listing and pushed to a file does not flap.
     findings = lint_source(
         """
         import yaml
@@ -1129,7 +1130,7 @@ def test_container_list_files_is_an_unordered_source(lint_source):
                 self._container.push("/dynamic.yml", config)
         """
     )
-    assert any(f.sink == "file" for f in findings)
+    assert not any(f.sink == "file" for f in findings)
 
 
 # --- file param-contracts (a helper writes a parameter to an on-disk file) -----

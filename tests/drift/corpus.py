@@ -90,7 +90,8 @@ ANCHORS: Tuple[Anchor, ...] = (
            "ops>=2.0", _has("Container", "push")),
     Anchor("ops:add_layer-plan", "Container.add_layer feeds the pebble plan",
            "ops>=2.0", _has("Container", "add_layer")),
-    Anchor("ops:list_files-unordered", "Container.list_files is an unordered listing",
+    Anchor("ops:list_files-ordered", "Container.list_files lists via pebble's "
+           "os.ReadDir -> sorted by filename (stable, not an unordered source)",
            "ops>=2.0", _has("Container", "list_files")),
     Anchor("ops:get_relation-producer", "Model.get_relation yields a Relation",
            "ops>=2.0", _has("Model", "get_relation")),
@@ -212,13 +213,13 @@ CORPUS: Tuple[Case, ...] = (
                 container.add_layer("s", layer)
     """, "flap", ["ops:add_layer-plan", "std:set-unordered"]),
 
-    # -- container.list_files (ops unordered source) -> file --
+    # -- container.list_files (pebble sorts by filename) -> file : clean --
     _c("list-files-into-file", """
         class Charm:
             def h(self, container):
                 names = [f.name for f in container.list_files("/etc")]
                 container.push("/manifest", "\\n".join(names))
-    """, "flap", ["ops:list_files-unordered", "ops:push-file"], "unordered-iteration"),
+    """, "clean", ["ops:list_files-ordered", "ops:push-file"]),
 
     # -- get_relation producer -> databag --
     _c("get-relation-set-databag", """
