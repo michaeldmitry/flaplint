@@ -74,7 +74,7 @@ class _Palette:
 #: Short human title for each failure mode (``rule``).
 _RULE_TITLE: Dict[str, str] = {
     "unordered-collection": "unordered collection",
-    "unordered-pick": "positional pick from unordered data",
+    "unordered-pick": "position-dependent value from unordered data",
     "unordered-iteration": "unsorted iteration into a sequence",
     "nondeterministic": "nondeterministic value",
 }
@@ -119,7 +119,15 @@ def _describe(f: Finding) -> str:
     Names the affected variable and sink, weaves in the born-at/via provenance
     when present, rather than printing a generic per-rule blurb.
     """
-    subject = f"`{f.variable}`" if f.variable else "this variable"
+    if f.variable:
+        subject = f"`{f.variable}`"
+    elif f.scope:
+        # No nameable variable -- an anonymous ``return list(set(...))``. Name the
+        # enclosing function/property instead (that is where the ``sorted()`` goes)
+        # rather than the useless ``this variable``.
+        subject = f"the value returned by `{f.scope}`"
+    else:
+        subject = "this variable"
     target = _SINK_TARGET.get(f.sink, "the databag")
 
     # Weave the sink location straight into the mention of the target -- "written
@@ -166,9 +174,17 @@ def _describe(f: Finding) -> str:
                 f"element may be selected on different runs."
             )
         else:
+            # Same-file pick. Two shapes reach here and both must read correctly:
+            # a literal subscript (``addrs[0]``) *and* an ``enumerate`` value target
+            # (``for idx, e in enumerate(x): d[f"loki-{idx}"] = e``), where each
+            # element is bound to a position rather than one being plucked. So don't
+            # claim "{subject} is selected by position" (which reads as a single
+            # ``subject[N]``); say a value is taken *by position from* {subject},
+            # which is true either way. The fix is identical: sort the collection at
+            # the source, before it is indexed or enumerated.
             core = (
-                f"{subject} is selected by position from an unordered collection before "
-                f"reaching {target_at}."
+                f"a value taken by position from {subject} (an unordered collection) "
+                f"reaches {target_at}."
             )
     elif f.rule == "unordered-iteration":
         if f.kind == "caller":
@@ -216,6 +232,19 @@ def _describe(f: Finding) -> str:
         core = f"{subject} reaches {target_at} in a nondeterministic form."
 
     sentence = core
+
+    # Context-sensitive finding: this flow is invisible to a static read of the
+    # base class -- it only exists because ``self.<attr>`` is a concrete subclass at
+    # runtime (fixed by the constructor), whose override differs from the declared
+    # base type. Spell that out so the reader understands *why* it reaches the sink
+    # (the polymorphism was the non-obvious step).
+    if f.via_subclass:
+        attr = f"`self.{f.via_attr}`" if f.via_attr else "the receiver"
+        sentence += (
+            f" At runtime, {attr} is actually a `{f.via_subclass}`, so the subclass's "
+            f"implementation is used here instead of the one defined on the annotated "
+            f"base class."
+        )
 
     if f.origin_path:
         origin = f"{_relpath(f.origin_path)}:{f.origin_line}"
@@ -305,7 +334,14 @@ def render_report(
             mark = p.red("✖") if is_err else p.yellow("▲")
             loc = f"{f.line}:{f.col}".rjust(loc_w)
             title = _RULE_TITLE.get(f.rule, f.rule)
-            var = p.cyan(f.variable) if f.variable else p.dim("<anonymous>")
+            # Prefer a named variable; else the enclosing function/property (where the
+            # fix goes); only truly anonymous values fall back to ``<anonymous>``.
+            if f.variable:
+                var = p.cyan(f.variable)
+            elif f.scope:
+                var = p.cyan(f.scope + "()")
+            else:
+                var = p.dim("<anonymous>")
             sink = _SINK_LABEL.get(f.sink, f.sink)
             conf_paint = {"high": p.red, "medium": p.yellow, "low": p.blue}.get(
                 f.confidence, p.dim

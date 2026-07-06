@@ -139,8 +139,16 @@ class FunctionAnalyzer:
 
     # -- entry point --------------------------------------------------------
 
-    def analyze(self, fi: FuncInfo, handler: Handler) -> None:
-        """Walk ``fi`` seeding each parameter with its own ``("param", idx)``."""
+    def analyze(
+        self, fi: FuncInfo, handler: Handler, cls_override: Optional[str] = None
+    ) -> None:
+        """Walk ``fi`` seeding each parameter with its own ``("param", idx)``.
+
+        ``cls_override`` re-analyzes an *inherited* method as if ``self`` were a
+        concrete subclass (context-sensitive re-analysis): a self-attribute whose type
+        the subclass refined (a constructor self-pass) then resolves to the subclass's
+        override rather than the base's. Defaults to the method's own defining class.
+        """
         # Select this function's file's import aliases so name-matching in the
         # engine resolves any renamed imports. One function is walked at a time.
         self.engine.enter(fi.path)
@@ -150,7 +158,7 @@ class FunctionAnalyzer:
         ctx = Context(
             env=env,
             types={},
-            cls=fi.class_name,
+            cls=cls_override or fi.class_name,
             params=list(fi.params),
             param_annotations=dict(fi.param_annotations),
             func_path=fi.path,
@@ -1012,10 +1020,37 @@ class FunctionAnalyzer:
         for stmt in body:
             self._visit_stmt(stmt, ctx, handler)
 
+    def _bind_walruses(self, node: Optional[ast.AST], ctx: Context) -> None:
+        """Propagate every ``(name := expr)`` binding in ``node`` into the environment.
+
+        Python's assignment-expression binds ``name`` in the *enclosing* scope, so a
+        guard like ``if certs := self.get_all_certificates():`` leaves ``certs`` holding
+        the call's (possibly unordered) value for the whole block. flaplint otherwise
+        only tracks plain ``name = expr`` statements, so without this a walrus-guarded
+        value would look untainted and a real flap (``"\\n".join(certs)`` -> file) is
+        missed. Walk the controlling expression and bind each walrus target to its
+        value's taint; nested statement bodies are never passed in, so this cannot
+        pre-bind a name from a branch that has not been walked yet.
+        """
+        if node is None:
+            return
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.NamedExpr) and isinstance(sub.target, ast.Name):
+                ctx.env[sub.target.id] = self._eval(sub.value, ctx)
+
     def _visit_stmt(self, stmt: ast.stmt, ctx: Context, handler: Handler) -> None:
         # Nested functions / classes are analyzed as their own FuncInfo.
         if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             return
+
+        # Bind any ``(name := expr)`` walrus in this statement's *surface* expressions
+        # (guards -- ``if``/``while``/``with``/``for`` tests -- and a direct value such
+        # as an assign RHS or a bare call) before dispatching, so the target is in scope
+        # for the block the guard controls. Nested statement bodies are excluded, so this
+        # never binds a name ahead of the branch that defines it.
+        for surface in (*astutils.guards(stmt), getattr(stmt, "value", None)):
+            if isinstance(surface, ast.expr):
+                self._bind_walruses(surface, ctx)
 
         if isinstance(stmt, ast.Assign):
             self._visit_assign(stmt, ctx, handler)

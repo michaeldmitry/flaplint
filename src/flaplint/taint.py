@@ -559,6 +559,14 @@ class TaintEngine:
         if isinstance(node, ast.Await):
             return self.eval(node.value, env, cls_ctx, _depth + 1)
 
+        if isinstance(node, ast.NamedExpr):
+            # A walrus ``(name := expr)`` evaluates to ``expr``'s value, so its taint
+            # is exactly ``expr``'s. The *binding* of ``name`` into the environment is
+            # done by the traversal (see ``_bind_walruses``) so it survives into the
+            # guarded block; here we only need the value flavor so ``x = (y := f())``
+            # tracks too.
+            return self.eval(node.value, env, cls_ctx, _depth + 1)
+
         if isinstance(node, ast.Call):
             return self._call(node, env, cls_ctx, _depth)
 
@@ -758,6 +766,51 @@ class TaintEngine:
                 # control parameters that do NOT flow into the output, so they must not
                 # be arg-propagated by the default rule below.
                 return out | {o for o in recv_taint if o[0] not in ("param", "iterparam")}
+            if name == "get" and not resolved:
+                # ``d.get(key[, default])`` is a single keyed extraction -- the method
+                # analogue of the ``d[key]`` subscript -- so it launders the *mapping's
+                # own order* while PRESERVING *value* taint. Precisely: a value fetched
+                # by key does not depend on the mapping's iteration order, so the
+                # collection-order flavors (``itercaller``/``local``) that describe the
+                # container's disorder are dropped; a value-position pick
+                # (``element``/``iterparam``) survives, and -- via the constant-key path
+                # below -- so does taint recorded *on the retrieved value itself*. This
+                # is NOT "we proved the receiver is a dict": like the sibling
+                # views/mutators (``.items()``/``.update()``/...), it is a name-based
+                # rule keyed on ``get`` being a builtin-collection method on a *non-self*
+                # receiver (so it never unions a same-named user method -- a cross-class
+                # collision). The accepted trade-off is a user class that reimplements
+                # ``get`` to return a whole collection would be mis-laundered; in
+                # exchange, an *untyped* receiver (the real case: the data_platform_libs
+                # ``fetch_my_relation_field`` -> ``.get(rid, {}).get(field)`` chain, whose
+                # receiver has no inferred class) is still correctly laundered instead of
+                # inheriting the ``result`` dict's whole ``secret_fields`` iteration
+                # taint -- the false positive on the extracted scalar (a TLS key/cert
+                # string that cannot flap). Mirrors the subscript's fixed-key path: a
+                # constant string key with recorded per-key taint returns *that* key's
+                # taint (a value buried under one key stays caught); everything else
+                # launders. The default argument can itself become the result, so its
+                # taint flows; the key argument does not.
+                if call.args and isinstance(call.args[0], ast.Constant) and isinstance(
+                    call.args[0].value, str
+                ):
+                    base = call.func.value
+                    base_path = None
+                    if isinstance(base, ast.Name):
+                        base_path = base.id
+                    elif isinstance(base, ast.Attribute) and isinstance(
+                        base.value, ast.Name
+                    ):
+                        base_path = f"{base.value.id}.{base.attr}"
+                    if base_path is not None:
+                        keyed = f"{base_path}[{call.args[0].value!r}]"
+                        if keyed in env:
+                            return out | set(env[keyed])
+                out |= {o for o in recv_taint if is_element(o) or is_iterparam(o)}
+                for a in call.args[1:]:
+                    if not isinstance(a, ast.Starred):
+                        out |= self.eval(a, env, cls_ctx, depth + 1)
+                return out
             out |= recv_taint
 
         # Default-propagate (the inverted taint model): an unknown call carries its
@@ -844,7 +897,30 @@ class TaintEngine:
         if isinstance(recv, ast.Attribute):
             base_cls = self._receiver_class(recv.value, cls_ctx)
             if base_cls is not None:
-                return self.class_attr_types.get(base_cls, {}).get(recv.attr)
+                return self._attr_type_in_chain(base_cls, recv.attr)
+        return None
+
+    def _attr_type_in_chain(self, cls: str, attr: str) -> Optional[str]:
+        """Type recorded for ``self.<attr>`` on ``cls`` or its nearest base.
+
+        ``self.attr`` is often stored in a *base* ``__init__`` (``EventHandlers`` sets
+        ``self.relation_data``) while the access lives in a subclass method, so the
+        lookup must walk the inheritance chain rather than only the exact class.
+        Breadth-first from ``cls`` outward, so a *more-derived* class's recorded type
+        (a self-pass refinement, ``class_attr_types[DataPeer]["relation_data"]``) wins
+        over an inherited one -- the hook the context-sensitive pass relies on.
+        """
+        seen: Set[str] = set()
+        queue = [cls]
+        while queue:
+            c = queue.pop(0)
+            if c in seen:
+                continue
+            seen.add(c)
+            t = self.class_attr_types.get(c, {}).get(attr)
+            if t is not None:
+                return t
+            queue.extend(self.class_bases.get(c, ()))
         return None
 
     def _summary_return_origins(self, fi: "FuncInfo", node: ast.AST) -> Set[Origin]:

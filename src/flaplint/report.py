@@ -53,16 +53,50 @@ def _grade_param(ann: "str | None") -> "str | None":
     return "high" if ann in DEFINITELY_UNORDERED_ANNOTATIONS else "medium"
 
 
+def _read_self_attrs(node: ast.AST, attrs: Set[str]) -> Set[str]:
+    """The subset of ``attrs`` that ``node``'s body reads as ``self.<attr>``."""
+    hit: Set[str] = set()
+    for sub in ast.walk(node):
+        if (
+            isinstance(sub, ast.Attribute)
+            and isinstance(sub.value, ast.Name)
+            and sub.value.id in ("self", "cls")
+            and sub.attr in attrs
+        ):
+            hit.add(sub.attr)
+    return hit
+
+
 def report(
     functions: List[FuncInfo],
     analyzer: FunctionAnalyzer,
     suppressed: Dict[str, Set[int]],
     explain_gaps: bool = False,
+    selfpass_refinements: "Dict[str, Set[str]] | None" = None,
 ) -> "Tuple[List[Finding], List[Gap]]":
     """Produce the deduplicated, suppression-aware findings (and, optionally, gaps)."""
     findings: List[Finding] = []
     gaps: List[Gap] = []
     seen: Set[Tuple] = set()
+
+    def _enclosing_scope(path: str, line: int) -> str:
+        """Innermost function/property whose body spans ``(path, line)``, or ``""``.
+
+        Used as a fallback subject when the anchored value has no nameable variable
+        (an anonymous ``return list(set(...))``): its enclosing property is exactly
+        where the ``sorted()`` fix goes. Spans *all* collected functions (not just
+        primary ones) so a born site inside a vendored library still resolves.
+        """
+        best_name = ""
+        best_start = -1
+        for fi in functions:
+            if fi.path != path:
+                continue
+            start = getattr(fi.node, "lineno", 0)
+            end = getattr(fi.node, "end_lineno", start) or start
+            if start <= line <= end and start > best_start and fi.name not in ("", "<module>"):
+                best_name, best_start = fi.name, start
+        return best_name
 
     def emit(
         path: str,
@@ -74,6 +108,8 @@ def report(
         variable: str,
         origin: Tuple = None,
         sink_loc: "Tuple[str, ast.AST] | None" = None,
+        via_subclass: str = "",
+        via_attr: str = "",
     ) -> None:
         line = getattr(node, "lineno", 0)
         if line in suppressed.get(path, ()):
@@ -136,6 +172,9 @@ def report(
                 sink_path=sink_path,
                 sink_line=sink_line,
                 sink_col=sink_col,
+                scope="" if variable else _enclosing_scope(path, line),
+                via_subclass=via_subclass,
+                via_attr=via_attr,
             )
         )
 
@@ -222,6 +261,34 @@ def report(
         if site in confirmed_iter:
             continue  # a traced caller already reported this iteration at high conf
         emit(ipath, inode, "sink", conf, "unordered-iteration", "databag", pname)
+
+    # Context-sensitive re-analysis (self-pass mixin). An inherited method reads a
+    # self-attribute whose concrete type a *subclass* refined via a constructor
+    # self-pass (``class DataPeer(DataPeerData, DataPeerEventHandlers)`` wiring the
+    # handler to itself). The method was analysed once under its defining class, where
+    # the attribute has the base (clean) type; re-run it with ``self`` bound to the
+    # subclass, so the attribute resolves to the subclass's override. New findings flow
+    # through the same dedup ``emit`` -- identical clean re-runs collapse, only the
+    # divergent (subclass-specific) finding is added. Bounded to inherited methods that
+    # actually read a refined attribute.
+    if selfpass_refinements:
+        engine = analyzer.engine
+        for cls, attrs in selfpass_refinements.items():
+            chain = engine._class_chain(cls)
+            for fi in functions:
+                if not fi.primary or fi.class_name == cls or fi.class_name not in chain:
+                    continue
+                matched = _read_self_attrs(fi.node, attrs)
+                if not matched:
+                    continue
+                via_attr = sorted(matched)[0]
+                reout: "List[Tuple]" = []
+                analyzer.analyze(fi, ReportHandler(fi, reout, None), cls_override=cls)
+                for node, conf, rule, sink, variable, path, origin, sink_loc in reout:
+                    emit(
+                        path, node, "caller", conf, rule, sink, variable, origin,
+                        sink_loc, via_subclass=cls, via_attr=via_attr,
+                    )
 
     # Collapse a bare (no-origin) finding into a sibling that carries a concrete
     # upstream origin at the same anchor: they are the same flow whose provenance

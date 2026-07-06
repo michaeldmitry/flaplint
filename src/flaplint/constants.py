@@ -436,9 +436,19 @@ BUILTIN_MUTATOR_METHODS: Set[str] = {
     "pop",
 }
 
-#: Builtin collection method names (views + mutators) that must never resolve to a
-#: same-named *user* method on a receiver of unknown class.
-BUILTIN_COLLECTION_METHODS: Set[str] = BUILTIN_VIEW_METHODS | BUILTIN_MUTATOR_METHODS
+#: Builtin mapping *accessor* methods that extract a single value by key
+#: (``dict.get(k[, default])``). Like the views/mutators these carry the same
+#: cross-class collision risk -- a non-self ``d.get(k)`` must not union in a
+#: same-named user ``get`` method's summary -- but unlike a view they LAUNDER order:
+#: the value at a key does not depend on the mapping's iteration order (the method
+#: analogue of the ``d[k]`` subscript), handled in ``TaintEngine._call``.
+BUILTIN_ACCESSOR_METHODS: Set[str] = {"get"}
+
+#: Builtin collection method names (views + mutators + accessors) that must never
+#: resolve to a same-named *user* method on a receiver of unknown class.
+BUILTIN_COLLECTION_METHODS: Set[str] = (
+    BUILTIN_VIEW_METHODS | BUILTIN_MUTATOR_METHODS | BUILTIN_ACCESSOR_METHODS
+)
 
 #: On-disk file / workload-config emission APIs (the ``file`` sink). Order-
 #: unstable (or volatile) content reaching one of these writes a byte-unstable

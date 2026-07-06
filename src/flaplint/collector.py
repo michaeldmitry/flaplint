@@ -35,11 +35,24 @@ class Collector(ast.NodeVisitor):
         class_set_fields: Optional[Dict[str, Set[str]]] = None,
         class_bases: Optional[Dict[str, List[str]]] = None,
         value_object_fields: Optional[Dict[str, List[str]]] = None,
+        ctor_arg_types: Optional[Dict[str, Dict[object, Set[str]]]] = None,
+        attr_backrefs: Optional[Dict[str, List[tuple]]] = None,
     ) -> None:
         self.path = path
         self.primary = primary
         self.registry = registry
         self.attr_types = attr_types
+        #: callee class name -> {construction-arg key -> set of inferred type names}.
+        #: The key is an int (0-based positional index into the *call*'s args) or a
+        #: str (keyword name). Filled from every ``ClassName(self, ...)`` /
+        #: ``ClassName(ctor_result, ...)`` site so an *unannotated* ``__init__``
+        #: parameter can be typed from what it is actually constructed with (the
+        #: sub-component-gets-the-charm idiom). Reconciled after all files are read.
+        self.ctor_arg_types = ctor_arg_types if ctor_arg_types is not None else {}
+        #: class name -> [(attr, param_name)] for ``self.<attr> = <param>`` back-refs
+        #: whose param has no (class) annotation, so the type must come from the
+        #: construction site above rather than the annotation.
+        self.attr_backrefs = attr_backrefs if attr_backrefs is not None else {}
         #: class name -> its base class names (``LokiPushApiConsumer`` ->
         #: ``["ConsumerBase"]``), so a method/property inherited from a base resolves
         #: on a subclass receiver -- the ``loki_consumer.loki_endpoints`` idiom where
@@ -131,7 +144,20 @@ class Collector(ast.NodeVisitor):
         self.registry.setdefault(fi.name, []).append(fi)
         self.functions.append(fi)
         if cls_name:
-            self._record_member_types(node, cls_name, annotations)
+            # A property that returns a class (``@property def _patroni(self) ->
+            # Patroni``) reads like a typed attribute at the use site
+            # (``self.charm._patroni.render_file(...)``), so type it as one -- a member
+            # chain can then resolve through it. Only when the attribute isn't already
+            # typed by an assignment, and only for a capitalised (class) return.
+            if (
+                is_property
+                and fi.returns_class
+                and fi.returns_class[:1].isupper()
+                and node.name not in self.attr_types.get(cls_name, {})
+            ):
+                self.attr_types.setdefault(cls_name, {})[node.name] = fi.returns_class
+            self._record_member_types(node, cls_name, annotations, params)
+        self._record_call_arg_types(node, cls_name or "", annotations)
 
     @staticmethod
     def _compute_absorbs(node: ast.AST, param_index: Dict[str, int]) -> Dict[int, str]:
@@ -259,8 +285,77 @@ class Collector(ast.NodeVisitor):
             seen, found = key, True
         return seen if found else None
 
-    def _record_member_types(
+    @staticmethod
+    def _ctor_arg_type(
+        arg: ast.AST, cls_name: str, param_annotations: Dict[str, Optional[str]]
+    ) -> Optional[str]:
+        """High-confidence class of a construction argument, or ``None``.
+
+        Only trusts unambiguous signals so an inferred type never mis-resolves a
+        method: ``self``/``cls`` -> the enclosing class; a nested constructor
+        (``Patroni(...)``) -> its class; a class-annotated parameter -> its
+        annotation. Anything else (a literal, an unannotated local, a bare attribute)
+        stays ``None`` rather than guessing.
+        """
+        if isinstance(arg, ast.Name):
+            if arg.id in ("self", "cls"):
+                return cls_name
+            ann = param_annotations.get(arg.id)
+            return ann if ann and ann[:1].isupper() else None
+        cls = astutils.ctor_class(arg)
+        return cls if cls and cls[:1].isupper() else None
+
+    def _record_call_arg_types(
         self, node: ast.AST, cls_name: str, param_annotations: Dict[str, Optional[str]]
+    ) -> None:
+        """Record the argument types of every call in this method, keyed by callee name.
+
+        Feeds :attr:`ctor_arg_types` so a later pass can type an *unannotated* callee
+        parameter from what is actually passed at the call site -- not just
+        constructors (``Backups(self, "s3")`` types ``Backups.charm``) but any
+        uniquely-named function/method (``_render(self)`` types ``_render``'s param).
+        The callee is keyed by its final name (``ClassName`` / ``method`` / ``func``);
+        positional args by their 0-based index into the *call*, keyword args by name.
+        Names are recorded raw and reconciled against real classes/functions later --
+        a name that resolves ambiguously (a method defined on several classes) is
+        dropped there, so this only records; it never resolves.
+        """
+        for sub in ast.walk(node):
+            if not isinstance(sub, ast.Call):
+                continue
+            name = astutils.final_attr(sub.func)
+            if not name:
+                continue
+            # Key by ``Class#method`` when the receiver's class is known (``self``, a
+            # fresh ``ClassName()``, a class-annotated value) -- then a *shared* method
+            # name resolves precisely, no global-uniqueness needed. Otherwise key by the
+            # bare name (a constructor / free function, or an unknown-receiver method
+            # that the post-pass only trusts if globally unique).
+            key: str = name
+            if isinstance(sub.func, ast.Attribute):
+                recv_cls = self._ctor_arg_type(sub.func.value, cls_name, param_annotations)
+                if recv_cls:
+                    key = f"{recv_cls}#{name}"
+            bucket = self.ctor_arg_types.setdefault(key, {})
+            for i, arg in enumerate(sub.args):
+                if isinstance(arg, ast.Starred):
+                    break  # positions past a splat are unknown
+                t = self._ctor_arg_type(arg, cls_name, param_annotations)
+                if t:
+                    bucket.setdefault(i, set()).add(t)
+            for kw in sub.keywords:
+                if kw.arg is None:
+                    continue
+                t = self._ctor_arg_type(kw.value, cls_name, param_annotations)
+                if t:
+                    bucket.setdefault(kw.arg, set()).add(t)
+
+    def _record_member_types(
+        self,
+        node: ast.AST,
+        cls_name: str,
+        param_annotations: Dict[str, Optional[str]],
+        params: List[str],
     ) -> None:
         """Record ``self.<attr>``'s class so member accesses resolve to it.
 
@@ -288,6 +383,19 @@ class Collector(ast.NodeVisitor):
                 ann = param_annotations.get(sub.value.id)
                 if ann and ann[:1].isupper():
                     cls = ann
+                elif sub.value.id in params:
+                    # ``self.charm = charm`` where ``charm`` has no class annotation:
+                    # record the back-ref so the construction-site pass can type it from
+                    # what this class is built with. Only for a genuine self-attr target.
+                    for tgt in sub.targets:
+                        if (
+                            isinstance(tgt, ast.Attribute)
+                            and isinstance(tgt.value, ast.Name)
+                            and tgt.value.id in ("self", "cls")
+                        ):
+                            self.attr_backrefs.setdefault(cls_name, []).append(
+                                (tgt.attr, sub.value.id)
+                            )
             if cls is None:
                 continue
             for tgt in sub.targets:

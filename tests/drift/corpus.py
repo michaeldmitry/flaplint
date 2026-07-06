@@ -214,11 +214,16 @@ CORPUS: Tuple[Case, ...] = (
     """, "flap", ["ops:add_layer-plan", "std:set-unordered"]),
 
     # -- container.list_files (pebble sorts by filename) -> file : clean --
+    # Self-attribute receiver, so the only thing under test is the list_files
+    # ordering contract (a bare-parameter receiver would trip the separate
+    # unannotated-param rule and mask it).
     _c("list-files-into-file", """
         class Charm:
-            def h(self, container):
-                names = [f.name for f in container.list_files("/etc")]
-                container.push("/manifest", "\\n".join(names))
+            def __init__(self):
+                self._container = None
+            def h(self):
+                names = [f.name for f in self._container.list_files("/etc")]
+                self._container.push("/manifest", "\\n".join(names))
     """, "clean", ["ops:list_files-ordered", "ops:push-file"]),
 
     # -- get_relation producer -> databag --

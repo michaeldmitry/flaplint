@@ -123,19 +123,27 @@ class Analyzer:
         file_imports: Dict[str, FileImports] = {}
         functions: List[FuncInfo] = []
         suppressed: Dict[str, Set[int]] = {}
+        ctor_arg_types: Dict[str, Dict[object, Set[str]]] = {}
+        attr_backrefs: Dict[str, List[tuple]] = {}
 
         for path in self.primary_files:
             self._ingest(
                 path, True, registry, class_attr_types, model_seq_fields,
                 class_set_fields, class_bases, value_object_fields, file_imports,
-                functions, suppressed,
+                functions, suppressed, ctor_arg_types, attr_backrefs,
             )
         for path in self.secondary_files:
             self._ingest(
                 path, False, registry, class_attr_types, model_seq_fields,
                 class_set_fields, class_bases, value_object_fields, file_imports,
-                functions, suppressed,
+                functions, suppressed, ctor_arg_types, attr_backrefs,
             )
+        _infer_ctor_param_types(
+            registry, class_attr_types, ctor_arg_types, attr_backrefs
+        )
+        selfpass_refinements = _infer_selfpass_refinements(
+            registry, class_attr_types, class_bases
+        )
 
         engine = TaintEngine(
             registry,
@@ -151,7 +159,10 @@ class Analyzer:
         analyzer = FunctionAnalyzer(engine)
         mark_databag_accessors(functions, registry)
         compute_summaries(functions, analyzer)
-        findings, gaps = report(functions, analyzer, suppressed, self.explain_gaps)
+        findings, gaps = report(
+            functions, analyzer, suppressed, self.explain_gaps,
+            selfpass_refinements=selfpass_refinements,
+        )
 
         threshold = CONFIDENCE_RANK[self.min_confidence]
         findings = [f for f in findings if CONFIDENCE_RANK[f.confidence] >= threshold]
@@ -248,6 +259,8 @@ class Analyzer:
         file_imports: Dict[str, FileImports],
         functions: List[FuncInfo],
         suppressed: Dict[str, Set[int]],
+        ctor_arg_types: Dict[str, Dict[object, Set[str]]],
+        attr_backrefs: Dict[str, List[tuple]],
     ) -> None:
         source = read_source(path)
         if source is None:
@@ -269,6 +282,8 @@ class Analyzer:
             class_set_fields=class_set_fields,
             class_bases=class_bases,
             value_object_fields=value_object_fields,
+            ctor_arg_types=ctor_arg_types,
+            attr_backrefs=attr_backrefs,
         )
         collector.visit(tree)
         functions.extend(collector.functions)
@@ -276,6 +291,226 @@ class Analyzer:
         functions.append(
             FuncInfo(name="<module>", path=path, node=tree, primary=report_here)
         )
+
+
+def _infer_ctor_param_types(
+    registry: Registry,
+    class_attr_types: Dict[str, Dict[str, str]],
+    ctor_arg_types: Dict[str, Dict[object, Set[str]]],
+    attr_backrefs: Dict[str, List[tuple]],
+) -> None:
+    """Type an *unannotated* callee parameter from what is passed at its call sites.
+
+    The general form of interprocedural type inference: a parameter with no class
+    annotation is typed from the argument the call site actually supplies
+    (:meth:`Collector._ctor_arg_type` trusts only ``self``/``cls``, a nested
+    constructor, or a class-annotated arg). Two consumers of that type:
+
+    * **constructors** -- ``self.backup = PostgreSQLBackups(self, ...)`` types
+      ``Backups``'s ``charm`` param, and because it is stored (``self.charm = charm``)
+      the type is lifted onto ``class_attr_types`` so *every* method resolves
+      ``self.charm.<...>`` (the cross-method, high-leverage case);
+    * **any other function/method** -- the inferred type is written onto the callee's
+      own ``param_annotations``, so a receiver use *inside that function's body*
+      (``def _render(charm): charm._patroni.render_file(...)``) resolves.
+
+    Conservative by construction: a name that resolves to more than one function (a
+    method defined on several classes) is skipped -- only a unique callee is trusted,
+    which sidesteps the cross-class collision that name-based resolution otherwise
+    risks; a parameter passed conflicting types across sites is dropped; and an
+    existing annotation / constructor-assignment type is never overwritten. So it only
+    *adds* resolution power, never redirects it.
+    """
+    init_by_class: Dict[str, FuncInfo] = {
+        fi.class_name: fi for fi in registry.get("__init__", []) if fi.class_name
+    }
+
+    def resolve(args: Dict[object, Set[str]], params: List[str], offset: int) -> Dict[str, str]:
+        """{param_name -> single unambiguous type} for one callee's call sites."""
+        out: Dict[str, str] = {}
+        for key, types in args.items():
+            if len(types) != 1:
+                continue  # conflicting types across call sites -> ambiguous
+            (t,) = tuple(types)
+            if isinstance(key, int):
+                pidx = key + offset  # positional call arg i fills param i(+1 for self)
+                pname = params[pidx] if 0 <= pidx < len(params) else None
+            else:
+                pname = key if key in params else None
+            if pname is not None:
+                out[pname] = t
+        return out
+
+    def apply(fi: FuncInfo, param_type: Dict[str, str]) -> None:
+        for pname, t in param_type.items():
+            fi.param_annotations.setdefault(pname, t)  # never overwrite an annotation
+
+    def _method_offset(fi: FuncInfo) -> int:
+        return 1 if fi.params and fi.params[0] in ("self", "cls") else 0
+
+    for name, args in ctor_arg_types.items():
+        if "#" in name:
+            # ``Class#method`` -- a method call with a *known* receiver class, so it
+            # resolves precisely even if the method name is shared across classes.
+            clsname, method = name.split("#", 1)
+            cands = [fi for fi in registry.get(method, []) if fi.class_name == clsname]
+            if len(cands) == 1:
+                apply(cands[0], resolve(args, cands[0].params, _method_offset(cands[0])))
+            continue
+        init = init_by_class.get(name)
+        if init is not None:
+            # Constructor: positional arg i fills param i+1 (self is implicit).
+            param_type = resolve(args, init.params, offset=1)
+            apply(init, param_type)
+            bucket = class_attr_types.setdefault(name, {})
+            for attr, pname in attr_backrefs.get(name, []):
+                if pname in param_type and attr not in bucket:
+                    bucket[attr] = param_type[pname]
+            continue
+        # Bare-name method on an *unknown* receiver: only a globally unique callee is
+        # safe to type (no receiver class to disambiguate a shared method name).
+        candidates = registry.get(name, [])
+        if len(candidates) == 1:
+            apply(candidates[0], resolve(args, candidates[0].params, _method_offset(candidates[0])))
+
+
+_SELF_ARG = object()  # sentinel: a construction argument that is the ``self`` object
+
+
+def _init_arg_source(arg: ast.AST, own_params: Set[str]) -> object:
+    """Classify a ``__init__``-call argument: ``self`` (sentinel), a param name, or None."""
+    if isinstance(arg, ast.Name):
+        if arg.id in ("self", "cls"):
+            return _SELF_ARG
+        if arg.id in own_params:
+            return arg.id
+    return None
+
+
+def _init_callee(recv: ast.AST, cls: str, class_bases: Dict[str, List[str]]) -> "Tuple[Optional[str], bool]":
+    """Resolve the callee of a ``<recv>.__init__(...)`` call and whether ``self`` is explicit.
+
+    ``super().__init__(...)`` -> the first base of ``cls`` (self is implicit, so its
+    positional args start at param 1); ``Base.__init__(self, ...)`` -> ``Base`` (self is
+    passed explicitly as arg 0).
+    """
+    if (
+        isinstance(recv, ast.Call)
+        and isinstance(recv.func, ast.Name)
+        and recv.func.id == "super"
+    ):
+        bases = class_bases.get(cls, [])
+        return (bases[0] if bases else None, False)
+    if isinstance(recv, ast.Name):
+        return (recv.id, True)
+    return (None, True)
+
+
+def _infer_selfpass_refinements(
+    registry: Registry,
+    class_attr_types: Dict[str, Dict[str, str]],
+    class_bases: Dict[str, List[str]],
+) -> Dict[str, Set[str]]:
+    """Refine an attribute's type to the concrete subclass that self-passes it.
+
+    A mixin like ``class DataPeer(DataPeerData, DataPeerEventHandlers)`` wires the
+    inherited handler to itself -- ``DataPeerEventHandlers.__init__(self, charm, self,
+    ...)`` -- so for ``DataPeer`` instances ``self.relation_data`` is exactly a
+    ``DataPeer`` (which overrides ``local_secret_fields`` to be unordered). The base
+    ``__init__`` stores that parameter under an annotation of the *base* type, masking
+    it. This follows the ``self`` argument through the ``__init__`` delegation chain to
+    the attribute it is ultimately stored on and records ``class_attr_types[C][attr] =
+    C`` -- a *fact* from the construction, not a guess. Returns ``{C: {attrs}}`` for the
+    context-sensitive re-analysis worklist (see :func:`report`).
+    """
+    inits: Dict[str, FuncInfo] = {
+        fi.class_name: fi for fi in registry.get("__init__", []) if fi.class_name
+    }
+
+    def resolve_init(cls: Optional[str]) -> Optional[str]:
+        """Nearest class in ``cls``'s chain that *defines* ``__init__`` (own or inherited)."""
+        seen: Set[str] = set()
+        queue = [cls] if cls else []
+        while queue:
+            c = queue.pop(0)
+            if c is None or c in seen:
+                continue
+            seen.add(c)
+            if c in inits:
+                return c
+            queue.extend(class_bases.get(c, ()))
+        return None
+    # Per class: params stored directly as ``self.<attr>``, and delegations to a base
+    # ``__init__`` (callee -> {callee param name -> source: self-sentinel / param / None}).
+    stored_as: Dict[str, Dict[str, str]] = {}
+    forwards: Dict[str, List["Tuple[str, Dict[str, object]]"]] = {}
+    for cls, fi in inits.items():
+        own = set(fi.params)
+        st: Dict[str, str] = {}
+        fw: List["Tuple[str, Dict[str, object]]"] = []
+        for node in ast.walk(fi.node):
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Attribute)
+                and isinstance(node.targets[0].value, ast.Name)
+                and node.targets[0].value.id in ("self", "cls")
+                and isinstance(node.value, ast.Name)
+                and node.value.id in own
+            ):
+                st[node.value.id] = node.targets[0].attr
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "__init__"
+            ):
+                callee, explicit = _init_callee(node.func.value, cls, class_bases)
+                callee = resolve_init(callee)  # an inherited __init__ resolves to its definer
+                if callee is None:
+                    continue
+                cparams = inits[callee].params
+                offset = 0 if explicit else 1  # explicit self is arg 0; super() implicit
+                srcmap: Dict[str, object] = {}
+                for i, a in enumerate(node.args):
+                    if isinstance(a, ast.Starred):
+                        break
+                    pidx = i + offset
+                    if 0 <= pidx < len(cparams):
+                        srcmap[cparams[pidx]] = _init_arg_source(a, own)
+                for kw in node.keywords:
+                    if kw.arg:
+                        srcmap[kw.arg] = _init_arg_source(kw.value, own)
+                fw.append((callee, srcmap))
+        stored_as[cls] = st
+        forwards[cls] = fw
+
+    # Fixpoint: propagate "this param ends up stored as self.<attr>" up the delegation
+    # chain, so a param forwarded through several ``super().__init__`` hops is resolved.
+    changed = True
+    while changed:
+        changed = False
+        for cls, fws in forwards.items():
+            for callee, srcmap in fws:
+                callee_map = stored_as.get(callee, {})
+                for cparam, src in srcmap.items():
+                    if isinstance(src, str) and cparam in callee_map:
+                        attr = callee_map[cparam]
+                        if stored_as.setdefault(cls, {}).get(src) != attr:
+                            stored_as[cls][src] = attr
+                            changed = True
+
+    # A ``self`` argument that reaches a stored parameter refines that attribute to the
+    # self-passing class.
+    refinements: Dict[str, Set[str]] = {}
+    for cls, fws in forwards.items():
+        for callee, srcmap in fws:
+            callee_map = stored_as.get(callee, {})
+            for cparam, src in srcmap.items():
+                if src is _SELF_ARG and cparam in callee_map:
+                    attr = callee_map[cparam]
+                    class_attr_types.setdefault(cls, {})[attr] = cls
+                    refinements.setdefault(cls, set()).add(attr)
+    return refinements
 
 
 def _render_sites(

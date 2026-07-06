@@ -256,3 +256,68 @@ def test_reading_a_file_into_a_databag_is_not_flagged(lint_source):
         """
     )
     assert findings == []
+
+
+def test_dict_get_launders_mapping_order_not_value_taint(lint_source):
+    # ``d.get(field)`` extracts ONE value by key -- the method analogue of ``d[key]``
+    # -- so it launders the *mapping's own order* while preserving *value* taint. Here
+    # the instability lives only in how the dict is built (``for g in list(set(...)):
+    # d.update(...)``), i.e. dictionary-order taint, which a keyed lookup does not
+    # depend on -- so a single field fetched off it (the data_platform_libs
+    # ``fetch_my_relation_field`` -> ``.get(rid, {}).get(field)`` chain returning a TLS
+    # key/cert scalar) must NOT inherit that iteration taint. (Value taint is preserved
+    # separately -- see the constant-key test below.)
+    findings = lint_source(
+        """
+        class Charm:
+            def _build(self):
+                d = {}
+                for g in list(set(self._raw())):
+                    d.update(self._op(g))
+                return d
+            def h(self):
+                self._container.push("/certs", self._build().get(1, {}).get("key"))
+        """
+    )
+    assert not any(f.sink == "file" for f in findings)
+
+
+def test_dict_get_launders_even_with_a_user_get_method_present(lint_source):
+    # A stray user-defined ``get`` must not defeat the laundering. Note the analysis
+    # does NOT infer that the receiver is a dict -- it matches on ``get`` being a
+    # builtin-collection method name on a *non-self* receiver, so it declines to union
+    # a same-named user method's summary (the same cross-class collision guard the
+    # views/mutators get). Accepted trade-off: a user class reimplementing ``get`` to
+    # return a whole collection would be mis-laundered; in exchange an untyped
+    # call-result receiver (the real FP) is handled.
+    findings = lint_source(
+        """
+        class Other:
+            def get(self, k):
+                return list(self._stuff)
+        class Charm:
+            def _build(self):
+                d = {}
+                for g in list(set(self._raw())):
+                    d.update(self._op(g))
+                return d
+            def h(self):
+                self._container.push("/p", self._build().get("field"))
+        """
+    )
+    assert not any(f.sink == "file" for f in findings)
+
+
+def test_dict_get_of_a_constant_key_still_catches_a_buried_unstable_value(lint_source):
+    # Laundering must stay field-sensitive: a constant-key ``.get('jobs')`` where that
+    # key holds a genuinely unstable value (``list(set(...))``) is still flagged, like
+    # the equivalent ``d['jobs']`` subscript.
+    findings = lint_source(
+        """
+        class Charm:
+            def h(self):
+                d = {"jobs": list(set(self.x)), "name": "fixed"}
+                self.relation.data[self.app]["j"] = ",".join(d.get("jobs"))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)

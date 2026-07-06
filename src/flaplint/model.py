@@ -178,6 +178,22 @@ class Finding:
     sink_path: str = ""
     sink_line: int = 0
     sink_col: int = 0
+    #: enclosing function/property that produces the anchored value -- a
+    #: human-readable *fallback subject* when there is no nameable ``variable`` (an
+    #: anonymous ``return list(set(...))``). Lets the report name *where* the
+    #: ``sorted()`` goes ("the value returned by ``current_secret_fields``")
+    #: instead of ``<anonymous>``. ``""`` when a variable already names the value
+    #: or the enclosing function is unknown.
+    scope: str = ""
+    #: set only for findings surfaced by context-sensitive re-analysis (the
+    #: self-pass mixin): the concrete runtime subclass whose attribute override
+    #: made this flow reachable, and the ``self`` attribute it is bound to. Lets
+    #: the description explain the polymorphism -- the value reaches the sink only
+    #: because ``self.<via_attr>`` is a ``<via_subclass>`` at runtime, whose
+    #: override differs from the base type visible at the read site. Both ``""``
+    #: for ordinary statically-resolved findings.
+    via_subclass: str = ""
+    via_attr: str = ""
 
     def format(self) -> str:
         """Render as ``path:line:col: owner=... confidence=... key=value ...``.
@@ -197,10 +213,14 @@ class Finding:
         ]
         if self.variable:
             fields.append(f"var={self.variable}")
+        elif self.scope:
+            fields.append(f"in={self.scope}")
         if self.origin_path:
             fields.append(f"origin={self.origin_path}:{self.origin_line}")
         if self.via:
             fields.append(f"via={self.via}")
+        if self.via_subclass:
+            fields.append(f"via_subclass={self.via_subclass}")
         if self.sink_line:
             fields.append(f"sink_at={self.sink_path}:{self.sink_line}")
         return f"{self.path}:{self.line}:{self.col}: " + " ".join(fields)

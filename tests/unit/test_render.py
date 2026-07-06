@@ -262,16 +262,21 @@ def test_reattributed_pick_description_does_not_call_the_subject_the_pick():
     assert "Fix at the source" in text
 
 
-def test_same_file_pick_description_still_names_the_subject_as_the_pick():
-    # A same-file pick anchors *at* the pick, so the subject genuinely is the
-    # positionally-selected value -- keep the direct "is selected by position" wording.
+def test_same_file_pick_description_names_the_value_taken_from_the_subject():
+    # A same-file pick anchors *at* the pick. The direct wording says a value is
+    # taken *by position from* the subject -- true for both a literal ``addr[0]``
+    # subscript and an ``enumerate`` value target (where each element is bound to a
+    # position). It must not claim the collection itself "is selected by position"
+    # (which reads as a single ``addr[N]`` and is wrong for the enumerate shape),
+    # nor use the cross-file "carries a value picked" wording.
     f = Finding(
         path="charm.py", line=10, col=5, kind="caller", confidence="high",
         rule="unordered-pick", sink="databag", variable="addr",
         origin_path="charm.py", origin_line=8,
     )
     text = _describe_of(f)
-    assert "addr` is selected by position" in text
+    assert "value taken by position from `addr`" in text
+    assert "is selected by position" not in text
     assert "carries a value picked by position" not in text
 
 

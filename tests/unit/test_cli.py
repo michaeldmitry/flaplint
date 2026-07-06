@@ -65,6 +65,9 @@ def test_json_output_shape(tmp_path, capsys):
         "sink_path",
         "sink_line",
         "sink_col",
+        "scope",
+        "via_subclass",
+        "via_attr",
     }
     assert entry["kind"] == "caller"
     assert entry["confidence"] == "high"
