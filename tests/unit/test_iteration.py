@@ -931,3 +931,168 @@ def test_field_read_off_a_local_dict_stays_clean(lint_source):
         """
     )
     assert findings == []
+
+
+def test_get_off_a_mapping_of_sets_param_is_unordered(lint_source):
+    # ``Dict[str, Set[str]]``: the mapping is key-ordered, but ``.get(k)`` hands back a
+    # *set* value -- iterating it into a sequence written to a sink flaps. The nginx
+    # ``upstreams_to_addresses`` shape (cos-coordinated-workers). The nested ``Set``
+    # value-type must be tracked, not just the ``Dict`` root (which alone reads ordered).
+    findings = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                addrs = u2a.get("workers")
+                self.relation.data[self.app]["v"] = ",".join(addrs)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_subscript_off_a_mapping_of_sets_param_is_unordered(lint_source):
+    # The subscript twin of the ``.get()`` case: ``u2a[k]`` is a set, so iterating it
+    # unsorted into a databag write flaps.
+    findings = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                self.relation.data[self.app]["v"] = ",".join(u2a["workers"])
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_mapping_of_ordered_values_param_stays_clean(lint_source):
+    # Control: ``Dict[str, List[str]]`` values are ordered, so ``.get(k)`` is not an
+    # unordered source -- the nested-value rule must not over-fire on ordered values.
+    findings = lint_source(
+        """
+        from typing import Dict, List
+        class Charm:
+            def go(self, u2a: Dict[str, List[str]]):
+                self.relation.data[self.app]["v"] = ",".join(u2a.get("workers"))
+        """
+    )
+    assert findings == []
+
+
+def test_values_iteration_of_a_mapping_of_sets_is_unordered(lint_source):
+    # ``for v in d.values()`` where ``d: Dict[str, Set[str]]`` binds each ``v`` to a
+    # set, so iterating one unsorted into a sink flaps. Same value-extraction family as
+    # ``d.get(k)`` -- the loop form.
+    findings = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                for addrs in u2a.values():
+                    self.relation.data[self.app]["v"] = ",".join(addrs)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_items_iteration_value_is_unordered_key_stays_clean(lint_source):
+    # ``for k, v in d.items()``: the value ``v`` is a set (unordered), but the key ``k``
+    # follows dict key order (stable). The value write must flap; the key write must not.
+    flagged = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                for k, v in u2a.items():
+                    self.relation.data[self.app]["v"] = ",".join(v)
+        """
+    )
+    assert any(f.sink == "databag" for f in flagged)
+    clean = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                for k, v in u2a.items():
+                    self.relation.data[self.app]["k"] = k
+        """
+    )
+    assert clean == []
+
+
+def test_setdefault_of_a_mapping_of_sets_is_unordered(lint_source):
+    # ``d.setdefault(k, default)`` returns the value at ``k`` just like ``d.get(k)``, so
+    # for a ``Dict[str, Set[str]]`` it hands back an unordered set.
+    findings = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                self.relation.data[self.app]["v"] = ",".join(u2a.setdefault("k", set()))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_append_of_nested_unordered_into_serialized_list_is_flagged(lint_source):
+    # The nginx ``_upstreams`` shape: a STABLE outer loop appends a dict holding a
+    # comprehension over an unordered set into an accumulator list, which is then
+    # serialized (yaml/json/str) to a sink. The list's own order is fine; the flap is
+    # the nested set. ``.append`` must carry the nested instability so the serializer
+    # sees it -- anchored at the nested source (the fix is ``sorted(addrs)``, not the
+    # list).
+    findings = lint_source(
+        """
+        import json
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                acc = []
+                for role in self.roles:                      # stable outer loop
+                    acc.append({"servers": [s for s in u2a.get(role)]})
+                self.relation.data[self.app]["v"] = json.dumps(acc)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_append_of_nested_unordered_never_serialized_stays_clean(lint_source):
+    # The FP guard (the ``_dedupe_list`` shape the maintainer feared): appending
+    # nested-unordered content and then only *iterating* it (dedupe) without ever
+    # serializing it to a sink must NOT flag -- iteration is not a sink, so the
+    # propagated taint stays inert.
+    findings = lint_source(
+        """
+        from typing import Dict, Set
+        class Charm:
+            def _dedupe(self, xs):
+                out = []
+                for x in xs:
+                    out.append(x)
+                return out
+            def go(self, u2a: Dict[str, Set[str]]):
+                acc = []
+                for role in self.roles:
+                    acc.append({"servers": [s for s in u2a.get(role)]})
+                deduped = self._dedupe(acc)
+                self.count = len(deduped)     # only length escapes -- no serialization
+        """
+    )
+    assert all(f.variable != "acc" for f in findings)
+
+
+def test_append_of_already_sorted_nested_content_stays_clean(lint_source):
+    # If the nested content is sorted at construction, the element carries no
+    # instability, so nothing propagates through ``.append`` -- no false positive.
+    findings = lint_source(
+        """
+        import json
+        from typing import Dict, Set
+        class Charm:
+            def go(self, u2a: Dict[str, Set[str]]):
+                acc = []
+                for role in self.roles:
+                    acc.append({"servers": sorted(u2a.get(role))})
+                self.relation.data[self.app]["v"] = json.dumps(acc)
+        """
+    )
+    assert findings == []

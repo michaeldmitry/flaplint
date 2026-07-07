@@ -321,3 +321,34 @@ def test_dict_get_of_a_constant_key_still_catches_a_buried_unstable_value(lint_s
         """
     )
     assert any(f.sink == "databag" for f in findings)
+
+
+def test_external_typed_receiver_from_helper_does_not_collide_with_same_name_method(
+    lint_source,
+):
+    # `prm.reconcile(policies)` where `prm` is an *external* type, obtained from a
+    # helper annotated `-> PolicyResourceManager` (a class we cannot see into). It
+    # shares the method name `reconcile` with `Nginx.reconcile`, which writes its
+    # parameter to a config file. Resolving `prm.reconcile` by bare name imported
+    # nginx's file sink and mis-attributed an unrelated (mesh-policy) unordered list to
+    # the nginx write -- a cross-wire false positive (right sink, wrong source). The
+    # helper's external return type must type `prm` so the receiver is recognised as
+    # external and the same-name union is not applied. (A *direct* external
+    # construction already gets this via `ctor_class`; this covers the helper case.)
+    findings = lint_source(
+        """
+        class Nginx:
+            def reconcile(self, config: str):
+                self._container.push("/etc/nginx.conf", config)
+
+        def _get_prm() -> "PolicyResourceManager":
+            return PolicyResourceManager()
+
+        class MeshReconciler:
+            def build(self, cluster):
+                prm = _get_prm()
+                policies = list({app for app in cluster.gather_apps()})
+                prm.reconcile(policies)
+        """
+    )
+    assert [f for f in findings if f.sink == "file"] == []

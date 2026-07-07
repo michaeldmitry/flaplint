@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Set
 from . import astutils
 from .constants import (
     ACCUMULATOR_METHODS,
+    DEFINITELY_UNORDERED_ANNOTATIONS,
     SEQUENCE_FIELD_ANNOTATIONS,
     UNORDERED_ANNOTATIONS,
     UNORDERED_RETURN_ANNOTATIONS,
@@ -103,6 +104,16 @@ class Collector(ast.NodeVisitor):
             for a in ordered
             if a.annotation
         }
+        # Parameters typed as a mapping of *set* values (``Dict[str, Set[str]]``):
+        # indexing / ``.get()`` / ``.values()`` yields an unordered collection, even
+        # though the mapping's own key order is laundered by serializers.
+        unordered_value_params = {
+            a.arg
+            for a in ordered
+            if a.annotation is not None
+            and astutils.mapping_value_root(a.annotation)
+            in DEFINITELY_UNORDERED_ANNOTATIONS
+        }
         is_method = bool(params) and params[0] in ("self", "cls")
         decorators = getattr(node, "decorator_list", [])
         is_property = any(
@@ -117,6 +128,7 @@ class Collector(ast.NodeVisitor):
             params=params,
             param_index={p: i for i, p in enumerate(params)},
             param_annotations=annotations,
+            unordered_value_params=unordered_value_params,
             n_positional=len(positional),
             is_method=is_method,
             is_property=is_property,

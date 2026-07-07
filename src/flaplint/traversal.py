@@ -22,6 +22,7 @@ from .constants import (
     FILE_WRITE_DESCS,
     HASH_CALLS,
     ISINSTANCE_ORDERED_TYPES,
+    LIST_ACCUMULATOR_METHODS,
     MAPPING_MERGE_METHODS,
     MAPPING_WRITE_METHODS,
     MODEL_SERIALIZERS,
@@ -29,22 +30,32 @@ from .constants import (
     ORDERED_ANNOTATIONS,
     PLAN_WRITE_DESC,
     PROPAGATE_CALLS,
+    RENDER_SERIALIZER_CALLS,
     RENDER_SERIALIZERS,
     SANITIZER_CALLS,
     SECRET_WRITE_DESC,
     SET_MUTATION_METHODS,
     STR_SPLIT_METHODS,
     TEMPLATE_RENDER_METHODS,
+    UNORDERED_ANNOTATIONS,
     UNORDERED_ATTRS,
     UNORDERED_CALLS,
     VOLATILE_CALLS,
 )
 from . import databag
 from .handlers import Handler, _RemoteSite
-from .model import FuncInfo, Origin, Registry
+from .model import (
+    FuncInfo,
+    Origin,
+    Registry,
+    is_element,
+    is_itercaller,
+    is_local,
+)
 from .taint import (
     TaintEngine,
     _as_value_position,
+    _as_local_sequence,
     _promote_to_sequence,
 )
 
@@ -108,6 +119,11 @@ class Context:
     #: ``.setdefault()`` on one is known to merge another mapping's key-insertion
     #: order into it -- even when it started from an otherwise-stable empty ``{}``.
     dict_vars: Set[str] = field(default_factory=set)
+    #: variables that are a mapping of *set* values (``Dict[str, Set[str]]`` param, or
+    #: a local bound from one) -- so ``v[k]`` / ``v.get(k)`` / ``v.values()`` yields an
+    #: unordered set. Seeded from ``FuncInfo.unordered_value_params`` and propagated
+    #: across plain ``x = mapping`` aliases.
+    unordered_value_vars: Set[str] = field(default_factory=set)
     cls: Optional[str] = None  # enclosing class of the analyzed function
     #: local variable -> its databag-provenance kind (relation/relation_data/databag)
     databag_kinds: Dict[str, str] = field(default_factory=dict)
@@ -158,6 +174,7 @@ class FunctionAnalyzer:
         ctx = Context(
             env=env,
             types={},
+            unordered_value_vars=set(fi.unordered_value_params),
             cls=cls_override or fi.class_name,
             params=list(fi.params),
             param_annotations=dict(fi.param_annotations),
@@ -173,6 +190,7 @@ class FunctionAnalyzer:
         # annotation, locals by constructor) so an attribute read can resolve its
         # receiver's class -- ``event.certificates`` -> ``CertificatesAvailableEvent``.
         self.engine.set_var_types({**ctx.param_annotations, **ctx.types})
+        self.engine.set_unordered_value_vars(ctx.unordered_value_vars)
         return self.engine.eval(node, ctx.env, ctx.cls)
 
     def _resolve_methods(self, call: ast.Call, ctx: Context) -> List[FuncInfo]:
@@ -216,17 +234,35 @@ class FunctionAnalyzer:
             return
         cls = astutils.ctor_class(value)
         if cls is None and isinstance(value, ast.Call):
-            # ``x = helper()`` where ``helper``'s ``-> Ret`` annotation names a class we
-            # analysed: type ``x`` as ``Ret`` so a later ``x.method()`` resolves on that
-            # class instead of the same-name union (which collides across classes). Only
-            # an analysed class is trusted -- an external/typing return annotation
-            # (``-> List`` / ``-> KubernetesResourceManager``) leaves ``x`` untyped, as
-            # before.
+            # ``x = helper()`` where ``helper``'s ``-> Ret`` annotation names a class:
+            # type ``x`` as ``Ret`` so a later ``x.method()`` resolves on that class
+            # instead of the same-name union (which collides across classes). An
+            # *analysed* class enables real resolution. An *external* class we can't see
+            # into (``-> PolicyResourceManager`` from lightkube) is still recorded, so
+            # the later ``x.method()`` is recognised as an *external* receiver and does
+            # NOT fall back to the same-name union of unrelated user methods -- the
+            # ``prm.reconcile()`` -> ``Nginx.reconcile()`` cross-wire (a mesh-policy list
+            # mis-attributed to nginx's config-file write). This mirrors how a *direct*
+            # external construction (``x = PolicyResourceManager(...)``) already types
+            # ``x`` via ``ctor_class``. Typing/collection roots (``-> List[str]`` ->
+            # ``List``) name no class and are skipped so those stay untyped as before.
+            external: Optional[str] = None
             for fi in self._resolve_methods(value, ctx):
                 rc = fi.returns_class
-                if rc and rc in self.engine._analyzed_classes:
+                if not rc:
+                    continue
+                if rc in self.engine._analyzed_classes:
                     cls = rc
                     break
+                if (
+                    external is None
+                    and rc[:1].isupper()
+                    and rc not in ORDERED_ANNOTATIONS
+                    and rc not in UNORDERED_ANNOTATIONS
+                ):
+                    external = rc
+            if cls is None:
+                cls = external
         if cls:
             ctx.types[target.id] = cls
         elif target.id in ctx.types:
@@ -243,6 +279,12 @@ class FunctionAnalyzer:
             ctx.dict_vars.add(target.id)
         else:
             ctx.dict_vars.discard(target.id)
+        # Propagate mapping-of-set typing across a plain ``x = mapping`` alias, so
+        # ``x[k]`` / ``x.get(k)`` on the alias still knows the value is an unordered set.
+        if isinstance(value, ast.Name) and value.id in ctx.unordered_value_vars:
+            ctx.unordered_value_vars.add(target.id)
+        else:
+            ctx.unordered_value_vars.discard(target.id)
         # ``ctx = self._get_ctx()`` where ``_get_ctx`` is a pure getter (``return
         # self._ctx``): record ``ctx`` as an alias of ``self._ctx``, so a later field
         # mutation on it (``ctx.targets = set(x)``) is charged to the real attribute.
@@ -1081,9 +1123,9 @@ class FunctionAnalyzer:
             # taint engine launders benign key-order-only (``local``) instability
             # to an empty set here, so this never fires on it.
             v = stmt.value
-            if (
-                isinstance(v, ast.Call)
-                and astutils.final_attr(v.func) in RENDER_SERIALIZERS
+            if isinstance(v, ast.Call) and (
+                astutils.final_attr(v.func) in RENDER_SERIALIZERS
+                or astutils.attr_path(v.func) in RENDER_SERIALIZER_CALLS
             ):
                 origins = self._eval(v, ctx)
                 if origins:
@@ -1353,6 +1395,34 @@ class FunctionAnalyzer:
                     argtaint |= self._eval(arg, ctx)
                 if argtaint:
                     ctx.env[root] = set(ctx.env.get(root, ())) | argtaint
+        # List-accumulator *content* propagation: ``L.append(x)`` / ``.extend`` /
+        # ``.insert`` on a plain local list carries the appended value's *content*
+        # instability onto ``L``, so a later recursive serializer descending into the
+        # nested element (``yaml.dump(L)`` / ``crossplane.build(L)`` / ``json.dumps(L)``)
+        # flaps -- the nginx ``_upstreams`` shape (a stable outer loop appends a dict
+        # holding a comprehension over an unordered set). Only *concrete content*
+        # flavors propagate (``local``/``itercaller``/``element``/``volatile``), each
+        # keeping its born-site so the fix anchors at the nested source, not ``L``.
+        # Contract-boundary ``param``/``iterparam`` are excluded -- they would smear a
+        # caller's uncertainty onto every list a param is appended to. Plain ``Name``
+        # receiver only; constructed objects (builders) are handled above via
+        # ``ctx.types``, and the loop-source-unordered case by ``loop_accumulators``.
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id not in ctx.types
+            and call.func.attr in LIST_ACCUMULATOR_METHODS
+        ):
+            recv = call.func.value.id
+            content = {
+                o
+                for arg in call.args
+                for o in self._eval(arg, ctx)
+                if is_local(o) or is_itercaller(o) or is_element(o) or o == "volatile"
+            }
+            if content:
+                ctx.env[recv] = set(ctx.env.get(recv, ())) | content
         self._absorb_into_callee(call, ctx, handler)
         self._scan_expr(stmt.value, ctx, handler)
 
@@ -1461,6 +1531,23 @@ class FunctionAnalyzer:
             self._visit_body(stmt.body, ctx, handler)
         self._visit_body(stmt.orelse, ctx, handler)
 
+    def _mapping_value_view(self, node: ast.AST, ctx: Context) -> Optional[str]:
+        """``"values"``/``"items"`` if ``node`` is ``<uvv>.values()``/``.items()``.
+
+        ``<uvv>`` is a variable known to be a mapping of *set* values
+        (:attr:`Context.unordered_value_vars`), so the values the view yields are
+        unordered sets. ``None`` for anything else.
+        """
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id in ctx.unordered_value_vars
+            and node.func.attr in ("values", "items")
+        ):
+            return node.func.attr
+        return None
+
     def _visit_for(self, stmt: ast.For, ctx: Context, handler: Handler) -> None:
         iter_taint = self._eval(stmt.iter, ctx)
         self._scan_expr(stmt.iter, ctx, handler)
@@ -1504,6 +1591,27 @@ class FunctionAnalyzer:
                         t.id for t in ast.walk(value_elt) if isinstance(t, ast.Name)
                     ):
                         ctx.env[nm] = set(ctx.env.get(nm, ())) | set(pick)
+        # ``for v in d.values()`` / ``for k, v in d.items()`` where ``d`` is a
+        # ``Dict[str, Set[str]]``: each *value* is a set, so bind the value target(s) as
+        # unordered (``local``) -- the loop analogue of ``v = d.get(k)``. For
+        # ``.items()`` only the value element of the ``(key, value)`` tuple is a set;
+        # the key follows dict key order and stays clean.
+        view = self._mapping_value_view(stmt.iter, ctx)
+        if view == "values":
+            value_targets = targets
+        elif view == "items" and isinstance(stmt.target, ast.Tuple) and len(
+            stmt.target.elts
+        ) >= 2:
+            value_targets = [
+                t.id
+                for velt in stmt.target.elts[1:]
+                for t in ast.walk(velt)
+                if isinstance(t, ast.Name)
+            ]
+        else:
+            value_targets = []
+        for nm in value_targets:
+            ctx.env[nm] = set(ctx.env.get(nm, ())) | {("local", None, stmt.iter, None)}
         for inner in astutils.child_bodies(stmt):
             self._visit_body(inner, ctx, handler)
         # If the loop iterates an unordered source, every accumulator it fills
@@ -1516,9 +1624,24 @@ class FunctionAnalyzer:
         # key-order, which key-sorting legitimately launders).
         if iter_taint:
             seq_taint = _promote_to_sequence(iter_taint, stmt.iter)
+            # An *identity-passthrough* list accumulator (``for x in src:
+            # out.append(x)`` -- element appended unchanged, the ``_dedupe_list`` shape)
+            # is an order-preserving copy of ``src``, not a fresh materialization. It
+            # must not mark a *parameter* source as iterated *here* -- that re-anchors a
+            # caller's flap onto this transparent passthrough (losing the real born-site
+            # upstream). ``_as_local_sequence`` still promotes a ``local`` source (a set
+            # copied into a list genuinely materialises), but lets ``param`` pass
+            # through so it flows via ``returns_params`` with the caller's own origin.
+            passthrough = _as_local_sequence(iter_taint, stmt.iter)
+            identity_accs = astutils.identity_passthrough_accumulators(stmt)
             list_accs = astutils.list_loop_accumulators(stmt)
             for acc in astutils.loop_accumulators(stmt):
-                add = seq_taint if acc in list_accs else iter_taint
+                if acc in identity_accs:
+                    add = passthrough
+                elif acc in list_accs:
+                    add = seq_taint
+                else:
+                    add = iter_taint
                 ctx.env[acc] = set(ctx.env.get(acc, ())) | set(add)
         # Loop-variable aliasing: ``for x in c: x[k] = <unordered>`` mutates an
         # element of ``c`` in place, so ``c`` itself becomes order-unstable.

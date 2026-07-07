@@ -291,6 +291,37 @@ def annotation_root(node: Optional[ast.AST]) -> Optional[str]:
     return None
 
 
+#: Annotation roots that denote a mapping whose *values* are a distinct type from its
+#: keys -- so ``Dict[K, V]``'s value type is the second subscript argument.
+_MAPPING_ANNOTATION_ROOTS = {
+    "dict",
+    "Dict",
+    "Mapping",
+    "MutableMapping",
+    "OrderedDict",
+    "defaultdict",
+    "DefaultDict",
+}
+
+
+def mapping_value_root(node: Optional[ast.AST]) -> Optional[str]:
+    """Value-type root of a ``Dict[K, V]`` / ``Mapping[K, V]`` annotation, else ``None``.
+
+    ``Dict[str, Set[str]]`` -> ``"Set"``; ``dict[str, list[int]]`` -> ``"list"``. Used
+    to see that indexing / ``.get()`` / ``.values()`` of a mapping parameter yields a
+    value of type ``V`` -- so a ``Dict[str, Set[str]]`` hands back an *unordered* set
+    even though the mapping itself is key-ordered. Only a two-argument mapping subscript
+    qualifies; anything else returns ``None``.
+    """
+    if isinstance(node, ast.Subscript) and annotation_root(node.value) in _MAPPING_ANNOTATION_ROOTS:
+        sl = node.slice
+        if isinstance(sl, ast.Index):  # py3.8 wraps the slice
+            sl = sl.value
+        if isinstance(sl, ast.Tuple) and len(sl.elts) == 2:
+            return annotation_root(sl.elts[1])
+    return None
+
+
 def _unwrap_optional(sl: ast.AST) -> Optional[str]:
     """Resolve the payload type of an ``Optional``/``Union`` subscript slice.
 
@@ -579,6 +610,40 @@ def list_loop_accumulators(node: ast.For) -> set:
             ):
                 names.add(sub.target.value.id)  # acc[k] += [v]
     return names
+
+
+def identity_passthrough_accumulators(node: ast.For) -> set:
+    """List accumulators filled *only* by appending a loop target *unchanged*.
+
+    ``for x in src: out.append(x)`` (and ``.extend``/``.insert`` of a bare loop
+    target) is an order-preserving *copy/filter* of ``src`` -- the ``_dedupe_list``
+    shape -- not a fresh materialization: it creates no new element order, it
+    inherits ``src``'s. So a caller's flap must not be re-anchored *here* (this
+    passthrough is transparent); its born-site belongs upstream. Excludes any
+    accumulator that also receives a *transformed* element (``out.append(f(x))`` /
+    ``out.append({...})``) or is otherwise mutated -- those genuinely build a new
+    structure and stay materializers.
+    """
+    targets = {t.id for t in ast.walk(node.target) if isinstance(t, ast.Name)}
+    all_identity: dict = {}
+    for sub in ast.walk(node):
+        if not (
+            isinstance(sub, ast.Call)
+            and isinstance(sub.func, ast.Attribute)
+            and isinstance(sub.func.value, ast.Name)
+            and sub.func.attr in LIST_ACCUMULATOR_METHODS
+        ):
+            continue
+        acc = sub.func.value.id
+        # appended value: ``insert(i, v)`` -> args[1]; ``append``/``extend`` -> args[0]
+        val = (
+            sub.args[1]
+            if sub.func.attr == "insert" and len(sub.args) >= 2
+            else (sub.args[0] if sub.args else None)
+        )
+        is_identity = isinstance(val, ast.Name) and val.id in targets
+        all_identity[acc] = all_identity.get(acc, True) and is_identity
+    return {acc for acc, ident in all_identity.items() if ident}
 
 
 def file_write_args(call: ast.Call) -> Optional[Tuple[str, List[ast.expr]]]:

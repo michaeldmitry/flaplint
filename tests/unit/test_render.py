@@ -295,3 +295,55 @@ def test_confirmed_iteration_description_does_not_blame_the_caller():
     assert "unordered source iterated without sorted()" in text
     assert "It reaches" not in text  # location is inline, not a trailing sentence
     assert "rendered workload config at charm.py:6" in text
+
+
+def test_crossfile_iteration_carrier_is_not_called_the_iteration_site():
+    # A ``kind=caller`` iteration finding whose born site is in *another file* anchors
+    # at a downstream *carrier* -- often not even a collection (``_nginx_config()``
+    # returns a str; ``json.dumps(jobs)`` a serialized blob). The disorder was baked
+    # in by an unsorted iteration upstream. So the description must not claim the
+    # subject "is an unordered source iterated" at this line; it *carries* pre-baked
+    # disorder. Discriminated by origin_path being a different file (mirrors the
+    # cross-file ``unordered-pick`` carrier branch).
+    f = Finding(
+        path="src/charm.py", line=165, col=9, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="file", variable="_nginx_config()",
+        origin_path="lib/nginx.py", origin_line=594, via="addresses",
+        sink_path="lib/nginx.py", sink_line=972,
+    )
+    text = _describe_of(f)
+    assert "carries a value whose element order was baked in" in text
+    assert "is an unordered source iterated" not in text
+    assert "Fix at the source" in text  # still points at the real iteration
+    assert "addresses" in text
+
+
+def test_param_boundary_iteration_blames_the_caller_not_the_parameter():
+    # A confirmed iteration of a *formal parameter* with no single born site (several
+    # callers feed it) -- cos-proxy's ``_label_alert_rules(unit_rules, ...)``. The
+    # reader can't see from this line *why* the param is unordered, so the description
+    # must name the caller boundary and offer the type-annotation fix, not imply the
+    # parameter is intrinsically unordered.
+    f = Finding(
+        path="src/agg.py", line=678, col=33, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="databag", variable="unit_rules",
+        via_param=True, sink_path="src/agg.py", sink_line=201,
+    )
+    text = _describe_of(f)
+    assert "a caller passes an unordered collection into `unit_rules`" in text
+    assert "is an unordered source iterated" not in text
+    assert "annotate `unit_rules` as dict/list" in text
+
+
+def test_samefile_iteration_born_here_still_says_iterated_here():
+    # The carrier rewording must NOT swallow a same-file born-here iteration: when the
+    # unsorted iteration is at *this* line (origin absent, or in the same file), the
+    # subject really is the source being looped -- keep the direct "iterated" wording.
+    f = Finding(
+        path="lib/nginx.py", line=594, col=45, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="render", variable="addresses",
+        sink_path="lib/nginx.py", sink_line=450,
+    )
+    text = _describe_of(f)
+    assert "is an unordered source iterated without sorted()" in text
+    assert "carries a value whose element order" not in text

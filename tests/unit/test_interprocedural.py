@@ -795,3 +795,51 @@ def test_local_builder_absorbing_setter_still_flags(lint_source):
         """
     )
     assert findings
+
+
+def test_identity_passthrough_helper_keeps_flap_at_callers_source(lint_source):
+    # An identity-passthrough helper (``for x in items: out.append(x)`` -- element
+    # appended unchanged, the ``_dedupe_list`` shape) is an order-preserving copy, not a
+    # materialization. A caller's flap flows *through* it and must anchor at the
+    # caller's own unordered source -- NOT be re-anchored onto the passthrough's
+    # iteration (the misattribution that says "sort here" where sorting won't help).
+    # Recall is preserved (the databag still flaps); only the fix site is corrected.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def _dedupe(self, items):
+                out = []
+                for x in items:
+                    if x not in out:
+                        out.append(x)
+                return out
+            def go(self):
+                jobs = [j for j in set(self._x)]
+                self.relation.data[self.app]["v"] = json.dumps(self._dedupe(jobs))
+        """
+    )
+    dbs = [f for f in findings if f.sink == "databag"]
+    assert dbs                                    # recall preserved -- the databag flaps
+    # attributed to the caller's ``set(...)`` source, not the ``_dedupe`` passthrough
+    assert all(f.variable == "set" for f in dbs)
+
+
+def test_transforming_helper_still_materializes(lint_source):
+    # Contrast: a helper that *transforms* each element (``out.append({...x...})``)
+    # genuinely builds a new sequence, so it must still be flagged as a materializer --
+    # the identity-passthrough carve-out must not swallow this recall.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def _wrap(self, items):
+                out = []
+                for x in items:
+                    out.append({"v": x})
+                return out
+            def go(self):
+                self.relation.data[self.app]["v"] = json.dumps(self._wrap(set(self._x)))
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)

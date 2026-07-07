@@ -187,12 +187,39 @@ def _describe(f: Finding) -> str:
                 f"reaches {target_at}."
             )
     elif f.rule == "unordered-iteration":
-        if f.kind == "caller":
-            # Confirmed: an unordered value was traced *into* this iteration. The
-            # subject is the source being looped, not the sequence built from it,
-            # so say plainly that iterating it bakes the disorder into element
-            # order. The "Fix at the source" trail below points at where that
-            # source is born.
+        if f.kind == "caller" and f.origin_path and _relpath(f.origin_path) != _relpath(f.path):
+            # Cross-file: the born site -- where the disorder is baked in by an
+            # unsorted iteration -- is upstream in another file. The subject *here*
+            # is not the thing being iterated; it is a *carrier* (typically a
+            # rendered string, a ``json.dumps`` result, or a stored-state read-back)
+            # that transports the already-ordered-by-accident sequence to this sink.
+            # So don't claim it "is an unordered source iterated" at this line (it
+            # may not even be a collection -- ``_nginx_config()`` returns a str). The
+            # "Fix at the source" trail below names where the iteration truly is.
+            # Mirrors the cross-file carrier branch of ``unordered-pick`` above.
+            core = (
+                f"{subject} carries a value whose element order was baked in by an "
+                f"unsorted iteration, before it reaches {target_at}."
+            )
+        elif f.via_param:
+            # Confirmed contract boundary: the iterated value is a *parameter* fed an
+            # unordered collection by a caller (there may be several, so no single born
+            # site). Don't imply the parameter is intrinsically unordered -- name the
+            # caller boundary, which is the "why" a reader can't see from this line,
+            # and give both fixes (sort here, or tighten the parameter's type so
+            # callers must pass an ordered collection).
+            core = (
+                f"a caller passes an unordered collection into {subject} (a parameter), "
+                f"and iterating it without sorted() bakes that disorder into a sequence "
+                f"written to {target_at}. Sort at the iteration (sorted({subject})), or "
+                f"annotate {subject} as dict/list so callers must pass an ordered type."
+            )
+        elif f.kind == "caller":
+            # Confirmed *and* born here: an unordered value is iterated at this very
+            # line. The subject is the source being looped, not the sequence built
+            # from it, so say plainly that iterating it bakes the disorder into
+            # element order. Any "Fix at the source" trail below points at where that
+            # source is born (a same-file helper, when present).
             core = (
                 f"{subject} is an unordered source iterated without sorted() to "
                 f"build a sequence written to {target_at}."

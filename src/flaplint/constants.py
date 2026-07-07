@@ -543,6 +543,17 @@ PLAN_WRITE_DESC = "pebble plan (replan / service-restart gate)"
 #: on it (the taint engine returns an empty origin set for that case).
 RENDER_SERIALIZERS: Set[str] = {"dump", "safe_dump", "dumps"}
 
+#: Dotted-name serializers whose return value is a rendered config blob, but whose
+#: bare method name is too common to live in :data:`RENDER_SERIALIZERS` (matched by
+#: last component only). ``crossplane.build(directives)`` renders an nginx config
+#: string from a list of directive dicts *preserving list order* -- so an unordered
+#: source baked into that list (nginx upstream ``server`` lines built by iterating a
+#: ``Set`` of worker addresses) survives, unsorted, into the config text and flaps the
+#: file. Vendored fleet-wide by ``cos-coordinated-workers`` (every COS coordinator:
+#: loki, mimir, tempo, parca...). Matched on the full ``receiver.method`` path so a
+#: charm's own ``x.build()`` is unaffected.
+RENDER_SERIALIZER_CALLS: Set[str] = {"crossplane.build"}
+
 #: Template-render methods (Jinja2 ``template.render(**context)``). The analyzer
 #: cannot see inside a ``.j2`` template, so it treats a render as building text out
 #: of its arguments: if any argument is order-unstable (a set, a volatile value, or

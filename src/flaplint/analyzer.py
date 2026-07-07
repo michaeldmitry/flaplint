@@ -30,7 +30,7 @@ from .discovery import (
     sink_dep_roots,
 )
 from .model import FileImports, Finding, FuncInfo, Registry
-from .report import report
+from .report import collapse_pipelines, report
 from .summary import compute_summaries, mark_databag_accessors
 from .taint import TaintEngine
 from .traversal import FunctionAnalyzer
@@ -180,6 +180,10 @@ class Analyzer:
                 )
             )
         self._classify_levels(findings)
+        # Pipeline collapse runs here -- after ownership is known -- so the survivor
+        # of a source+carriers group is chosen by error-over-warning, not by an
+        # accidental absolute-path ordering that favours the vendored copy.
+        findings = collapse_pipelines(findings)
         self._relativize(findings)
         cwd = os.getcwd()
         for g in gaps:

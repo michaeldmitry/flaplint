@@ -194,6 +194,16 @@ class Finding:
     #: for ordinary statically-resolved findings.
     via_subclass: str = ""
     via_attr: str = ""
+    #: set when the iterated value is a *formal parameter* of the enclosing function
+    #: and the flap has no single born site -- a confirmed ``kind=caller``
+    #: ``unordered-iteration`` at a *contract boundary*, where the disorder enters
+    #: through whichever caller passes an unordered collection into the parameter
+    #: (cos-proxy's ``_label_alert_rules(unit_rules, ...)`` is fed unordered dicts by
+    #: three callers, so there is no one origin to point at). Lets the description
+    #: attribute the instability to the caller boundary -- "a caller passes an
+    #: unordered collection into ``unit_rules``" -- instead of implying the parameter
+    #: is intrinsically unordered. ``False`` for every other finding.
+    via_param: bool = False
 
     def format(self) -> str:
         """Render as ``path:line:col: owner=... confidence=... key=value ...``.
@@ -267,6 +277,11 @@ class FuncInfo:
     params: List[str] = field(default_factory=list)
     param_index: Dict[str, int] = field(default_factory=dict)
     param_annotations: Dict[str, Optional[str]] = field(default_factory=dict)
+    #: parameters annotated as a mapping whose *value* type is an unordered set
+    #: (``Dict[str, Set[str]]``), so ``p[k]`` / ``p.get(k)`` / ``p.values()`` hand back
+    #: an unordered collection -- iterating one unsorted flaps. The mapping's own key
+    #: order is laundered by serializers, but its set *values* are not.
+    unordered_value_params: Set[str] = field(default_factory=set)
     n_positional: int = 0
     is_method: bool = False
     is_property: bool = False

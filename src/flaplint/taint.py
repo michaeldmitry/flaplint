@@ -251,6 +251,10 @@ class TaintEngine:
         #: (params by annotation, locals by constructor). Set per ``eval`` entry by
         #: the traversal so an attribute read can resolve its receiver's class.
         self._var_types: Dict[str, str] = {}
+        #: names bound to a mapping of *set* values (``Dict[str, Set[str]]``): a
+        #: ``v[k]`` / ``v.get(k)`` / ``v.values()`` on one hands back an unordered set.
+        #: Set per-scope by the traversal from ``FuncInfo.unordered_value_params``.
+        self._unordered_value_vars: Set[str] = set()
         self.relations_unordered = relations_unordered
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
@@ -274,6 +278,15 @@ class TaintEngine:
         the traversal before each ``eval`` with the live context (params + locals).
         """
         self._var_types = {k: v for k, v in var_types.items() if v}
+
+    def set_unordered_value_vars(self, names: Set[str]) -> None:
+        """Names whose indexed/``.get()``/``.values()`` value is an unordered set.
+
+        A ``Dict[str, Set[str]]`` parameter (and locals aliased from one): the mapping
+        is key-ordered, but the *values* it hands back are sets. Set per-scope by the
+        traversal so the ``.get()`` / subscript rules can taint the extracted value.
+        """
+        self._unordered_value_vars = names
 
     def record_instance_attr(
         self, cls_ctx: Optional[str], attr: str, origins: Set[Origin]
@@ -448,7 +461,12 @@ class TaintEngine:
         if isinstance(node, (ast.List, ast.Tuple)):
             out = set()
             for elt in node.elts:
-                out |= self.eval(elt, env, cls_ctx, _depth + 1)
+                # ``[*spread]`` unpacks another iterable *in order* into this list, so
+                # the spread's element taint (an unordered source materialised via
+                # ``*upstreams``) carries into the new list -- evaluate the spread's
+                # operand, not the (untainted) ``Starred`` wrapper.
+                target = elt.value if isinstance(elt, ast.Starred) else elt
+                out |= self.eval(target, env, cls_ctx, _depth + 1)
             return out
 
         if isinstance(node, ast.Subscript):
@@ -456,6 +474,14 @@ class TaintEngine:
             # related Relation objects in Juju ``relation-ids`` order, which is
             # not contractually sorted. Opt-in only.
             if self.relations_unordered and astutils.final_attr(node.value) == "relations":
+                return {("local", None, node, None)}
+            # ``d[k]`` where ``d`` is a ``Dict[str, Set[str]]``: the extracted value is a
+            # *set*, so it carries set-order (``local``) instability regardless of the
+            # key -- the mapping analogue of the ``d.get(k)`` rule below.
+            if (
+                isinstance(node.value, ast.Name)
+                and node.value.id in self._unordered_value_vars
+            ):
                 return {("local", None, node, None)}
             # Dict-by-fixed-key read-back: ``d['jobs']`` where a per-key taint was
             # recorded at the dict literal (stored under the compound ``env`` key
@@ -766,10 +792,12 @@ class TaintEngine:
                 # control parameters that do NOT flow into the output, so they must not
                 # be arg-propagated by the default rule below.
                 return out | {o for o in recv_taint if o[0] not in ("param", "iterparam")}
-            if name == "get" and not resolved:
-                # ``d.get(key[, default])`` is a single keyed extraction -- the method
-                # analogue of the ``d[key]`` subscript -- so it launders the *mapping's
-                # own order* while PRESERVING *value* taint. Precisely: a value fetched
+            if name in ("get", "setdefault") and not resolved:
+                # ``d.get(key[, default])`` (and ``d.setdefault(key, default)``, which
+                # likewise *returns* the value at ``key``) is a single keyed extraction --
+                # the method analogue of the ``d[key]`` subscript -- so it launders the
+                # *mapping's own order* while PRESERVING *value* taint. Precisely: a value
+                # fetched
                 # by key does not depend on the mapping's iteration order, so the
                 # collection-order flavors (``itercaller``/``local``) that describe the
                 # container's disorder are dropped; a value-position pick
@@ -807,6 +835,12 @@ class TaintEngine:
                         if keyed in env:
                             return out | set(env[keyed])
                 out |= {o for o in recv_taint if is_element(o) or is_iterparam(o)}
+                # ``d.get(k)`` where ``d`` is a ``Dict[str, Set[str]]`` hands back a
+                # *set* value: the mapping's key order is laundered, but the extracted
+                # value is itself an unordered collection.
+                base = call.func.value
+                if isinstance(base, ast.Name) and base.id in self._unordered_value_vars:
+                    out.add(("local", None, call, None))
                 for a in call.args[1:]:
                     if not isinstance(a, ast.Starred):
                         out |= self.eval(a, env, cls_ctx, depth + 1)

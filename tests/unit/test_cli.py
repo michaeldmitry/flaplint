@@ -68,6 +68,7 @@ def test_json_output_shape(tmp_path, capsys):
         "scope",
         "via_subclass",
         "via_attr",
+        "via_param",
     }
     assert entry["kind"] == "caller"
     assert entry["confidence"] == "high"

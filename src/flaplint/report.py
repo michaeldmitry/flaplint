@@ -98,6 +98,30 @@ def report(
                 best_name, best_start = fi.name, start
         return best_name
 
+    def _is_unannotated_enclosing_param(path: str, line: int, name: str) -> bool:
+        """Is ``name`` an *unannotated* formal parameter of the function at ``line``?
+
+        Distinguishes an iterated *parameter* whose disorder is invisible from this
+        line (an unannotated contract boundary -- the "why" is a caller passing an
+        unordered collection) from both an intrinsically-unordered local and an
+        *annotated* param (``peer_unit_names: Set[str]``), where the signature already
+        shows why it is unordered and the direct wording reads fine. Only the
+        invisible case earns the caller-boundary rephrasing.
+        """
+        if not name:
+            return False
+        best_start, best = -1, None
+        for fi in functions:
+            if fi.path != path:
+                continue
+            start = getattr(fi.node, "lineno", 0)
+            end = getattr(fi.node, "end_lineno", start) or start
+            if start <= line <= end and start > best_start:
+                best_start, best = start, fi
+        if best is None or name not in best.params:
+            return False
+        return not best.param_annotations.get(name)
+
     def emit(
         path: str,
         node: ast.AST,
@@ -156,6 +180,17 @@ def report(
         origin_path, origin_line, via = "", 0, ""
         if origin and (origin[0], origin[1]) != (path, line):
             origin_path, origin_line, via = origin[0], origin[1], origin[2]
+        # Contract-boundary iteration: a confirmed unordered iteration of a *formal
+        # parameter* with no single born site -- the disorder enters through whichever
+        # caller passes an unordered collection in. Flagged only when there is no
+        # upstream origin (a named born site would already explain it) so the report
+        # can attribute it to the caller boundary rather than the parameter itself.
+        via_param = (
+            rule == "unordered-iteration"
+            and kind == "caller"
+            and not origin_path
+            and _is_unannotated_enclosing_param(path, line, variable)
+        )
         findings.append(
             Finding(
                 path,
@@ -175,6 +210,7 @@ def report(
                 scope="" if variable else _enclosing_scope(path, line),
                 via_subclass=via_subclass,
                 via_attr=via_attr,
+                via_param=via_param,
             )
         )
 
@@ -328,3 +364,91 @@ def report(
         gaps = sorted(deduped, key=lambda g: (g.path, g.line, g.col))
 
     return findings, gaps
+
+
+def collapse_pipelines(findings: List[Finding]) -> List[Finding]:
+    """Collapse the redundant call-path *duplicates* of one write into one finding.
+
+    When one upstream unstable source -- itself independently flagged -- reaches *the
+    same physical write* through more than one call path, each path produces a finding
+    that is byte-for-byte the same churn with the same fix. The nginx shape: a set
+    iterated into a rendered config, that rendered string then pushed to one file, but
+    reached via both the charm's ``_nginx_config()`` wrapper and the coordinator's
+    ``nginx_config`` -- two findings, one write, one ``sorted()`` fix. Keep the single
+    most actionable one: code the charm *owns* (an error) over a vendored dependency
+    (a warning), the *confirmed* trace over a precautionary boundary, higher confidence
+    first, then the most *downstream* (leaf) anchor -- the one in the consuming code
+    that re-attribution exists to surface. The survivor still names the upstream fix
+    (via its "Fix at the source" trail), so no fix location is ever lost.
+
+    Deliberately *narrow* -- grouped by ``(source, physical write)``, not by source
+    alone. A source that fans out to two **different** sinks (a databag *and* a file,
+    or a databag *and* a secret) keeps a finding per sink: those are distinct churn
+    symptoms even when one ``sorted()`` fixes both, so merging them across sinks would
+    hide real signal (measured at ~70 fleet-wide). Only literal same-write duplicates
+    -- zero information difference beyond which call path surfaced them -- collapse.
+
+    Safety invariants: a finding only groups when its origin lands *on another
+    finding's anchor* (the source is already flagged with its own fix), so a value
+    whose shared source is a mere unflagged *parameter* (the traefik databag+secret
+    shape) is never grouped. Two *distinct* sources into one write (postgresql's
+    patroni.yaml) have different origins -> different groups -> both survive.
+
+    Must run *after* ``f.level`` is assigned (ownership classification): the
+    error/warning axis is the primary tie-break, and before it is set every finding
+    defaults to ``error`` -- which would silently fall through to the path tie-break
+    and (with absolute paths) prefer the vendored ``.venv`` copy over owned ``src``.
+    """
+    anchor_set = {(f.path, f.line) for f in findings}
+    carrier_roots = {
+        (f.origin_path, f.origin_line)
+        for f in findings
+        if f.origin_path and (f.origin_path, f.origin_line) in anchor_set
+    }
+    if not carrier_roots:
+        return findings
+
+    conf_rank = {"high": 0, "medium": 1, "low": 2}
+
+    def _root_of(f: Finding):
+        if f.origin_path and (f.origin_path, f.origin_line) in carrier_roots:
+            return (f.origin_path, f.origin_line)
+        if (f.path, f.line) in carrier_roots:
+            return (f.path, f.line)
+        return None
+
+    def _sink_loc(f: Finding):
+        # The physical write -- an off-anchor sink pointer when present (the write is a
+        # helper/lines away), else the finding's own line. Two findings collapse only
+        # when this *and* the source match: same value, same write, different call path.
+        return (
+            f.sink_path or f.path,
+            f.sink_line or f.line,
+            f.sink,
+        )
+
+    def _group_of(f: Finding):
+        r = _root_of(f)
+        return None if r is None else (r, _sink_loc(f))
+
+    def _priority(f: Finding):
+        return (
+            0 if f.level == "error" else 1,       # owned (actionable) first
+            conf_rank.get(f.confidence, 3),       # more confident first
+            0 if f.kind == "caller" else 1,       # confirmed before precautionary
+            # leaf before root: the most downstream finding (nothing carries from it)
+            # is the one in the consuming code that re-attribution exists to surface.
+            1 if (f.path, f.line) in carrier_roots else 0,
+            f.path, f.line, f.col,                # stable, deterministic
+        )
+
+    winners: "Dict[Tuple, Finding]" = {}
+    for f in findings:
+        g = _group_of(f)
+        if g is None:
+            continue
+        cur = winners.get(g)
+        if cur is None or _priority(f) < _priority(cur):
+            winners[g] = f
+    keep = {id(w) for w in winners.values()}
+    return [f for f in findings if _group_of(f) is None or id(f) in keep]
