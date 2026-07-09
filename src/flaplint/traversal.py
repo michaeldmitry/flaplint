@@ -181,6 +181,11 @@ class FunctionAnalyzer:
             func_path=fi.path,
             func_name=fi.name,
         )
+        # Give the handler a live reference to this walk's environment so a sink can
+        # name the *volatile* leaf of a container (``{"id": test_uuid, ...}``) rather
+        # than the first ordered key. ``ctx.env`` is one mutable dict for the whole
+        # function, so at sink time it reflects the flow-sensitive state.
+        handler.ctx = ctx
         self._visit_body(getattr(fi.node, "body", []), ctx, handler)
 
     # -- helpers ------------------------------------------------------------
@@ -192,6 +197,25 @@ class FunctionAnalyzer:
         self.engine.set_var_types({**ctx.param_annotations, **ctx.types})
         self.engine.set_unordered_value_vars(ctx.unordered_value_vars)
         return self.engine.eval(node, ctx.env, ctx.cls)
+
+    def _prefer_same_file(self, cands: List[FuncInfo], ctx: Context) -> List[FuncInfo]:
+        """Break a same-name tie toward a definition in the caller's own file.
+
+        A charm vendors several versions of a library side by side (``.../v0/foo.py``
+        and ``.../v1/foo.py``), each a self-contained module that re-declares the
+        *same* class and method names. ``class_name`` is a bare string, so both
+        versions' definitions match a receiver's class chain and their summaries and
+        born-site/sink pointers bleed across versions -- yielding an impossible trace
+        (a ``v0`` databag write blamed on a ``v1`` function ``v0`` never calls) or a
+        cross-version phantom finding. Each version's internal calls stay inside its
+        own file, so when the caller's file itself defines a matching candidate that
+        is the right one. Fall back to the cross-file union only when it does not (a
+        genuine library call, or real cross-file inheritance).
+        """
+        if len(cands) <= 1 or not ctx.func_path:
+            return cands
+        same = [fi for fi in cands if fi.path == ctx.func_path]
+        return same or cands
 
     def _resolve_methods(self, call: ast.Call, ctx: Context) -> List[FuncInfo]:
         """Candidate definitions for a call, narrowed by receiver class if known."""
@@ -206,7 +230,11 @@ class FunctionAnalyzer:
                 chain = self.engine._class_chain(cls)
                 matched = [fi for fi in candidates if fi.class_name in chain]
                 if matched:
-                    return matched
+                    # Pin a typed cross-module receiver to the version it was imported
+                    # from (``v0`` vs ``v1``); ``_prefer_same_file`` handles ``self``
+                    # calls (same-module by construction). Both fall back to the union.
+                    matched = self.engine._pin_to_import(matched, cls)
+                    return self._prefer_same_file(matched, ctx)
             # Receiver precisely typed to a class we have *no definition* for -- an
             # external library type (``self._krm = KubernetesResourceManager(...)`` from
             # lightkube). Do NOT fall back to the same-name union of *unrelated* user
@@ -227,7 +255,7 @@ class FunctionAnalyzer:
                 recv = call.func.value
                 if not (isinstance(recv, ast.Name) and recv.id in ("self", "cls")):
                     return []
-        return candidates
+        return self._prefer_same_file(candidates, ctx)
 
     def _record_type(self, target: ast.AST, value: ast.AST, ctx: Context) -> None:
         if not isinstance(target, ast.Name):

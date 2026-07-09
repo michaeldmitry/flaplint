@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 import shutil
 import textwrap
-from typing import Dict, List, Sequence
+from typing import Dict, List, Sequence, Tuple
 
 from .model import Finding, Gap
 
@@ -239,7 +239,7 @@ def _describe(f: Finding) -> str:
             # any value inside it, so don't name a single subject -- explain that the
             # builtin hash() is nondeterministic across Juju hooks.
             core = (
-                "The builtin hash() returns a different value on every Juju hook even "
+                "The builtin hash() returns a different value on every invocation even "
                 "when the hashed content is identical. "
             )
         elif is_detector:
@@ -331,6 +331,7 @@ def render_report(
     *,
     colour: bool = True,
     width: int = 0,
+    scanned: "Sequence[Tuple[str, str]]" = (),
 ) -> str:
     """Return the full pretty report for *findings* as a single string."""
     p = _Palette(colour)
@@ -338,8 +339,12 @@ def render_report(
         width = min(shutil.get_terminal_size(fallback=(90, 24)).columns, 100)
 
     banner = (
-        p.bold("flaplint") + "  " + p.dim("· charm flapping checker")
+        p.bold("flaplint")
     )
+    if scanned:
+        # git provenance of the scanned source, so the run is reproducible.
+        stamp = "  ".join(f"{name} {p.dim(ver)}" for name, ver in scanned)
+        banner += p.dim("  · ") + stamp
 
     if not findings:
         body = (
@@ -466,10 +471,4 @@ def _summary(findings: Sequence[Finding], files_scanned: int, p: _Palette) -> st
     parts.append(p.dim(f"· {files_scanned} file(s) scanned"))
     summary = "  " + "   ".join(parts)
 
-    # Spell out the two marks so the ownership axis is never read as severity:
-    # confidence (how sure) is a separate word on each finding's meta line.
-    legend = (
-        "  " + p.red("✖") + p.dim(" yours — fails the run     ")
-        + p.yellow("▲") + p.dim(" in a dependency — non-blocking")
-    )
-    return rule + "\n" + summary + "\n" + legend + "\n"
+    return rule + "\n" + summary

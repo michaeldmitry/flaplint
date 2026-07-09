@@ -86,19 +86,20 @@ def test_dependency_finding_reads_as_ownership_not_severity():
     # mark + footer legend, not repeated as words on each finding.
     assert "▲" in report
     assert "warning" not in report
-    assert "in a dependency" in report  # summary tally + legend
+    assert "in dependencies" in report  # summary tally
     assert "high confidence" in report  # confidence still on the header
     # Ownership words are NOT duplicated onto the finding line.
     assert "not yours to fix" not in report
 
 
-def test_owned_finding_shows_confidence_and_legend_explains_marks():
+def test_owned_finding_shows_confidence_and_marks():
     report = render_report([_finding(level="error")], files_scanned=1, colour=False)
     assert "✖" in report
     assert "high confidence" in report
-    # The header carries confidence only; ownership lives on the mark + legend.
+    # The header carries confidence only; ownership lives on the ✖ mark and the
+    # summary tally ("N yours"), not repeated as words on each finding line.
     assert "yours to fix" not in report
-    assert "fails the run" in report  # legend spells out ✖
+    assert "yours" in report  # summary tally names ownership
 
 
 def test_colour_enabled_respects_no_color(monkeypatch):

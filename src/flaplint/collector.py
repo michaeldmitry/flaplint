@@ -92,7 +92,14 @@ class Collector(ast.NodeVisitor):
         # ``from json import dumps`` records an (harmless) identity mapping.
         for alias in node.names:
             if alias.name != "*":
-                self.imports.names[alias.asname or alias.name] = alias.name
+                bound = alias.asname or alias.name
+                self.imports.names[bound] = alias.name
+                # Absolute ``from a.b.c import Name`` -- remember the module so a
+                # later ``Name(...).method()`` can be pinned to *that* file's class
+                # rather than the same-name union across vendored lib versions.
+                # (Relative imports carry ``level > 0`` and no resolvable module here.)
+                if node.module and not node.level:
+                    self.imports.from_modules[bound] = node.module
 
     def _add_function(self, node: ast.AST) -> None:
         args = node.args  # type: ignore[attr-defined]

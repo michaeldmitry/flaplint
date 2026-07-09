@@ -44,6 +44,18 @@ _MAPPING_PARAM_TYPES = frozenset(
 )
 
 
+def _module_matches_path(path: str, module: str) -> bool:
+    """Does file ``path`` implement dotted ``module`` (``a.b.c`` <- ``.../a/b/c.py``)?
+
+    A suffix match: the file need only *end* with the module's path form, so an
+    absolute ``.../lib/charms/foo/v0/bar.py`` matches ``charms.foo.v0.bar``. Also
+    accepts a package ``__init__.py``.
+    """
+    tail = module.replace(".", "/")
+    stem = path[:-3] if path.endswith(".py") else path
+    return stem.endswith("/" + tail) or stem.endswith("/" + tail + "/__init__")
+
+
 def _survives_stringify(origins: Set[Origin]) -> Set[Origin]:
     """Origins that survive a non-sorting serializer (``str``/``repr``/``encode``).
 
@@ -267,6 +279,8 @@ class TaintEngine:
         #: path -> that file's import aliases (set per-file via ``enter``).
         self.file_imports = file_imports or {}
         self._aliases = FileImports()
+        self._current_path: Optional[str] = None
+        self._subclass_map: Optional[Dict[str, List[str]]] = None
         #: class name -> ``{attr -> origins}``: the taint an instance attribute
         #: carries, unioned over every ``self.<attr> = <expr>`` assignment in any
         #: method of the class. Lets taint survive being parked on ``self`` in one
@@ -317,7 +331,13 @@ class TaintEngine:
         key = astutils.self_attr_key(node)
         if key is None:
             return set()
-        return set(self.instance_attr_taint.get(cls_ctx, {}).get(key, ()))
+        out = set(self.instance_attr_taint.get(cls_ctx, {}).get(key, ()))
+        # Downward dispatch: a base method reading ``self.<attr>`` may run on a
+        # subclass instance that assigned that attribute a different (unstable) value.
+        # An attribute is as overridable as a method, so union subclass recordings.
+        for sub in self._class_descendants(cls_ctx):
+            out |= set(self.instance_attr_taint.get(sub, {}).get(key, ()))
+        return out
 
     def _instance_attr_subscript_taint(
         self, node: ast.Subscript, cls_ctx: Optional[str]
@@ -342,7 +362,10 @@ class TaintEngine:
         if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
             return set()
         attr = f"{base.attr}[{key.value!r}]"
-        return set(self.instance_attr_taint.get(cls_ctx, {}).get(attr, ()))
+        out = set(self.instance_attr_taint.get(cls_ctx, {}).get(attr, ()))
+        for sub in self._class_descendants(cls_ctx):  # downward dispatch (see above)
+            out |= set(self.instance_attr_taint.get(sub, {}).get(attr, ()))
+        return out
 
     @staticmethod
     def coerce_to_sequence_field(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
@@ -379,6 +402,7 @@ class TaintEngine:
         its canonical name. Safe because functions are walked one at a time.
         """
         self._aliases = self.file_imports.get(path) or FileImports()
+        self._current_path = path
 
     # -- public -------------------------------------------------------------
 
@@ -929,6 +953,23 @@ class TaintEngine:
                     out |= self.eval(kw.value, env, cls_ctx, depth + 1)
         return out
 
+    def _pin_to_import(self, cands, class_name):
+        """Narrow same-name candidates to the module ``class_name`` was imported from.
+
+        When the current file does ``from charms.foo.v0.bar import C``, a receiver
+        typed to ``C`` must resolve to ``v0``'s definition, not the ``v0``+``v1``
+        union of the same class name. Falls back to the union when the import can't
+        be pinned (``C`` defined locally, a relative import, no matching file).
+        """
+        if len(cands) <= 1 or not class_name or not self._current_path:
+            return cands
+        fi_imports = self.file_imports.get(self._current_path)
+        module = fi_imports.from_modules.get(class_name) if fi_imports else None
+        if not module:
+            return cands
+        pinned = [fi for fi in cands if _module_matches_path(fi.path, module)]
+        return pinned or cands
+
     def _resolve_summary_candidates(self, call, name, cls_ctx):
         """Candidate callees for return-summary lookup.
 
@@ -947,9 +988,40 @@ class TaintEngine:
             and isinstance(call.func.value, ast.Name)
             and call.func.value.id in ("self", "cls")
         ):
-            own = [fi for fi in candidates if fi.class_name == cls_ctx]
-            if own:
-                return own
+            exact = [fi for fi in candidates if fi.class_name == cls_ctx]
+            if exact:
+                # A charm vendors several versions of a library (``.../v0/foo.py`` and
+                # ``.../v1/foo.py``), each re-declaring the *same* class and methods.
+                # ``class_name`` is a bare string, so both versions' definitions match
+                # and their return-summaries union -- so a ``v0`` value inherits a
+                # ``v1`` function's born-site (an impossible cross-version trace). A
+                # ``self``/``cls`` call is always intra-module, so the definition in the
+                # *current file* is the only correct one; keep the cross-file union
+                # only when this file has no such method (inherited from a base).
+                same_file = [fi for fi in exact if fi.path == self._current_path]
+                exact = same_file or exact
+            # Downward dispatch: ``self.foo()`` in a base method may run on a subclass
+            # instance and dispatch to its override (the base copy is often an abstract
+            # stub or a clean default). Add subclass overrides so a base aggregator like
+            # ``_loki_config`` picks up an override's instability. Not same-file-filtered
+            # -- an override legitimately lives in the subclass's own file.
+            overrides = [
+                fi for fi in candidates
+                if fi.class_name in self._class_descendants(cls_ctx)
+            ]
+            if exact or overrides:
+                return exact + overrides
+        # A *typed* cross-module receiver (``p = GrafanaSourceProvider(...); p.foo()``):
+        # pin to the class from the module the receiver's type was imported from, so a
+        # charm that imports the ``v0`` provider resolves to ``v0`` -- not the ``v0``+
+        # ``v1`` union of the same class name.
+        if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+            recv_cls = self._var_types.get(call.func.value.id)
+            if recv_cls:
+                by_cls = [fi for fi in candidates if fi.class_name == recv_cls]
+                pinned = self._pin_to_import(by_cls or candidates, recv_cls)
+                if pinned is not (by_cls or candidates):
+                    return pinned
         if name in BUILTIN_COLLECTION_METHODS and isinstance(call.func, ast.Attribute):
             recv = call.func.value
             is_self = isinstance(recv, ast.Name) and recv.id in ("self", "cls")
@@ -1016,10 +1088,13 @@ class TaintEngine:
         """
         out: Set[Origin] = set()
         if fi.returns_element:
-            if fi.element_site is not None:
-                out.add(
-                    ("element", fi.element_site[0], fi.element_site[1], fi.element_site[2])
-                )
+            # One origin per *distinct* pick site (not just the earliest): a returned
+            # config that aggregates several unstable picks yields a finding for each,
+            # so every place needing a ``sorted()`` gets its own report entry.
+            sites = fi.element_sites or ({fi.element_site} if fi.element_site else set())
+            if sites:
+                for s in sites:
+                    out.add(("element", s[0], s[1], s[2]))
             else:
                 out.add(("element", fi.path, node, fi.name))
         if fi.returns_unordered:
@@ -1030,10 +1105,15 @@ class TaintEngine:
             else:
                 out.add(("local", fi.path, node, fi.name))
         if fi.returns_itercaller:
-            if fi.itercaller_site is not None:
-                out.add(
-                    ("itercaller", fi.itercaller_site[0], fi.itercaller_site[1], None)
-                )
+            # One origin per distinct materialization site -- a function merging loki
+            # endpoints *and* prometheus jobs into one config reaches the write via two
+            # sources; each surfaces as its own finding rather than one representative.
+            sites = fi.itercaller_sites or (
+                {fi.itercaller_site} if fi.itercaller_site else set()
+            )
+            if sites:
+                for s in sites:
+                    out.add(("itercaller", s[0], s[1], None))
             else:
                 out.add(("itercaller", fi.path, node, None))
         return out
@@ -1052,11 +1132,27 @@ class TaintEngine:
         recv_cls = self._receiver_class(node.value, cls_ctx)
         if recv_cls is None:
             return set()
-        chain = self._class_chain(recv_cls)
+        classes = self._class_chain(recv_cls)
+        # Downward dispatch for a ``self``/``cls`` property read: the enclosing
+        # instance may be a subclass, so a base property (often an abstract stub or a
+        # clean default) can be overridden below. Include subclass overrides so a base
+        # aggregator (``_loki_config`` reading ``self._additional_log_configs``) sees
+        # the override's instability. Gated to self/cls -- a typed member receiver is
+        # the broader (FP-prone) polymorphism case handled elsewhere.
+        if isinstance(node.value, ast.Name) and node.value.id in ("self", "cls"):
+            classes = classes | self._class_descendants(recv_cls)
+        matched = [
+            fi
+            for fi in self.registry.get(node.attr, ())
+            if fi.is_property and fi.class_name in classes
+        ]
+        # Pin to the version the receiver's class was imported from, so
+        # ``self._info.items`` (``_info`` typed to a ``v1``-imported ``Provider``)
+        # blames the ``v1`` property, not the ``v0``+``v1`` union of the same name.
+        matched = self._pin_to_import(matched, recv_cls)
         out: Set[Origin] = set()
-        for fi in self.registry.get(node.attr, ()):
-            if fi.is_property and fi.class_name in chain:
-                out |= self._summary_return_origins(fi, node)
+        for fi in matched:
+            out |= self._summary_return_origins(fi, node)
         return out
 
     def _class_chain(self, cls: Optional[str]) -> Set[str]:
@@ -1073,4 +1169,31 @@ class TaintEngine:
                 continue
             seen.add(c)
             stack.extend(self.class_bases.get(c, ()))
+        return seen
+
+    def _class_descendants(self, cls: Optional[str]) -> Set[str]:
+        """Transitive *subclasses* of ``cls`` (downward dispatch).
+
+        A ``self.foo()`` in a base method runs on an instance of ``cls`` or any
+        subclass, so at runtime it may dispatch to a subclass's override. Inverting
+        ``class_bases`` (subclass -> bases) once lets a base method's self-call also
+        resolve to those overrides -- the flaw a virtual method has over static
+        upward resolution. Empty when nothing subclasses ``cls``.
+        """
+        if not cls:
+            return set()
+        if self._subclass_map is None:
+            m: Dict[str, List[str]] = {}
+            for sub, bases in self.class_bases.items():
+                for b in bases:
+                    m.setdefault(b, []).append(sub)
+            self._subclass_map = m
+        seen: Set[str] = set()
+        stack = [cls]
+        while stack:
+            c = stack.pop()
+            for sub in self._subclass_map.get(c, ()):
+                if sub not in seen:
+                    seen.add(sub)
+                    stack.append(sub)
         return seen

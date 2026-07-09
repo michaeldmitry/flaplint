@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from .analyzer import Analyzer
 from .render import colour_enabled, render_gaps, render_report
+from .version import source_versions
 
 _DESCRIPTION = (
     "Detect order-unstable values written to Juju relation data, which cause "
@@ -71,6 +72,15 @@ def _build_parser() -> argparse.ArgumentParser:
         "reported regardless.",
     )
     parser.add_argument(
+        "--own-only",
+        action="store_true",
+        help="report ONLY findings in code you own (your src/ and any --dep root) "
+        "-- suppress every dependency and vendored charm-lib finding, including a "
+        "vendored lib/ living inside your own charm. Unlike --no-report-deps (which "
+        "still shows a vendored lib/), this hides anything flaplint would not fail "
+        "the run on. Use it to see just the flaps that are yours to fix.",
+    )
+    parser.add_argument(
         "--min-confidence",
         choices=("low", "medium", "high"),
         default="medium",
@@ -127,7 +137,17 @@ def main(argv: Optional[List[str]] = None) -> int:
         explain_gaps=args.explain_gaps,
     )
     findings = analyzer.run()
+    if args.own_only:
+        # ``error`` == charm-owned (your src/ or a --dep root); ``warning`` == a
+        # dependency or a vendored lib/ you don't own. Keep only the former.
+        findings = [f for f in findings if f.level == "error"]
     gaps = analyzer.gaps
+
+    # git revision(s) of the scanned source, so a run is reproducible.
+    scanned = source_versions(args.paths)
+    scanned_line = "scanned: " + "  ".join(
+        f"{name} {ver}" for name, ver in scanned
+    ) if scanned else ""
 
     fmt = "json" if args.json else args.format
 
@@ -138,6 +158,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "findings": payload,
                 "gaps": [g.__dict__ for g in gaps],
             }
+        # Provenance goes to stderr so stdout stays a clean, parseable JSON body.
+        if scanned_line:
+            print(scanned_line, file=sys.stderr)
         print(json.dumps(payload, indent=2))
     elif fmt == "concise":
         for finding in findings:
@@ -147,10 +170,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         errors = sum(1 for f in findings if f.level == "error")
         warnings = len(findings) - errors
         gap_note = f", {len(gaps)} blind spot(s)" if args.explain_gaps else ""
+        prov = f"\n{scanned_line}" if scanned_line else ""
         print(
             f"\n{len(findings)} flap risk(s): "
             f"{errors} yours, {warnings} in dependencies{gap_note} "
-            f"in {len(analyzer.primary_files)} file(s).",
+            f"in {len(analyzer.primary_files)} file(s).{prov}",
             file=sys.stderr,
         )
     else:  # pretty
@@ -158,6 +182,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             findings,
             len(analyzer.primary_files),
             colour=colour_enabled(sys.stdout),
+            scanned=scanned,
         )
         print(report)
         if args.explain_gaps:

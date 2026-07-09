@@ -345,6 +345,11 @@ class FuncInfo:
     #: returns, so callers can point a finding at the offending subscript instead
     #: of their own serializer. ``None`` until ``returns_element`` is set.
     element_site: Optional[Tuple[str, ast.AST, str]] = None
+    #: *all* distinct value-position pick sites this function returns (not just the
+    #: earliest ``element_site``). One config the function returns can aggregate
+    #: several independently-unstable picks; each is its own place a ``sorted()`` is
+    #: needed, so callers emit one finding per site rather than a single representative.
+    element_sites: "Set[Tuple[str, ast.AST, str]]" = field(default_factory=set)
     #: provenance ``(path, node, func)`` of the locally-unordered value this
     #: function returns, so a caller's finding can point ``origin=`` at the
     #: ``set()`` / ``glob()`` that births the instability rather than the
@@ -360,6 +365,13 @@ class FuncInfo:
     #: function returns, so a caller's ``unordered-iteration`` finding points at
     #: the ``list(...)`` / comprehension. ``None`` until ``returns_itercaller``.
     itercaller_site: Optional[Tuple[str, ast.AST, str]] = None
+    #: *all* distinct materialization sites this function returns (not just the
+    #: earliest ``itercaller_site``). A function that aggregates several unstable
+    #: sources into one returned config (``_generate_config`` merging loki endpoints
+    #: *and* prometheus jobs) carries a born-site per source; each is a separate place
+    #: to ``sorted()``, so callers emit one finding per site -- distinct entries for
+    #: one write reached by many origins (not folded into one representative).
+    itercaller_sites: "Set[Tuple[str, ast.AST, str]]" = field(default_factory=set)
     #: parameter indices whose taint flows through to the return value.
     returns_params: Set[int] = field(default_factory=set)
     #: the class this function's ``-> Ret`` annotation names, so a local bound to its
@@ -439,3 +451,8 @@ class FileImports:
 
     names: Dict[str, str] = field(default_factory=dict)
     modules: Dict[str, str] = field(default_factory=dict)
+    #: bound name -> the module it was imported *from*, for absolute
+    #: ``from a.b.c import Name [as N]`` (``{"N": "a.b.c"}``). Lets resolution pin a
+    #: same-named class/method to the exact vendored module version it came from
+    #: (``charms.foo.v0.bar`` vs ``...v1...``) instead of unioning both.
+    from_modules: Dict[str, str] = field(default_factory=dict)

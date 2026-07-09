@@ -59,6 +59,39 @@ def test_uuid_in_dict_survives_sort_keys(lint_source):
     assert "nondeterministic" in details(findings)
 
 
+def test_volatile_carrier_named_not_first_ordered_key(lint_source):
+    # The nondeterministic value sits behind a local (``test_uuid``) nested inside
+    # a dict whose *first* key holds an ordered parameter. The finding must blame
+    # the volatile carrier, not the innocent first key.
+    findings = lint_source(
+        """
+        import json
+        import uuid
+        from datetime import datetime
+
+        class Charm:
+            def set_peer_data(self, bag, data):
+                self.relation.data[bag]["d"] = json.dumps(data)
+
+            def run(self, *, script_path: str):
+                test_uuid = str(uuid.uuid4())
+                start_time = datetime.now().isoformat()
+                self.set_peer_data(
+                    self.app,
+                    data={
+                        "script_path": script_path,
+                        "labels": {"test_uuid": test_uuid, "date": start_time},
+                        "status": "idle",
+                    },
+                )
+        """
+    )
+    caller = [f for f in findings if f.rule == "nondeterministic"]
+    assert caller, "the volatile write must still be flagged"
+    assert caller[0].variable == "test_uuid"
+    assert all(f.variable != "script_path" for f in findings)
+
+
 def test_time_value_is_flagged(lint_source):
     findings = lint_source(
         """

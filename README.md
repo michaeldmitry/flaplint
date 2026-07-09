@@ -199,7 +199,7 @@ For the full story — every pattern it catches, how each serializer treats them
 By default `flaplint` prints a **grouped, colourised report**:
 
 ```text
-flaplint  · charm flapping checker
+flaplint
 
 src/charm.py
   ✖  142:9  unordered collection · peers → databag  · high confidence
@@ -216,7 +216,6 @@ lib/charms/grafana_k8s/v0/grafana_dashboard.py
 
 ────────────────────────────────────────────────────────
   ✖ 3 flap risk(s)   2 yours   1 in dependencies   · 11 file(s) scanned
-  ✖ yours — fails the run     ▲ in a dependency — non-blocking
 ```
 
 Every finding carries **two independent axes**, spelled out so neither is mistaken for the other:

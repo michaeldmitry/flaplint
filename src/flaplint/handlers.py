@@ -226,6 +226,27 @@ def _volatile_name(node: Optional[ast.AST]) -> str:
     return ""
 
 
+def _volatile_carrier(node: Optional[ast.AST], env) -> str:
+    """Name the volatile value inside ``node`` -- a call *or* a local holding one.
+
+    ``_volatile_name`` finds a literal ``uuid.uuid4()`` written straight into the
+    sink. But the common shape is a two-liner: ``u = str(uuid.uuid4())`` then
+    ``bag[k] = json.dumps({"id": u, ...})``. There the regenerating call is one
+    assignment back, so the serializer's subtree holds only the *name* ``u``.
+    Walk the container for the first ``Name`` leaf that the environment says is
+    ``volatile`` -- so the finding blames ``u`` (or ``test_uuid``), not whatever
+    ordered value merely happens to be the first key in the dict.
+    """
+    lit = _volatile_name(node)
+    if lit:
+        return lit
+    if node is not None and env:
+        for sub in ast.walk(node):
+            if isinstance(sub, ast.Name) and "volatile" in env.get(sub.id, ()):
+                return sub.id
+    return ""
+
+
 
 def _resolve_field_origin(o: Origin, fi: FuncInfo):
     """Resolve a returned field origin's born-site to the callee's file/name.
@@ -264,6 +285,11 @@ class Handler:
     #: When True, the traversal computes and reports blind spots via :meth:`gap`.
     #: Off by default so a normal run pays nothing for the gap analysis.
     wants_gaps: bool = False
+
+    #: Live back-reference to the current function's ``Context`` (set by
+    #: ``FunctionAnalyzer.analyze``). Lets :meth:`sink` consult the flow-sensitive
+    #: environment to name a container's *volatile* leaf. ``None`` until a walk begins.
+    ctx = None
 
     def gap(self, node: ast.AST, sink: str, reason: str) -> None:
         """Called for a write whose content couldn't be fully traced (``--explain-gaps``)."""
@@ -424,6 +450,9 @@ class SummaryHandler(Handler):
                 ) < _loc_key(self.fi.element_site):
                     self.fi.element_site = site
                     self.changed = True
+                if site not in self.fi.element_sites:
+                    self.fi.element_sites.add(site)
+                    self.changed = True
                 if not self.fi.returns_element:
                     self.fi.returns_element = True
                     self.changed = True
@@ -439,6 +468,9 @@ class SummaryHandler(Handler):
                     site
                 ) < _loc_key(self.fi.itercaller_site):
                     self.fi.itercaller_site = site
+                    self.changed = True
+                if site not in self.fi.itercaller_sites:
+                    self.fi.itercaller_sites.add(site)
                     self.changed = True
                 if not self.fi.returns_itercaller:
                     self.fi.returns_itercaller = True
@@ -624,7 +656,8 @@ class ReportHandler(Handler):
                     "high",
                     "nondeterministic",
                     sink_type,
-                    _volatile_name(arg) or _variable(arg),
+                    _volatile_carrier(arg, getattr(getattr(self, "ctx", None), "env", None))
+                    or _variable(arg),
                     self.fi.path,
                     None,
                     None,  # finding sits at the write; no separate sink pointer

@@ -123,3 +123,33 @@ def test_no_deps_and_no_report_deps_are_accepted(tmp_path):
     path = _write(tmp_path, _CLEAN)
     assert main([path, "--no-deps", "--min-confidence", "low"]) == 0
     assert main([path, "--no-report-deps", "--min-confidence", "low"]) == 0
+
+
+def _charm_with_vendored_lib(tmp_path: Path) -> str:
+    """A charm root: an owned src/ and a vendored lib/, both writing a buggy bag."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "charm.py").write_text(textwrap.dedent(_BUGGY))
+    lib = tmp_path / "lib" / "charms" / "other" / "v0"
+    lib.mkdir(parents=True)
+    (lib / "other.py").write_text(textwrap.dedent(_BUGGY))
+    return str(tmp_path)
+
+
+def test_own_only_hides_vendored_lib_findings(tmp_path, capsys):
+    root = _charm_with_vendored_lib(tmp_path)
+
+    # Without the flag: both the owned src/ finding and the vendored lib/ one show.
+    main([root, "--min-confidence", "low", "--json"])
+    everything = json.loads(capsys.readouterr().out)
+    levels = {f["level"] for f in everything}
+    assert "error" in levels and "warning" in levels
+    assert any("lib/charms/other" in f["path"] for f in everything)
+
+    # With --own-only: only the owned (error) findings remain.
+    rc = main([root, "--min-confidence", "low", "--own-only", "--json"])
+    mine = json.loads(capsys.readouterr().out)
+    assert mine, "the owned src/ finding must survive"
+    assert all(f["level"] == "error" for f in mine)
+    assert not any("lib/charms/other" in f["path"] for f in mine)
+    assert rc == 1  # an owned finding still fails the run
