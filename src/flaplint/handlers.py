@@ -327,6 +327,19 @@ class SummaryHandler(Handler):
             self.fi.dangerous[idx] = "direct"
             self.changed = True
 
+    def _mark_proj(self, idx: int, accessor: str, sink_type: str, site) -> None:
+        """Record that a *projection* of parameter ``idx`` -- the value-object field
+        or fixed dict key named by ``accessor`` -- reaches a sink. The earliest write
+        per (accessor, sink) is kept, so the caller-side finding can point at the real
+        write. Field-sensitive twin of :meth:`_mark`.
+        """
+        by_acc = self.fi.dangerous_proj.setdefault(idx, {})
+        by_sink = by_acc.setdefault(accessor, {})
+        prev = by_sink.get(sink_type)
+        if prev is None or (site and (site[1], site[2]) < (prev[1], prev[2])):
+            by_sink[sink_type] = site
+            self.changed = True
+
     def _mark_iter(self, idx: int, origin: Origin) -> None:
         """Record the iteration site of a sequence-from-parameter (``iterparam``).
 
@@ -363,7 +376,13 @@ class SummaryHandler(Handler):
         )
         for origin in origins:
             if isinstance(origin, tuple) and origin[0] == "param":
-                self._mark(origin[1], marker, sink_type, site)
+                if len(origin) > 2 and isinstance(origin[2], str):
+                    # A parameter *projection* (``ctx.job`` / ``payload['jobs']``):
+                    # record field-sensitive danger, not whole-parameter danger, so a
+                    # clean sibling field of the argument is never charged.
+                    self._mark_proj(origin[1], origin[2], sink_type, site)
+                else:
+                    self._mark(origin[1], marker, sink_type, site)
             elif is_iterparam(origin):
                 # A sequence built from a parameter reaches a relation-data write:
                 # the strongest evidence that the iteration order escapes.

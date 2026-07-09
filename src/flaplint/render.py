@@ -288,6 +288,20 @@ def _describe(f: Finding) -> str:
             sentence += (
                 f" The instability is created at {origin}; fix it there."
             )
+
+    # Folded siblings: the same unstable value reaches this same write through other
+    # call paths, collapsed here to avoid duplicate findings. Surface them so the one
+    # fix reads as covering every spot -- and so a reader who expected a finding at
+    # one of those lines knows it was folded in, not missed.
+    if f.also_at:
+        spots = ", ".join(
+            f"`{v}` ({_relpath(p)}:{ln})" for p, ln, v in f.also_at
+        )
+        n = len(f.also_at)
+        sentence += (
+            f" The same write is also reached via {spots} — the single fix here "
+            f"covers {'that path' if n == 1 else 'those paths'} too."
+        )
     return sentence
 
 

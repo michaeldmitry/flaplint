@@ -442,13 +442,21 @@ def collapse_pipelines(findings: List[Finding]) -> List[Finding]:
             f.path, f.line, f.col,                # stable, deterministic
         )
 
-    winners: "Dict[Tuple, Finding]" = {}
+    groups: "Dict[Tuple, List[Finding]]" = {}
     for f in findings:
         g = _group_of(f)
-        if g is None:
-            continue
-        cur = winners.get(g)
-        if cur is None or _priority(f) < _priority(cur):
-            winners[g] = f
-    keep = {id(w) for w in winners.values()}
+        if g is not None:
+            groups.setdefault(g, []).append(f)
+
+    keep = set()
+    for members in groups.values():
+        members.sort(key=_priority)
+        winner = members[0]
+        keep.add(id(winner))
+        # Record the folded siblings on the survivor so the report can point at the
+        # other spots this one fix also covers -- a collapsed duplicate must read as
+        # "also here", never as a silently-dropped true positive.
+        folded = sorted(members[1:], key=lambda m: (m.path, m.line, m.col))
+        if folded:
+            winner.also_at = tuple((m.path, m.line, m.variable) for m in folded)
     return [f for f in findings if _group_of(f) is None or id(f) in keep]

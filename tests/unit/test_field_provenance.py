@@ -635,3 +635,158 @@ def test_getter_returning_a_copy_is_not_aliased(lint_source):
         """
     )
     assert not any(f.sink == "databag" for f in findings)
+
+
+def test_value_object_field_survives_across_a_call(lint_source):
+    # The cos-proxy shape: an unstable value is stashed in a *typed* value-object
+    # field, the object handed to another method, and that method serialises the
+    # field. Previously the taint was lost at the call boundary (the object's field
+    # was invisible inside the callee); now ``ctx.job`` -- ``ctx`` typed to the value
+    # object -- carries the parameter's danger, so a caller passing an unstable field
+    # is flagged.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Optional, Dict, Any
+
+        @dataclass
+        class JobCtx:
+            job: Dict[str, Any] = field(default_factory=dict)
+
+        class Charm:
+            def _drive(self):
+                u = {x.name: 1 for x in self.model.get_relation("p").units}
+                self._publish(JobCtx(job=u))
+            def _publish(self, ctx: Optional["JobCtx"] = None):
+                self.relation.data[self.app]["c"] = json.dumps(ctx.job)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_value_object_positional_construction_field_is_read_back(lint_source):
+    # ``JobCtx(u)`` fills the first declared field positionally exactly as
+    # ``JobCtx(job=u)`` does -- the field taint must survive read-back either way.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Dict, Any
+
+        @dataclass
+        class JobCtx:
+            job: Dict[str, Any] = field(default_factory=dict)
+
+        class Charm:
+            def go(self):
+                u = {x.name: 1 for x in self.model.get_relation("p").units}
+                ctx = JobCtx(u)
+                self.relation.data[self.app]["c"] = json.dumps(ctx.job)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_non_value_object_param_attribute_is_not_over_tainted(lint_source):
+    # Guard: the ``param.field`` rule fires only for *known value-object* params. An
+    # ordinary attribute on a stateful collaborator / event (``event.relation``,
+    # ``store.x``) must not be treated as caller-supplied instability -- a load and
+    # unchanged re-save stays silent.
+    findings = lint_source(
+        """
+        class Charm:
+            def publish(self, event):
+                loaded = event.relation.load(SomeData, event.app)
+                event.relation.save(loaded, self.app)
+        """
+    )
+    assert findings == []
+
+
+def test_clean_field_of_partly_unstable_value_object_stays_clean(lint_source):
+    # Field-sensitivity across a call: a value object carries an unstable ``dirty``
+    # field AND a stable ``clean`` one; a callee that serialises only ``clean`` must
+    # NOT be flagged. The coarse whole-object contract would false-positive here.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Optional, Dict, Any, List
+
+        @dataclass
+        class Ctx:
+            dirty: Dict[str, Any] = field(default_factory=dict)
+            clean: List[str] = field(default_factory=list)
+
+        class Charm:
+            def _drive(self):
+                u = {x.name: 1 for x in self.model.get_relation("p").units}
+                self._pub(Ctx(dirty=u, clean=["a", "b"]))
+            def _pub(self, ctx: Optional["Ctx"] = None):
+                self.relation.data[self.app]["c"] = json.dumps(ctx.clean)
+        """
+    )
+    assert findings == []
+
+
+def test_dirty_field_of_partly_unstable_value_object_is_flagged(lint_source):
+    # The positive twin: serialising the *unstable* field of the same object flags.
+    findings = lint_source(
+        """
+        import json
+        from dataclasses import dataclass, field
+        from typing import Optional, Dict, Any, List
+
+        @dataclass
+        class Ctx:
+            dirty: Dict[str, Any] = field(default_factory=dict)
+            clean: List[str] = field(default_factory=list)
+
+        class Charm:
+            def _drive(self):
+                u = {x.name: 1 for x in self.model.get_relation("p").units}
+                self._pub(Ctx(dirty=u, clean=["a", "b"]))
+            def _pub(self, ctx: Optional["Ctx"] = None):
+                self.relation.data[self.app]["c"] = json.dumps(ctx.dirty)
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_dict_subscript_field_survives_across_a_call(lint_source):
+    # The dict-subscript sibling of the value-object rule: an unstable value under a
+    # fixed key in a mapping-typed parameter, serialised inside the callee. Field-
+    # sensitive -- keyed on the specific ``['jobs']`` projection.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def _drive(self):
+                payload = {"jobs": [u.name for u in self.model.get_relation("p").units]}
+                self._pub(payload)
+            def _pub(self, payload: dict):
+                self.relation.data[self.app]["c"] = json.dumps(payload["jobs"])
+        """
+    )
+    assert any(f.sink == "databag" for f in findings)
+
+
+def test_clean_dict_key_of_partly_unstable_dict_stays_clean(lint_source):
+    # Field-sensitivity for dict keys: a mapping with an unstable ``jobs`` value and a
+    # stable ``name`` value; a callee serialising only ``['name']`` must stay clean.
+    findings = lint_source(
+        """
+        import json
+        class Charm:
+            def _drive(self):
+                payload = {
+                    "jobs": [u.name for u in self.model.get_relation("p").units],
+                    "name": "fixed",
+                }
+                self._pub(payload)
+            def _pub(self, payload: dict):
+                self.relation.data[self.app]["c"] = json.dumps(payload["name"])
+        """
+    )
+    assert findings == []

@@ -204,6 +204,13 @@ class Finding:
     #: unordered collection into ``unit_rules``" -- instead of implying the parameter
     #: is intrinsically unordered. ``False`` for every other finding.
     via_param: bool = False
+    #: sibling locations folded into this finding by the pipeline collapse: the
+    #: *same* unstable source reaching the *same* physical write through other call
+    #: paths (litmus's file write hit via both the charm wrapper and the coordinator).
+    #: Each entry is ``(path, line, variable)``. Surfaced so the reader sees the one
+    #: fix here also resolves those spots -- a collapsed duplicate is not a missed
+    #: true positive. Empty for a finding that stands alone.
+    also_at: "Tuple[Tuple[str, int, str], ...]" = ()
 
     def format(self) -> str:
         """Render as ``path:line:col: owner=... confidence=... key=value ...``.
@@ -233,6 +240,10 @@ class Finding:
             fields.append(f"via_subclass={self.via_subclass}")
         if self.sink_line:
             fields.append(f"sink_at={self.sink_path}:{self.sink_line}")
+        if self.also_at:
+            fields.append(
+                "also_at=" + ",".join(f"{p}:{ln}" for p, ln, _ in self.also_at)
+            )
         return f"{self.path}:{self.line}:{self.col}: " + " ".join(fields)
 
 
@@ -310,6 +321,16 @@ class FuncInfo:
     #: the real databag / secret write (e.g. the ``set_content`` line), not just the
     #: call site. Earliest write per (param, sink) is kept.
     dangerous_sites: Dict[int, Dict[str, Tuple[str, int, int]]] = field(
+        default_factory=dict
+    )
+    #: field-sensitive analogue of ``dangerous``: a *projection* of a parameter -- a
+    #: value-object field (``ctx.job`` -> accessor ``".job"``) or a fixed dict key
+    #: (``payload['jobs']`` -> ``"['jobs']"``) -- written to a sink. Keyed
+    #: ``param_idx -> accessor -> {sink_family: (path, lineno, col)}``. Distinct from
+    #: ``dangerous`` so a caller is flagged only when *that* projection of the argument
+    #: is unstable: a clean field of a partly-unstable value object stays clean (no
+    #: false positive), unlike the coarse whole-object contract.
+    dangerous_proj: Dict[int, Dict[str, Dict[str, Tuple[str, int, int]]]] = field(
         default_factory=dict
     )
     #: whether the function returns a locally-unordered value.

@@ -318,6 +318,30 @@ def test_crossfile_iteration_carrier_is_not_called_the_iteration_site():
     assert "addresses" in text
 
 
+def test_folded_siblings_are_surfaced_as_also_reached_via():
+    # A survivor of the pipeline collapse names the other call paths that hit the same
+    # write, so a reader who expected a finding at one of them sees it was folded in,
+    # not silently dropped.
+    f = Finding(
+        path="src/charm.py", line=165, col=9, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="file", variable="_cfg()",
+        origin_path="lib/nginx.py", origin_line=594, via="addresses",
+        sink_path="lib/nginx.py", sink_line=972,
+        also_at=(("lib/coordinator.py", 473, "nginx_config"),),
+    )
+    text = _describe_of(f)
+    assert "same write is also reached via `nginx_config` (lib/coordinator.py:473)" in text
+    assert "covers that path too" in text
+
+
+def test_no_folded_siblings_adds_no_also_reached_clause():
+    f = Finding(
+        path="src/charm.py", line=10, col=5, kind="caller", confidence="high",
+        rule="unordered-iteration", sink="databag", variable="x",
+    )
+    assert "also reached via" not in _describe_of(f)
+
+
 def test_param_boundary_iteration_blames_the_caller_not_the_parameter():
     # A confirmed iteration of a *formal parameter* with no single born site (several
     # callers feed it) -- cos-proxy's ``_label_alert_rules(unit_rules, ...)``. The

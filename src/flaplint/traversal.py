@@ -353,6 +353,21 @@ class FunctionAnalyzer:
         ctor = astutils.ctor_class(value)
         if isinstance(value, ast.Call) and ctor is not None:
             seq_fields = self.engine.model_seq_fields.get(ctor, ())
+            # *Positional* value-object args fill declared fields in order, so
+            # ``ScrapeJobContext(job)`` records ``name.job`` exactly as the keyword
+            # form does. Gated to known value objects (dataclass/pydantic/NamedTuple)
+            # -- a plain class's positional (config) args are not fields to read back.
+            vo_fields = self.engine.value_object_fields.get(ctor)
+            if vo_fields is not None:
+                for i, arg in enumerate(value.args):
+                    if isinstance(arg, ast.Starred) or i >= len(vo_fields):
+                        continue
+                    fld = vo_fields[i]
+                    t = self._eval(arg, ctx)
+                    if t and fld in seq_fields:
+                        t = self.engine.coerce_to_sequence_field(t, arg)
+                    if t:
+                        ctx.env[f"{name}.{fld}"] = t
             for kw in value.keywords:
                 if kw.arg is None or kw.value is None:
                     continue
@@ -378,6 +393,50 @@ class FunctionAnalyzer:
                         ctx.env[f"{name}.{fld}"] = set(
                             ctx.env.get(f"{name}.{fld}", ())
                         ) | set(origins)
+
+    def _arg_projection_taint(
+        self, arg: ast.AST, accessor: str, ctx: Context
+    ) -> "Optional[Set[Origin]]":
+        """Taint of a projection (``.field`` / ``['key']``) of a call argument.
+
+        Returns the projection's origins when the argument's field provenance is
+        *resolvable* (an empty set means "resolved, and this field is clean" -- so the
+        caller must NOT fire), or ``None`` when it cannot be resolved (an opaque factory
+        result, an attribute, an untracked local) -- signalling the caller to fall back
+        to the coarser whole-object taint so recall is preserved. Resolvable shapes:
+
+        * a *tracked* local (``ctx``/``payload``) -- one with per-field compound env
+          keys recorded at its construction / dict-literal binding; absence of *this*
+          field's key then means the field is clean;
+        * an *inline value-object construction* (``JobCtx(job=<expr>)``) -- the keyword
+          (or positional, by declared field order) filling that field;
+        * an *inline dict literal* (``{"jobs": <expr>}``) -- the value under that key.
+        """
+        if isinstance(arg, ast.Name):
+            prefixes = (arg.id + ".", arg.id + "[")
+            tracked = any(k.startswith(prefixes) for k in ctx.env)
+            if tracked:
+                return set(ctx.env.get(arg.id + accessor, ()))
+            return None  # untracked local -> caller falls back to whole-object taint
+        if accessor.startswith(".") and isinstance(arg, ast.Call):
+            field = accessor[1:]
+            for kw in arg.keywords:
+                if kw.arg == field and kw.value is not None:
+                    return self._eval(kw.value, ctx)
+            ctor = astutils.ctor_class(arg)
+            vo = self.engine.value_object_fields.get(ctor) if ctor else None
+            if vo and field in vo:
+                i = vo.index(field)
+                if i < len(arg.args) and not isinstance(arg.args[i], ast.Starred):
+                    return self._eval(arg.args[i], ctx)
+            return set()  # a construction that does not fill this field -> clean
+        if accessor.startswith("[") and isinstance(arg, ast.Dict):
+            want = accessor[1:-1]  # "['jobs']" -> "'jobs'"
+            for k, v in zip(arg.keys, arg.values):
+                if isinstance(k, ast.Constant) and repr(k.value) == want:
+                    return self._eval(v, ctx)
+            return set()  # a dict literal without this key -> clean
+        return None  # opaque argument (attribute, factory result) -> fall back
 
     def _record_dict_key_taint(
         self, base_path: str, value: ast.AST, ctx: Context
@@ -1028,7 +1087,7 @@ class FunctionAnalyzer:
                         "databag",
                     )
             for fi in self._resolve_methods(sub, ctx):
-                if not fi.dangerous:
+                if not fi.dangerous and not fi.dangerous_proj:
                     continue
                 for didx, arg in astutils.map_call_args(sub, fi).items():
                     if didx in fi.dangerous:
@@ -1055,6 +1114,35 @@ class FunctionAnalyzer:
                                     st,
                                     write_node=wn,
                                 )
+                    # Field-sensitive: a *projection* of the argument (a value-object
+                    # field ``arg.job`` or a fixed dict key ``arg['jobs']``) is written
+                    # to a sink inside the callee. Fire only when *that* projection of
+                    # the passed argument is unstable -- a clean sibling field/key of
+                    # the same argument is never charged (the FP the coarse whole-object
+                    # contract would have caused).
+                    for acc, by_sink in fi.dangerous_proj.get(didx, {}).items():
+                        proj = self._arg_projection_taint(arg, acc, ctx)
+                        if proj is None:
+                            # Field provenance unresolvable (a factory result / opaque
+                            # local): fall back to the whole-object taint -- coarser,
+                            # but preserves recall when we can't isolate the field.
+                            proj = self._eval(arg, ctx)
+                        if not proj:
+                            continue
+                        for st, site in sorted(by_sink.items()):
+                            wn = (
+                                _RemoteSite(site[0], site[1], site[2])
+                                if site else None
+                            )
+                            handler.sink(
+                                sub,
+                                proj,
+                                "via",
+                                f"{fi.name}() parameter '{fi.params[didx]}{acc}'",
+                                arg,
+                                st,
+                                write_node=wn,
+                            )
 
     # -- statement walk -----------------------------------------------------
 

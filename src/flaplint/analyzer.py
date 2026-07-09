@@ -249,6 +249,11 @@ class Analyzer:
                 f.origin_path = os.path.relpath(os.path.abspath(f.origin_path), cwd)
             if f.sink_path:
                 f.sink_path = os.path.relpath(os.path.abspath(f.sink_path), cwd)
+            if f.also_at:
+                f.also_at = tuple(
+                    (os.path.relpath(os.path.abspath(p), cwd), ln, var)
+                    for p, ln, var in f.also_at
+                )
 
     def _ingest(
         self,

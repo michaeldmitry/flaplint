@@ -35,6 +35,14 @@ from .model import FileImports, Origin, Registry, has_element, has_itercaller, h
 #: Recursion guard for pathological / deeply nested expressions.
 _MAX_DEPTH = 12
 
+#: Parameter annotations that make a fixed-key subscript (``param['jobs']``) a
+#: *mapping* access whose value can be projected across a call. Bare sequence /
+#: scalar annotations are excluded -- a fixed *string* key is only meaningful on a
+#: mapping, so this both narrows intent and avoids over-tainting.
+_MAPPING_PARAM_TYPES = frozenset(
+    {"dict", "Dict", "Mapping", "MutableMapping", "OrderedDict"}
+)
+
 
 def _survives_stringify(origins: Set[Origin]) -> Set[Origin]:
     """Origins that survive a non-sorting serializer (``str``/``repr``/``encode``).
@@ -497,6 +505,26 @@ class TaintEngine:
                 inst = self._instance_attr_subscript_taint(node, cls_ctx)
                 if inst:
                     return inst
+                # ``param['jobs']`` on a *mapping-typed parameter*: carry the
+                # parameter's origin one key deep as a projection
+                # ``("param", idx, "['jobs']")``, so serialising the fixed-key value
+                # marks that key dangerous and a caller passing a dict whose ``jobs``
+                # value is unstable is flagged -- the dict-subscript sibling of the
+                # value-object field rule, and equally field-sensitive (a clean sibling
+                # key stays clean). Gated to a mapping annotation so a fixed-key read on
+                # a non-mapping param is never over-tainted.
+                if (
+                    isinstance(node.value, ast.Name)
+                    and self._var_types.get(node.value.id) in _MAPPING_PARAM_TYPES
+                ):
+                    accessor = path[len(node.value.id):]  # "d['jobs']" -> "['jobs']"
+                    proj = {
+                        ("param", o[1], accessor)
+                        for o in env.get(node.value.id, ())
+                        if isinstance(o, tuple) and o and o[0] == "param"
+                    }
+                    if proj:
+                        return proj
                 # per-key provenance absent: fall through to the element rule below.
             # Sequence indexing/slicing picks an *order-dependent* element of an
             # unstable collection: ``unordered_list[0]`` is a different element
@@ -562,6 +590,28 @@ class TaintEngine:
             path = astutils.attr_path(node)
             if path is not None and path in env:
                 return set(env[path])
+            # ``param.field`` where ``param`` is a *formal parameter* typed as a value
+            # object (dataclass / pydantic / NamedTuple) and ``field`` is one of its
+            # declared fields: carry the parameter's origin one field deep as a
+            # *projection* ``("param", idx, ".field")``, so writing ``ctx.job`` to a
+            # sink marks that specific field dangerous -- and a caller passing a value
+            # object whose ``.job`` field is unstable is flagged, while a *clean* field
+            # of the same object stays clean (the field-sensitive fix for the
+            # value-object-field-across-a-call barrier). Gated to a *known value-object
+            # type* so an ordinary ``event.relation`` on a stateful collaborator is
+            # never over-tainted; ``self``/``cls`` are excluded (instance state). A
+            # *local* value object never reaches here -- its field taint is the precise
+            # compound key handled above; only bare parameters carry a ``param`` origin.
+            if isinstance(node.value, ast.Name) and node.value.id not in ("self", "cls"):
+                vo = self._var_types.get(node.value.id)
+                if vo and node.attr in self.value_object_fields.get(vo, ()):
+                    proj = {
+                        ("param", o[1], f".{node.attr}")
+                        for o in env.get(node.value.id, ())
+                        if isinstance(o, tuple) and o and o[0] == "param"
+                    }
+                    if proj:
+                        return proj
             # ``self.<attr>`` parked in one method and read in another: consult the
             # class-level instance-attribute taint (the cross-method barrier).
             inst = self._instance_attr_taint(node, cls_ctx)

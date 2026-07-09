@@ -43,6 +43,10 @@ def test_same_source_same_write_via_two_call_paths_collapses_to_owned():
     assert coord not in kept
     assert source in kept
     assert len(kept) == 2
+    # The folded call path is recorded on the survivor, so the report can say "also
+    # reached via ..." -- a collapsed duplicate must read as covered, not missed.
+    assert charm.also_at == (("lib/coordinator.py", 473, "nginx_config"),)
+    assert source.also_at == ()  # the render stands alone, nothing folded into it
 
 
 def test_same_source_two_different_sinks_are_both_kept():
