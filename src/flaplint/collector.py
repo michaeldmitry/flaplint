@@ -9,7 +9,7 @@ accesses on stored collaborators.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 
 from . import astutils
 from .constants import (
@@ -101,8 +101,8 @@ class Collector(ast.NodeVisitor):
                 if node.module and not node.level:
                     self.imports.from_modules[bound] = node.module
 
-    def _add_function(self, node: ast.AST) -> None:
-        args = node.args  # type: ignore[attr-defined]
+    def _add_function(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> None:
+        args = node.args
         positional = list(getattr(args, "posonlyargs", [])) + list(args.args)
         ordered = positional + list(args.kwonlyargs)
         params = [a.arg for a in ordered]

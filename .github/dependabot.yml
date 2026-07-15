@@ -1,0 +1,27 @@
+version: 2
+
+updates:
+  # Keep the workflows' action pins current (this is the supply-chain surface of CI).
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: ci # Conventional Commits -- keeps release-please happy (no release)
+    groups:
+      actions:
+        patterns: ["*"]
+
+  # Bump the locked dev deps (pytest, ops, ruff, mypy). flaplint has NO runtime deps,
+  # so this only ever touches the dev group -- and an ops bump here lands as a PR that
+  # runs the full suite (incl. tests/drift against the new locked ops), which is the
+  # cheap first layer of the ops-drift defence described in ops-drift.yml.
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: chore
+    groups:
+      dev-deps:
+        patterns: ["*"]

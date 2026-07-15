@@ -38,7 +38,10 @@ def stronger(a: Optional[str], b: Optional[str]) -> Optional[str]:
 
 def _entity_slice(node: ast.Subscript) -> ast.AST:
     sl = node.slice
-    return sl.value if isinstance(sl, ast.Index) else sl  # py<3.9 compatibility
+    # py<3.9 wrapped the index in an ``ast.Index``; ``.value`` unwraps it. (``getattr``
+    # rather than ``sl.value`` because ``ast.Index`` is a deprecated stub with no typed
+    # ``value`` attribute -- the access is real at runtime.)
+    return getattr(sl, "value") if isinstance(sl, ast.Index) else sl
 
 
 def databag_kind(

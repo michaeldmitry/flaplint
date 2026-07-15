@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 #: A taint origin -- *why* a value is considered unstable. One of:
 #:
@@ -55,7 +55,24 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 #:        list-element disorder. The fix (``sorted()``) lands at ``node``.
 #:
 #: An empty origin set means the value is order-stable.
-Origin = Union[str, Tuple[str, int], Tuple[str, Optional[str], ast.AST, Optional[str]]]
+#:
+#: The 4-tuple arm is intentionally ``Tuple[str, Any, Any, Any]`` rather than a precise
+#: union of every layout above: the four flavors that use it do NOT share a slot layout
+#: (``iterparam`` carries an ``int`` index in slot 1 and its node in slot 3; ``element``/
+#: ``itercaller`` can carry a *nested* ``(path, node, func)`` born-site in slot 4). Code
+#: discriminates on the ``o[0]`` tag at runtime; the typed accessors :func:`born_site` /
+#: :func:`local_site` recover the common ``(path, node, func)`` shape safely.
+#:
+#: The 3-tuple arm is the field-sensitive *param projection* ``("param", index,
+#: accessor)`` -- a value-object field (``".job"``) or fixed dict key (``"['jobs']"``)
+#: of parameter ``index``, so a caller is flagged only when *that* projection is
+#: unstable (a clean field of a partly-unstable argument stays clean).
+Origin = Union[
+    str,
+    Tuple[str, int],
+    Tuple[str, Any, str],
+    Tuple[str, Any, Any, Any],
+]
 
 
 def is_element(o: "Origin") -> bool:
@@ -104,8 +121,21 @@ def local_site(o: "Origin") -> Optional[Tuple[Optional[str], ast.AST, Optional[s
     ``path``/``func`` may be ``None`` placeholders meaning "the file/function
     currently being analysed", resolved by the consumer (mirrors ``element``).
     """
-    if is_local(o):
-        return (o[1], o[2], o[3])
+    return born_site(o) if is_local(o) else None
+
+
+def born_site(o: "Origin") -> Optional[Tuple[Optional[str], ast.AST, Optional[str]]]:
+    """``(path, node, func)`` provenance of any 4-tuple born-site origin.
+
+    Works for ``local`` / ``element`` / ``itercaller`` / ``iterparam`` alike (they
+    share the ``(kind, path, node, func)`` shape); ``None`` for the scalar
+    ``"volatile"`` and the ``("param", index)`` origins that carry no born site.
+    Typed so callers get the fields back without indexing the ``Origin`` union.
+    """
+    if isinstance(o, tuple) and len(o) == 4:
+        path, node, func = o[1], o[2], o[3]
+        if isinstance(node, ast.AST):
+            return (path, node, func)
     return None
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 
 from . import astutils
 from .constants import (
@@ -480,8 +480,8 @@ class FunctionAnalyzer:
         stale entry can't linger across a rebinding.
         """
         prefix = base_path + "["
-        for key in [k for k in ctx.env if k.startswith(prefix)]:
-            del ctx.env[key]
+        for stale in [k for k in ctx.env if k.startswith(prefix)]:
+            del ctx.env[stale]
         if not isinstance(value, ast.Dict):
             return
         for key, val in zip(value.keys, value.values):
@@ -530,14 +530,17 @@ class FunctionAnalyzer:
             return o
         if not isinstance(o, tuple):
             return None
-        tag = o[0]
+        # Indexed dynamically past the ``Origin`` alias (``itercaller`` carries a nested
+        # born-site in slot 3); index through ``Any``. Mirrors handlers._resolve_field_origin.
+        t = cast(Any, o)
+        tag = t[0]
         if tag in ("local", "element"):
-            return (tag, o[1] or ctx.func_path, o[2], o[3] or ctx.func_name)
+            return (tag, t[1] or ctx.func_path, t[2], t[3] or ctx.func_name)
         if tag == "itercaller":
-            born = o[3]
+            born = t[3]
             if born is not None:
                 born = (born[0] or ctx.func_path, born[1], born[2] or ctx.func_name)
-            return (tag, o[1] or ctx.func_path, o[2], born)
+            return (tag, t[1] or ctx.func_path, t[2], born)
         return None  # param / iterparam: not cross-method-resolvable here
 
     def _record_instance_attr(
@@ -1341,6 +1344,8 @@ class FunctionAnalyzer:
         RHS, or a resolved call's ``returns_tuple_origins`` summary; anything else
         leaves the targets clean rather than smearing the whole taint across them.
         """
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return  # only tuple/list unpacking targets have positional elements
         elts = target.elts
         if any(isinstance(e, ast.Starred) for e in elts):
             positions: "Optional[List[Set[Origin]]]" = None
@@ -1375,21 +1380,23 @@ class FunctionAnalyzer:
     def _visit_ann_assign(
         self, stmt: ast.AnnAssign, ctx: Context, handler: Handler
     ) -> None:
-        self._scan_expr(stmt.value, ctx, handler)
-        if stmt.value is not None:
-            self._absorb_into_constructor(stmt.value, ctx)
+        if stmt.value is None:
+            return  # a bare ``x: int`` annotation with no RHS binds no taint
+        value = stmt.value
+        self._scan_expr(value, ctx, handler)
+        self._absorb_into_constructor(value, ctx)
         if self._is_databag_target(stmt.target, ctx):
-            origins = self._eval(stmt.value, ctx)
+            origins = self._eval(value, ctx)
             if origins:
-                handler.sink(stmt, origins, "direct", "relation databag", stmt.value)
+                handler.sink(stmt, origins, "direct", "relation databag", value)
         if isinstance(stmt.target, ast.Name):
-            ctx.env[stmt.target.id] = self._eval(stmt.value, ctx) | self._ctor_field_taint(
-                stmt.value, ctx
+            ctx.env[stmt.target.id] = self._eval(value, ctx) | self._ctor_field_taint(
+                value, ctx
             )
-            self._record_type(stmt.target, stmt.value, ctx)
-            self._record_databag_alias(stmt.target, stmt.value, ctx)
-            self._record_field_taint(stmt.target.id, stmt.value, ctx)
-            self._record_dict_key_taint(stmt.target.id, stmt.value, ctx)
+            self._record_type(stmt.target, value, ctx)
+            self._record_databag_alias(stmt.target, value, ctx)
+            self._record_field_taint(stmt.target.id, value, ctx)
+            self._record_dict_key_taint(stmt.target.id, value, ctx)
         elif stmt.value is not None:
             path = astutils.attr_path(stmt.target)
             if path is not None:
@@ -1479,7 +1486,7 @@ class FunctionAnalyzer:
                  if fi.class_name in chain]
                 if chain is not None else []
             )
-            argtaint: Set[Origin] = set()
+            argtaint = set()
             if own_methods:
                 absorbed = {pidx for fi in own_methods for pidx in fi.absorbs}
                 for i, arg in enumerate(call.args):
@@ -1611,7 +1618,7 @@ class FunctionAnalyzer:
                 # private, never-rendered cache from becoming a sink; the ``iterparam``
                 # gate keeps a keyed ``param`` lookup (``secrets.get(id).get(k)``) out.
                 if render is not None:
-                    param_origins = {
+                    param_origins: Set[Origin] = {
                         ("param", o[1], None, None)
                         for o in argtaint
                         if isinstance(o, tuple) and o[0] == "iterparam"

@@ -95,7 +95,19 @@ flaplint flags this as a helper that trusts its caller to pass ordered data. If 
 
 ## How to use it
 
-Install and a `flaplint` command is put on your `PATH`:
+flaplint isn't on PyPI — run it straight from the repo with `uvx`, which
+fetches, builds and caches it in one step (no clone, no venv to manage):
+
+```bash
+# latest on the default branch
+uvx --from git+https://github.com/michaeldmitry/flaplint flaplint /path/to/my-charm/src
+
+# pin a released version for a reproducible CI gate
+uvx --from git+https://github.com/michaeldmitry/flaplint@v1.0.0 flaplint /path/to/my-charm/src
+```
+
+Or, working inside a clone, install it editable so a `flaplint` command lands on
+your `PATH`:
 
 ```bash
 uv pip install -e .       # or: pip install -e .

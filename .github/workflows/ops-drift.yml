@@ -1,0 +1,152 @@
+name: ops drift
+
+# The ecosystem canary. flaplint never imports ops -- it matches ops/pebble API *names*
+# in charm source as text -- so if ops renames something flaplint anchors on, coverage
+# silently drops with no error anywhere. These runs turn that into a loud failure.
+#
+# WHY CRON, and not "when a new ops is released":
+#   GitHub has no native trigger for a third-party PyPI release, so "on ops release"
+#   would mean building and babysitting a watcher (a poller, or a repository_dispatch
+#   from somewhere else) -- which is just this cron with more moving parts. Instead the
+#   risk is covered in three layers, cheapest first:
+#     1. every PR (ci.yml)  -- runs tests/drift against the LOCKED ops. Catches nothing
+#        new about ops, but proves our own changes didn't break the anchors.
+#     2. this weekly cron   -- runs the anchors across the whole SUPPORT WINDOW
+#        ({floor, latest}), outside the lock. Catches a released ops that broke us,
+#        within a week. Anchors are load-bearing but slow-moving; a week is fine.
+#     3. the `main` leg     -- runs against ops from git. This is the real win over
+#        "on release": it warns us BEFORE the breaking ops version ships, not after.
+#   Dependabot separately bumps the locked ops, and that PR goes through layer 1.
+
+on:
+  schedule:
+    # Mondays 04:17 UTC. Weekly because the anchors are load-bearing but slow-moving
+    # (ops ships a minor every few weeks); a week's detection latency is fine and the
+    # `main` leg below already warns pre-release. The exact minute/hour is deliberate,
+    # not magic: 04:xx UTC is off-peak (fast scheduling, cheap runners), and :17 avoids
+    # the top of the hour where GitHub queues -- and sometimes DROPS -- the pile of
+    # cron jobs everyone naively sets to "0". Monday morning UTC lands the result in
+    # front of a maintainer at the start of the week. Change freely; nothing depends
+    # on the specific value.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+  pull_request:
+    # Also run when the anchors themselves (or what they guard) are touched.
+    paths:
+      - "tests/drift/**"
+      - "src/flaplint/constants.py"
+      - "src/flaplint/databag.py"
+      - ".github/workflows/ops-drift.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  versions:
+    # Enumerate the ops versions to test at run time instead of hardcoding a list here.
+    # A hardcoded list silently goes stale the moment ops ships a new minor -- which is
+    # the exact blind spot this whole workflow exists to catch -- so the matrix reads
+    # PyPI and tracks releases automatically. See .github/scripts/ops_versions.py.
+    name: enumerate supported ops
+    runs-on: ubuntu-latest
+    outputs:
+      list: ${{ steps.enumerate.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - id: enumerate
+        env:
+          # Single source of truth for the floor: read it straight out of the justfile.
+          OPS_FLOOR_FILE: justfile
+        run: |
+          floor=$(grep -oP 'OPS_FLOOR := "\K[^"]+' "$OPS_FLOOR_FILE")
+          OPS_FLOOR="$floor" uv run --no-project python .github/scripts/ops_versions.py \
+            >> "$GITHUB_OUTPUT"
+
+  matrix:
+    # The WHOLE supported ops suite: newest patch of every minor from the floor up. One
+    # leg per minor -- the granularity at which the ops API surface flaplint anchors on
+    # actually moves (patches within a minor are near-identical). See
+    # docs/ops-version-anchoring.md.
+    name: ops ${{ matrix.ops }}
+    needs: versions
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ops: ${{ fromJSON(needs.versions.outputs.list) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: extractions/setup-just@v3
+      # Anchors are ops-version-specific, not Python-version-specific (ci.yml owns the
+      # Python matrix), so pin one modern interpreter for every leg.
+      - run: just drift "${{ matrix.ops }}" "3.12"
+
+  main:
+    name: ops @ git main (early warning)
+    runs-on: ubuntu-latest
+    # Bleeding edge: a failure here means an UPCOMING ops release will break an anchor.
+    # That is information, not a broken repo -- so it must never gate a PR. The
+    # `notify` job below still opens an issue for it on scheduled runs.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: extractions/setup-just@v3
+      - run: just drift-main
+
+  notify:
+    # Nobody watches a cron run. If the canary dies on a *scheduled* run, open (or
+    # reuse) an issue so it lands in someone's face. Skipped for PR runs, where the
+    # failing check is already visible.
+    name: open an issue on drift
+    if: always() && github.event_name == 'schedule' && (needs.matrix.result == 'failure' || needs.main.result == 'failure')
+    needs: [matrix, main]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - name: File or update the drift issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          SUPPORTED: ${{ needs.matrix.result }}
+          BLEEDING: ${{ needs.main.result }}
+        run: |
+          set -euo pipefail
+          title="ops drift detected"
+          body=$(cat <<EOF
+          The scheduled ops-drift run failed — an ops API surface flaplint anchors on
+          may have changed.
+
+          | leg | result | meaning |
+          |---|---|---|
+          | supported window ({floor, latest}) | \`${SUPPORTED}\` | a **released** ops broke an anchor — users are affected now |
+          | ops @ git main | \`${BLEEDING}\` | an **upcoming** ops release will break an anchor — fix before it ships |
+
+          Run: ${RUN}
+
+          The failing assert names the anchor and where flaplint relies on it. See
+          \`docs/ops-version-anchoring.md\` — if only one end of the window broke, the
+          fix is usually to make that single anchor version-aware rather than to move
+          \`OPS_FLOOR\`.
+          EOF
+          )
+          existing=$(gh issue list --repo "$REPO" --state open --label ops-drift \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$REPO" --body "$body"
+          else
+            gh label create ops-drift --repo "$REPO" --color B60205 \
+              --description "ops API surface drifted away from a flaplint anchor" 2>/dev/null || true
+            gh issue create --repo "$REPO" --title "$title" --label ops-drift --body "$body"
+          fi

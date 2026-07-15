@@ -19,7 +19,7 @@ any charm a person could deploy -- which is the property the oracle exists to ve
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 #: Oldest ops a *supported* Juju LTS can still run: Juju 2.9 LTS / Ubuntu Focal 20.04 /

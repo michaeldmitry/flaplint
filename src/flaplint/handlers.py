@@ -12,13 +12,14 @@ The same statement walk drives two passes:
 from __future__ import annotations
 
 import ast
-from typing import List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, cast
 
 from . import astutils
 from .constants import NONSORTING_SERIALIZERS, PROPAGATE_CALLS, VOLATILE_CALLS
 from .model import (
     FuncInfo,
     Origin,
+    born_site,
     has_element,
     has_itercaller,
     has_local,
@@ -62,7 +63,7 @@ def _pick_local_site(origins, fi: FuncInfo):
     blanked when the born site lives in the finding's own function (the
     ``origin=`` pointer already says so).
     """
-    sites = [local_site(o) for o in origins if is_local(o)]
+    sites = [s for s in (local_site(o) for o in origins) if s is not None]
     if not sites:
         return None
     path, node, func = min(
@@ -154,7 +155,7 @@ def _variable(node: ast.AST) -> str:
     # (``attr_path`` itself now spans any depth, for env-key provenance -- but the
     # display heuristic wants only the one-level case.)
     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
-        return astutils.attr_path(node)
+        return astutils.attr_path(node) or ""
     parts = _container_parts(node)
     if parts:
         # the offending collection is nested inside a literal -- name the first
@@ -185,7 +186,7 @@ def _variable(node: ast.AST) -> str:
         attr = astutils.final_attr(node.func)
         if attr:
             return attr
-    name = astutils.root_name(node)
+    name = astutils.root_name(node) or ""
     if name in ("self", "cls"):
         # A deep ``self``/``cls``-rooted access whose root_name is the useless
         # receiver: name the most specific *member* instead, so an inline
@@ -262,16 +263,20 @@ def _resolve_field_origin(o: Origin, fi: FuncInfo):
         return o
     if not isinstance(o, tuple):
         return None
-    tag = o[0]
+    # These origins are indexed dynamically past what the ``Origin`` alias spells out
+    # (an ``itercaller`` carries a *nested* born-site tuple in slot 3, unlike the
+    # scalar the alias declares), so index through ``Any`` here.
+    t = cast(Any, o)
+    tag = t[0]
     if tag in ("local", "element"):
-        return (tag, o[1] or fi.path, o[2], o[3] or fi.name)
+        return (tag, t[1] or fi.path, t[2], t[3] or fi.name)
     if tag == "itercaller":
         # Resolve the carried born-site's placeholders to this callee too, so a
         # caller reading the field back blames the ``set()`` in the helper.
-        born = o[3]
+        born = t[3]
         if born is not None:
             born = (born[0] or fi.path, born[1], born[2] or fi.name)
-        return (tag, o[1] or fi.path, o[2], born)
+        return (tag, t[1] or fi.path, t[2], born)
     return None  # param / iterparam: not cross-function-resolvable here
 
 
@@ -289,7 +294,9 @@ class Handler:
     #: Live back-reference to the current function's ``Context`` (set by
     #: ``FunctionAnalyzer.analyze``). Lets :meth:`sink` consult the flow-sensitive
     #: environment to name a container's *volatile* leaf. ``None`` until a walk begins.
-    ctx = None
+    #: Typed ``Any`` to avoid a traversal<->handlers import cycle -- only ``.env`` is
+    #: read off it, always via ``getattr``.
+    ctx: Any = None
 
     def gap(self, node: ast.AST, sink: str, reason: str) -> None:
         """Called for a write whose content couldn't be fully traced (``--explain-gaps``)."""
@@ -300,9 +307,10 @@ class Handler:
         origins: Set[Origin],
         kind: str,
         desc: str,
-        arg: ast.AST,
+        arg: "Optional[ast.AST]",
         sink_type: str = "databag",
-        write_node: "ast.AST | None" = None,
+        write_node: "Optional[Union[ast.AST, _RemoteSite]]" = None,
+        sink_site: Any = None,
     ) -> None:
         """Called when ``origins`` reach a sink (``databag`` or ``hash``).
 
@@ -372,7 +380,11 @@ class SummaryHandler(Handler):
         Keeps the earliest (by location) site so the finding points at the first
         offending iteration. ``None`` placeholders resolve to this function.
         """
-        site = (origin[2] or self.fi.path, origin[3])
+        # ``iterparam`` = ``(tag, index, path, node)`` -- slot 2 is the path and slot 3
+        # the node, which the ``Origin`` alias (built for local/element) doesn't spell
+        # out; index through ``Any``.
+        o = cast(Any, origin)
+        site = (o[2] or self.fi.path, o[3])
         prev = self.fi.iter_params.get(idx)
         if prev is None or _loc_key(site) < _loc_key(prev):
             self.fi.iter_params[idx] = site
@@ -422,6 +434,7 @@ class SummaryHandler(Handler):
                 # ``set()`` / ``glob()`` rather than their own serializer. ``None``
                 # placeholders mean "this function's file/name".
                 site = local_site(origin)
+                assert site is not None  # is_local guarantees a born site
                 resolved = (
                     site[0] or self.fi.path,
                     site[1],
@@ -440,10 +453,12 @@ class SummaryHandler(Handler):
                 # so callers can blame the subscript, not their own serializer.
                 # ``path is None`` means the pick is in this function's own file;
                 # ``func is None`` means this function owns it.
+                parts = born_site(origin)
+                assert parts is not None  # is_element guarantees a 4-tuple born site
                 site = (
-                    origin[1] or self.fi.path,
-                    origin[2],
-                    origin[3] or self.fi.name,
+                    parts[0] or self.fi.path,
+                    parts[1],
+                    parts[2] or self.fi.name,
                 )
                 if self.fi.element_site is None or _loc_key(
                     site
@@ -463,7 +478,9 @@ class SummaryHandler(Handler):
                 # than their own serializer, and mark the return key-sort-resistant
                 # (a key-sorting serializer must NOT launder it). ``None``
                 # placeholders resolve to this function's file/name.
-                site = (origin[1] or self.fi.path, origin[2], self.fi.name)
+                parts = born_site(origin)
+                assert parts is not None  # is_itercaller guarantees a 4-tuple born site
+                site = (parts[0] or self.fi.path, parts[1], self.fi.name)
                 if self.fi.itercaller_site is None or _loc_key(
                     site
                 ) < _loc_key(self.fi.itercaller_site):
@@ -552,10 +569,8 @@ class ReportHandler(Handler):
         self.fi = fi
         self.out = sink_out
         self.gaps_out = gaps_out
-
-    @property
-    def wants_gaps(self) -> bool:
-        return self.gaps_out is not None
+        # Gaps are collected only when the caller passed a list to fill.
+        self.wants_gaps = gaps_out is not None
 
     def gap(self, node, sink, reason) -> None:
         from .model import Gap
@@ -673,7 +688,7 @@ class ReportHandler(Handler):
             # the same source are two places a ``sorted()`` is needed), each carrying
             # the born-site of its underlying unordered value (4th slot) so the finding
             # still points ``origin=`` at where the value was created.
-            sites = {}
+            sites: Dict[Any, Any] = {}
             for o in origins:
                 if is_element(o):
                     site = (o[1] or self.fi.path, o[2])

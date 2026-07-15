@@ -61,8 +61,14 @@ two tests:
 
 ### Running the oracle as a matrix
 
-Locally the oracle validates against whatever ops is installed. In CI the intent is
-to run it against **`{OPS_FLOOR, latest-3.x}`** (and ideally versions in between):
+Locally the oracle validates against whatever ops is installed. In CI
+(`.github/workflows/ops-drift.yml`) it runs as a matrix over the **whole supported ops
+suite** — the newest patch of *every* minor from `OPS_FLOOR` up to latest, one leg per
+minor — plus an `ops @ git main` early-warning leg. The version list is enumerated from
+PyPI at run time (`.github/scripts/ops_versions.py`), not hardcoded, so a newly released
+ops is tested automatically rather than silently skipped. Covering every minor (not just
+the ends) catches a semantic that diverges in the *middle* of the window (broke in a
+3.x, silently fixed by latest):
 
 - a semantic that passes across the whole matrix → safe for every charm in the window;
 - a semantic that passes on one end but fails on the other → it has diverged, and the

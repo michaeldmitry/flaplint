@@ -10,7 +10,7 @@ with different settings never interfere.
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, cast
 
 from . import astutils
 from .constants import (
@@ -30,7 +30,7 @@ from .constants import (
     UNORDERED_CALLS,
     VOLATILE_CALLS,
 )
-from .model import FileImports, Origin, Registry, has_element, has_itercaller, has_local, is_element, is_itercaller, is_iterparam, is_local
+from .model import FileImports, FuncInfo, Origin, Registry, has_element, has_local, is_element, is_itercaller, is_iterparam, is_local
 
 #: Recursion guard for pathological / deeply nested expressions.
 _MAX_DEPTH = 12
@@ -108,9 +108,10 @@ def _as_value_position(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     out: Set[Origin] = set()
     for o in origins:
         if is_local(o):
-            out.add(("element", None, node, (o[1], o[2], o[3])))
+            t = cast(Any, o)
+            out.add(("element", None, node, (t[1], t[2], t[3])))
         elif is_itercaller(o):
-            out.add(("element", None, node, o[3]))
+            out.add(("element", None, node, cast(Any, o)[3]))
         else:
             out.add(o)
     return out
@@ -137,7 +138,8 @@ def _as_local_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     out: Set[Origin] = set()
     for o in origins:
         if is_local(o):
-            out.add(("itercaller", None, node, (o[1], o[2], o[3])))
+            t = cast(Any, o)
+            out.add(("itercaller", None, node, (t[1], t[2], t[3])))
         else:
             out.add(o)
     return out
@@ -156,7 +158,7 @@ def _promote_to_sequence(origins: Set[Origin], node: ast.AST) -> Set[Origin]:
     out = _as_local_sequence(origins, node)
     for o in origins:
         if isinstance(o, tuple) and o[0] == "param":
-            out.add(("iterparam", o[1], None, node))
+            out.add(("iterparam", cast(Any, o)[1], None, node))
     return out
 
 
@@ -358,7 +360,7 @@ class TaintEngine:
             return set()
         key = node.slice
         if isinstance(key, ast.Index):  # Python 3.8
-            key = key.value
+            key = getattr(key, "value")  # deprecated stub: ``.value`` is untyped
         if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
             return set()
         attr = f"{base.attr}[{key.value!r}]"
@@ -542,7 +544,7 @@ class TaintEngine:
                     and self._var_types.get(node.value.id) in _MAPPING_PARAM_TYPES
                 ):
                     accessor = path[len(node.value.id):]  # "d['jobs']" -> "['jobs']"
-                    proj = {
+                    proj: Set[Origin] = {
                         ("param", o[1], accessor)
                         for o in env.get(node.value.id, ())
                         if isinstance(o, tuple) and o and o[0] == "param"
@@ -558,6 +560,8 @@ class TaintEngine:
             # it does so as value-position (``element``) instability that a
             # key-sorting serializer downstream cannot launder away.
             sl = node.slice
+            if isinstance(sl, ast.Index):  # py3.8 wraps the index in an ``Index``
+                sl = getattr(sl, "value")  # deprecated stub: ``.value`` is untyped
             if isinstance(sl, ast.Slice) or (
                 isinstance(sl, ast.Constant) and isinstance(sl.value, int)
             ):
@@ -765,7 +769,7 @@ class TaintEngine:
                 return _key_sort_survivors(inner)
             return inner
         if name in ("dump", "safe_dump"):
-            mod = astutils.module_root(call.func)
+            mod = astutils.module_root(call.func) or ""
             if self._aliases.modules.get(mod, mod) == "json":
                 return set()  # json.dump(obj, fp) writes a file, not a databag value
             inner = self.eval(call.args[0], env, cls_ctx, depth + 1) if call.args else set()
@@ -809,7 +813,7 @@ class TaintEngine:
             return rendered
 
         # User-defined function: consult its return summary.
-        out: Set[Origin] = set()
+        out = set()
         resolved = False
         for fi in self._resolve_summary_candidates(call, name, cls_ctx):
             resolved = True
@@ -817,9 +821,9 @@ class TaintEngine:
             if fi.returns_params or fi.iter_params:
                 mapping = astutils.map_call_args(call, fi)
                 for idx in fi.returns_params:
-                    arg = mapping.get(idx)
-                    if arg is not None:
-                        out |= self.eval(arg, env, cls_ctx, depth + 1)
+                    marg = mapping.get(idx)
+                    if marg is not None:
+                        out |= self.eval(marg, env, cls_ctx, depth + 1)
                 # Confirmed iteration instability: when a known-unstable argument
                 # flows into a parameter the callee iterates unsorted into a
                 # sequence that escapes via return (iter_params[idx] with idx in
@@ -831,10 +835,10 @@ class TaintEngine:
                 for idx, (ipath, inode) in fi.iter_params.items():
                     if idx not in fi.returns_params:
                         continue  # direct-sink case: handled by report.py
-                    arg = mapping.get(idx)
-                    if arg is None:
+                    marg = mapping.get(idx)
+                    if marg is None:
                         continue
-                    arg_origins = self.eval(arg, env, cls_ctx, depth + 1)
+                    arg_origins = self.eval(marg, env, cls_ctx, depth + 1)
                     if has_local(arg_origins) or "volatile" in arg_origins or has_element(arg_origins):
                         out.add(("itercaller", ipath, inode, None))
 

@@ -102,7 +102,7 @@ def subscript_path(node: ast.AST) -> Optional[str]:
         return None
     key = node.slice
     if isinstance(key, ast.Index):  # Python 3.8 wraps the constant in an Index
-        key = key.value
+        key = getattr(key, "value")  # deprecated stub: ``.value`` is untyped
     if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
         return None
     base = node.value
@@ -316,7 +316,7 @@ def mapping_value_root(node: Optional[ast.AST]) -> Optional[str]:
     if isinstance(node, ast.Subscript) and annotation_root(node.value) in _MAPPING_ANNOTATION_ROOTS:
         sl = node.slice
         if isinstance(sl, ast.Index):  # py3.8 wraps the slice
-            sl = sl.value
+            sl = getattr(sl, "value")  # deprecated stub: ``.value`` is untyped
         if isinstance(sl, ast.Tuple) and len(sl.elts) == 2:
             return annotation_root(sl.elts[1])
     return None

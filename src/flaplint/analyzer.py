@@ -11,7 +11,7 @@ from __future__ import annotations
 import ast
 import os
 import sys
-from typing import Dict, List, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from . import astutils
 from .collector import Collector
@@ -589,7 +589,7 @@ def _render_sites(
                 for cls in classes:
                     sites.setdefault(
                         cls,
-                        (sink_type, fi.path, at_node.lineno,
+                        (sink_type, fi.path, getattr(at_node, "lineno", 0),
                          getattr(at_node, "col_offset", 0)),
                     )
     return sites

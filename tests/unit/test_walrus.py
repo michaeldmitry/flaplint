@@ -58,7 +58,9 @@ def test_walrus_equivalent_to_plain_assign(lint_source):
                     self.relation.data[self.app]["k"] = ",".join(data)
         """
     )
-    sig = lambda fs: sorted((f.rule, f.sink) for f in fs)
+    def sig(fs):
+        return sorted((f.rule, f.sink) for f in fs)
+
     assert sig(walrus) == sig(twoline)
     assert sig(walrus)  # and it is non-empty (both genuinely flag)
 

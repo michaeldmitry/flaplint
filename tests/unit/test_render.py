@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import ast
 import textwrap
 from pathlib import Path
 
 from flaplint.cli import main
+from flaplint.handlers import _variable
 from flaplint.model import Finding
 from flaplint.render import _describe, colour_enabled, render_report
 
@@ -150,10 +152,6 @@ def test_json_flag_is_alias_for_format_json(tmp_path, capsys):
 
 
 # -- offending-variable naming (handlers._variable) -------------------------
-
-import ast
-
-from flaplint.handlers import _variable
 
 
 def _expr(src: str) -> ast.AST:

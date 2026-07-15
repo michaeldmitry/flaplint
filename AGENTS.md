@@ -26,9 +26,24 @@ follows through object fields, dict keys, and model dumps — is documented in
 - **Managed with uv against a committed `uv.lock`.** `uv sync` provisions a locked
   `.venv` with the dev group; after changing `pyproject.toml` deps, run `uv lock`
   and commit the updated `uv.lock`.
-- **Run the test suite** (fast — ~0.5s) from the project root: `uv run pytest`.
+- **Python floor is 3.10.** flaplint parses charm source with the *running*
+  interpreter's `ast`, so its own version is load-bearing (a 3.8 flaplint cannot even
+  parse a charm using `match`). Don't reintroduce 3.8/3.9 shims.
+- **Tasks live in the [`justfile`](justfile)** — and CI runs *those same recipes*, so
+  there is no second definition of "the checks" to drift:
+  - `just check` — the gate (lint + typecheck + full suite). Run before pushing.
+  - `just test` / `just test-unit` / `just test-drift` — the suite (fast, ~0.5s).
+  - `just lint` / `just lint-fix` — ruff. `just typecheck` — mypy (**blocking**:
+    `src/flaplint` is mypy-clean; fix a new error with a typed accessor or a local
+    guard, not a blanket `# type: ignore`).
+  - `just drift 2.23` / `just drift ""` — the ops-anchor suite against a *specific* ops
+    version, deliberately outside the lock. See `docs/ops-version-anchoring.md`.
+  - `just run …` — dogfood flaplint itself.
 - **Run the linter** via `uv run flaplint …`, the installed console script, or the
   module (`python -m flaplint`) — all work.
+- **Commits/PR titles are Conventional Commits** (enforced on the PR title, which is
+  what squash-merge lands on `main`). `fix:` → patch, `feat:` → minor, `feat!:` →
+  major; release-please turns them into the version bump + CHANGELOG.
 
 ## Architecture (orientation)
 

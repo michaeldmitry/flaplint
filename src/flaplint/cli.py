@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from .analyzer import Analyzer
 from .render import colour_enabled, render_gaps, render_report
@@ -152,7 +152,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     fmt = "json" if args.json else args.format
 
     if fmt == "json":
-        payload = [f.__dict__ for f in findings]
+        payload: Any = [f.__dict__ for f in findings]
         if args.explain_gaps:
             payload = {
                 "findings": payload,

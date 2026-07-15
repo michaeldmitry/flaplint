@@ -7,7 +7,6 @@ relation data causes spurious ``relation-changed`` churn.
 
 from __future__ import annotations
 
-from conftest import details
 
 
 def test_set_serialized_to_databag_is_flagged(lint_source):

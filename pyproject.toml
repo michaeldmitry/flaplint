@@ -7,7 +7,7 @@ name = "flaplint"
 version = "1.0.0"
 description = "Static interprocedural taint linter for Juju relation-databag ordering churn."
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "michaeldmitry", email = "michael.dmitry98@gmail.com" }]
 keywords = ["juju", "charm", "linter", "static-analysis", "ast"]
@@ -17,6 +17,10 @@ classifiers = [
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Quality Assurance",
 ]
 # The analyzer is deliberately stdlib-only (ast). No runtime dependencies.
@@ -29,7 +33,7 @@ dependencies = []
 # guard against drift in the ops/pebble API surface flaplint anchors on. The analyzer
 # itself never imports ops (it reads source as text), and the drift tests skip when ops
 # is absent — so a bare ``uv pip install .`` of the tool itself needs none of this.
-dev = ["pytest>=7.0", "ops"]
+dev = ["pytest>=7.0", "ops", "ruff>=0.6", "mypy>=1.8"]
 
 [project.scripts]
 flaplint = "flaplint.cli:main"
@@ -50,4 +54,4 @@ addopts = "-ra"
 
 [tool.ruff]
 line-length = 88
-target-version = "py38"
+target-version = "py310"

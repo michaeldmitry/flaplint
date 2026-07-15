@@ -1,0 +1,72 @@
+name: CI
+
+# The PR/merge gate. Every step shells out to a `just` recipe, so what runs here is
+# exactly what `just check` runs on a laptop -- there is no second, drifting copy of
+# "the checks" living in this file.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: extractions/setup-just@v3
+      - run: just lint
+
+  typecheck:
+    name: typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: extractions/setup-just@v3
+      - run: just typecheck
+
+  test:
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # flaplint parses charm source with the *running* interpreter's `ast`, so its
+        # own Python version is load-bearing (AST shapes differ across releases)
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: extractions/setup-just@v3
+      - run: just test
+
+  ci-ok:
+    # A single, stable check to put in branch protection. Without it you would have to
+    # re-pin every matrix leg by name in the repo settings each time the matrix changes.
+    name: ci-ok
+    if: always()
+    needs: [lint, typecheck, test]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if any required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+      - run: echo "all required checks passed"

@@ -12,7 +12,7 @@ Two kinds of finding are emitted, both only for *primary* (in-scope) functions:
 from __future__ import annotations
 
 import ast
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from .constants import (
     DEFINITELY_UNORDERED_ANNOTATIONS,
@@ -130,7 +130,7 @@ def report(
         rule: str,
         sink: str,
         variable: str,
-        origin: Tuple = None,
+        origin: "Optional[Tuple]" = None,
         sink_loc: "Tuple[str, ast.AST] | None" = None,
         via_subclass: str = "",
         via_attr: str = "",
@@ -229,7 +229,7 @@ def report(
 
         # caller findings: local unordered/volatile value -> sink.
         sink_out: List[Tuple] = []
-        gaps_out: "List[Gap]" = [] if explain_gaps else None
+        gaps_out: "Optional[List[Gap]]" = [] if explain_gaps else None
         analyzer.analyze(fi, ReportHandler(fi, sink_out, gaps_out))
         if gaps_out:
             gaps.extend(gaps_out)

@@ -1,0 +1,35 @@
+name: Release
+
+# Version bumping, driven entirely by Conventional Commits on `main`:
+#
+#   fix:      -> patch   (1.0.0 -> 1.0.1)
+#   feat:     -> minor   (1.0.0 -> 1.1.0)
+#   feat!: / "BREAKING CHANGE:" in the body -> major (1.0.0 -> 2.0.0)
+#   docs/chore/ci/test/refactor -> no release
+#
+# release-please accumulates merged commits into a standing "chore(main): release X.Y.Z"
+# PR that bumps the version, writes CHANGELOG.md, and -- when YOU merge it -- tags and
+# publishes a GitHub Release. Nothing is tagged behind your back; the release is a
+# reviewable diff.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
