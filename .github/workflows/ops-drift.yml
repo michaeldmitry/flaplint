@@ -52,8 +52,8 @@ jobs:
     outputs:
       list: ${{ steps.enumerate.outputs.versions }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
       - id: enumerate
@@ -78,11 +78,11 @@ jobs:
       matrix:
         ops: ${{ fromJSON(needs.versions.outputs.list) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       # Anchors are ops-version-specific, not Python-version-specific (ci.yml owns the
       # Python matrix), so pin one modern interpreter for every leg.
       - run: just drift "${{ matrix.ops }}" "3.12"
@@ -95,11 +95,11 @@ jobs:
     # `notify` job below still opens an issue for it on scheduled runs.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-      - uses: extractions/setup-just@v3
+      - uses: extractions/setup-just@v4
       - run: just drift-main
 
   notify:
