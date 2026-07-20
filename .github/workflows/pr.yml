@@ -1,34 +1,40 @@
-name: PR title
+name: CI
 
-# Enforce Conventional Commits on the PR *title*.
-#
-# Why the title and not the commits: with squash-merge (the setting this repo should
-# use), the PR title becomes the single commit message on `main` -- and that is exactly
-# what release-please reads to decide the next version. So the title IS the contract.
-# Individual WIP commit messages inside the branch are then free-form, which is humane.
+# The PR gate. Runs the shared checks (lint / static / test -- defined once in
+# checks.yml) plus a Conventional-Commits check on the PR title. The identical checks
+# run again on `main` inside release.yml, so there is no separate "merge" workflow.
 
 on:
   pull_request:
     types: [opened, edited, reopened, synchronize]
 
-permissions:
-  pull-requests: read
-
 concurrency:
-  group: pr-title-${{ github.event.pull_request.number }}
+  group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
-  conventional:
-    name: conventional commit title
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  pr-title:
+    # Enforce Conventional Commits on the PR *title*, not the commits: with squash-merge
+    # (the setting this repo should use) the title becomes the single commit on `main`,
+    # and that is exactly what release-please reads to pick the next version. So the title
+    # IS the contract; WIP commit messages inside the branch stay free-form.
+    name: pr title
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
     steps:
       - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           # Types that drive the release (see release.yml):
-          #   fix:  -> patch      feat: -> minor      feat!/BREAKING CHANGE -> major
+          #   fix: -> patch      feat: -> minor      feat!/BREAKING CHANGE -> major
           # The rest are no-release housekeeping types.
           types: |
             feat

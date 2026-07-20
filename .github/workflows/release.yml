@@ -1,16 +1,30 @@
 name: Release
 
-# Version bumping, driven entirely by Conventional Commits on `main`:
+# The release pipeline for `main`. One workflow: run the shared PR checks, then let
+# release-please open/maintain the version-bump PR, then auto-merge it once the checks
+# are green. Version bumps are driven entirely by Conventional Commits:
 #
 #   fix:      -> patch   (1.0.0 -> 1.0.1)
 #   feat:     -> minor   (1.0.0 -> 1.1.0)
 #   feat!: / "BREAKING CHANGE:" in the body -> major (1.0.0 -> 2.0.0)
 #   docs/chore/ci/test/refactor -> no release
 #
-# release-please accumulates merged commits into a standing "chore(main): release X.Y.Z"
-# PR that bumps the version, writes CHANGELOG.md, and -- when YOU merge it -- tags and
-# publishes a GitHub Release. Nothing is tagged behind your back; the release is a
-# reviewable diff.
+# There is NO PyPI publish step: flaplint is consumed straight from git with
+#   uvx --from git+https://github.com/michaeldmitry/flaplint@vX.Y.Z flaplint ...
+# so the git *tag* release-please creates IS the distribution.
+#
+# TOKEN (read this if the run fails):
+#   release-please needs to CREATE a pull request. Two one-time setup steps:
+#   1. Settings -> Actions -> General -> Workflow permissions:
+#      tick "Allow GitHub Actions to create and approve pull requests".
+#      (Without it you get: "GitHub Actions is not permitted to create ... pull requests".)
+#   2. For the auto-merge -> tag chain to work you MUST use a non-default token. A PR
+#      opened -- or a commit pushed -- by the built-in GITHUB_TOKEN does NOT trigger
+#      further workflows, so a GITHUB_TOKEN merge would never fire the follow-up run that
+#      cuts the tag. Create a fine-grained PAT (or GitHub App token) with `contents:write`
+#      + `pull-requests:write`, save it as the `RELEASE_PLEASE_TOKEN` secret. The workflow
+#      falls back to GITHUB_TOKEN when it is unset (release PR still opens; you just merge
+#      it by hand).
 
 on:
   push:
@@ -25,11 +39,37 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release-please:
+  # The same PR checks, on main. This is the "green" the bump PR is merged on.
+  checks:
+    uses: ./.github/workflows/checks.yml
+
+  release:
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      - name: Auto-merge the release PR
+        # Only when a bump PR is open/updated (empty on the run that cuts the tag).
+        if: ${{ steps.release.outputs.pr }}
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          PR_JSON: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          number=$(echo "$PR_JSON" | jq -r .number)
+          # `checks` above is already green for this exact commit, and the bump PR only
+          # edits the version + CHANGELOG on top of it -- so it is safe to land. Squash so
+          # the "chore(main): release X.Y.Z" title becomes the single commit on main; that
+          # push (under RELEASE_PLEASE_TOKEN) re-runs this workflow, and release-please
+          # then tags and cuts the GitHub Release.
+          #
+          # release-please maintains ONE rolling release PR (it force-updates the same
+          # branch), so there are never stale bump PRs to clean up. If your branch
+          # protection requires status checks *on the PR itself*, swap `--squash` for
+          # `--auto --squash` and enable "Allow auto-merge" in repo settings.
+          gh pr merge "$number" --repo "$GITHUB_REPOSITORY" --squash --delete-branch

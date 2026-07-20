@@ -22,7 +22,7 @@ sync:
 # --- the gate -------------------------------------------------------------
 
 # Everything CI enforces as blocking, in one shot. Run this before pushing.
-check: lint typecheck test
+check: lint static test
 
 # --- lint / types ---------------------------------------------------------
 
@@ -43,7 +43,7 @@ fmt:
 fmt-check:
     uv run ruff format --check .
 
-typecheck:
+static:
     uv run mypy src/flaplint --ignore-missing-imports
 
 # --- tests ----------------------------------------------------------------

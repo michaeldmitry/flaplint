@@ -31,9 +31,9 @@ follows through object fields, dict keys, and model dumps — is documented in
   parse a charm using `match`). Don't reintroduce 3.8/3.9 shims.
 - **Tasks live in the [`justfile`](justfile)** — and CI runs *those same recipes*, so
   there is no second definition of "the checks" to drift:
-  - `just check` — the gate (lint + typecheck + full suite). Run before pushing.
+  - `just check` — the gate (lint + static + full suite). Run before pushing.
   - `just test` / `just test-unit` / `just test-drift` — the suite (fast, ~0.5s).
-  - `just lint` / `just lint-fix` — ruff. `just typecheck` — mypy (**blocking**:
+  - `just lint` / `just lint-fix` — ruff. `just static` — mypy (**blocking**:
     `src/flaplint` is mypy-clean; fix a new error with a typed accessor or a local
     guard, not a blanket `# type: ignore`).
   - `just drift 2.23` / `just drift ""` — the ops-anchor suite against a *specific* ops

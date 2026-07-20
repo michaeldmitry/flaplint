@@ -1,17 +1,13 @@
-name: CI
+name: checks
 
-# The PR/merge gate. Every step shells out to a `just` recipe, so what runs here is
-# exactly what `just check` runs on a laptop -- there is no second, drifting copy of
-# "the checks" living in this file.
+# The single definition of "the checks" -- lint, static typing, tests. Both the PR
+# gate (ci.yml) and the release pipeline (release.yml) `uses:` this, so there is exactly
+# one copy of the check matrix in the repo, and every step is a `just` recipe that runs
+# identically on a laptop (`just check`). This is a *reusable* workflow: it does nothing
+# on its own, only when another workflow calls it.
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  workflow_call:
 
 permissions:
   contents: read
@@ -28,16 +24,16 @@ jobs:
       - uses: extractions/setup-just@v4
       - run: just lint
 
-  typecheck:
-    name: typecheck
+  static:
+    name: static
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-      - uses: extractions/setup-just@v4
-      - run: just typecheck
+      - uses: extractions/setup-just@v3
+      - run: just static
 
   test:
     name: test (py${{ matrix.python-version }})
@@ -46,7 +42,7 @@ jobs:
       fail-fast: false
       matrix:
         # flaplint parses charm source with the *running* interpreter's `ast`, so its
-        # own Python version is load-bearing (AST shapes differ across releases)
+        # own Python version is load-bearing (AST shapes differ across releases).
         python-version: ["3.10", "3.11", "3.12", "3.13"]
     env:
       UV_PYTHON: ${{ matrix.python-version }}
@@ -63,7 +59,7 @@ jobs:
     # re-pin every matrix leg by name in the repo settings each time the matrix changes.
     name: ci-ok
     if: always()
-    needs: [lint, typecheck, test]
+    needs: [lint, static, test]
     runs-on: ubuntu-latest
     steps:
       - name: Fail if any required job failed
