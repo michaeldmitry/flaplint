@@ -33,7 +33,7 @@ dependencies = []
 # guard against drift in the ops/pebble API surface flaplint anchors on. The analyzer
 # itself never imports ops (it reads source as text), and the drift tests skip when ops
 # is absent — so a bare ``uv pip install .`` of the tool itself needs none of this.
-dev = ["pytest>=7.0", "ops", "ruff>=0.6", "mypy>=1.8"]
+dev = ["pytest>=7.0", "ops", "ruff>=0.15.22", "mypy>=1.8"]
 
 [project.scripts]
 flaplint = "flaplint.cli:main"
