@@ -54,24 +54,34 @@ def _loc_key(site: Tuple) -> Tuple[str, int, int]:
     return (path, getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
 
 
-def _pick_local_site(origins, fi: FuncInfo):
-    """``(path, line, via)`` born-site of the earliest ``local`` origin (or ``None``).
+def _local_sites(origins, fi: FuncInfo) -> List[Tuple[str, int, str]]:
+    """Distinct ``(path, line, via)`` born-sites of the ``local`` origins, in source
+    order (empty when none).
 
     Points a finding's ``origin=`` at where the unordered value is *created* (the
     ``set()`` / ``glob()`` / unsorted helper) rather than where it is written.
     ``None`` placeholders in an origin resolve to ``fi``'s file/name; ``via`` is
     blanked when the born site lives in the finding's own function (the
     ``origin=`` pointer already says so).
+
+    *Every* distinct site is returned, mirroring the ``element`` / ``itercaller``
+    branches of :meth:`ReportHandler.sink`. Two independently unstable sources that
+    both flow into the same write (the dispatching-property shape: a proxying branch
+    and a direct branch, each building a dict by iterating ``relation.units``) are
+    two separate bugs needing two separate ``sorted()`` calls. Reporting only the
+    earliest would hide the second: the reader fixes the named source and the finding
+    merely re-points at the other one, turning one report into serial whack-a-mole.
     """
     sites = [s for s in (local_site(o) for o in origins) if s is not None]
-    if not sites:
-        return None
-    path, node, func = min(
+    out: List[Tuple[str, int, str]] = []
+    for path, node, func in sorted(
         ((s[0] or fi.path, s[1], s[2] or fi.name) for s in sites),
         key=lambda t: _loc_key((t[0], t[1])),
-    )
-    via = "" if func == fi.name else func
-    return (path, getattr(node, "lineno", 0), via)
+    ):
+        entry = (path, getattr(node, "lineno", 0), "" if func == fi.name else func)
+        if entry not in out:  # two sites on one line collapse to one pointer
+            out.append(entry)
+    return out
 
 
 #: Wrapper callables whose offending content is their *first argument*, not the
@@ -445,6 +455,9 @@ class SummaryHandler(Handler):
                 ) < _loc_key(self.fi.unordered_site):
                     self.fi.unordered_site = resolved
                     self.changed = True
+                if resolved not in self.fi.unordered_sites:
+                    self.fi.unordered_sites.add(resolved)
+                    self.changed = True
                 if not self.fi.returns_unordered:
                     self.fi.returns_unordered = True
                     self.changed = True
@@ -600,7 +613,7 @@ class ReportHandler(Handler):
         ``born`` is the ``(born_path, born_node, born_func)`` recorded when a
         ``local`` value was promoted to ``itercaller`` (``None`` if none, e.g. the
         traced-parameter case). Placeholders resolve to this function (mirrors
-        :func:`_pick_local_site`); ``via`` is blanked when the born site is in this
+        :func:`_local_sites`); ``via`` is blanked when the born site is in this
         function -- and the whole origin is dropped when the born value sits on the
         same line as the finding, so it doesn't redundantly point at itself.
         """
@@ -788,15 +801,39 @@ class ReportHandler(Handler):
                     )
                 )
             return
-        self.out.append(
-            (
-                node,
-                "high",
-                "unordered-collection",
-                sink_type,
-                _variable(arg),
-                self.fi.path,
-                _pick_local_site(origins, self.fi),
-                None,  # finding sits at the write; no separate sink pointer
+        # Two independently unstable sources reaching the same write (e.g. a
+        # dispatching property whose branches each build a dict by iterating
+        # ``relation.units``) are two distinct bugs -- report every distinct
+        # local born-site, not just the earliest (mirrors the ``element`` /
+        # ``itercaller`` branches above). ``report.py``'s dedup key already
+        # includes the origin, so distinct sites survive as distinct findings.
+        local_sites = _local_sites(origins, self.fi)
+        if not local_sites:
+            # No local born-site: emit one finding with origin=None (preserves
+            # the original single-finding behavior for param-only flows).
+            self.out.append(
+                (
+                    node,
+                    "high",
+                    "unordered-collection",
+                    sink_type,
+                    _variable(arg),
+                    self.fi.path,
+                    None,
+                    None,  # finding sits at the write; no separate sink pointer
+                )
             )
-        )
+        else:
+            for origin in local_sites:
+                self.out.append(
+                    (
+                        node,
+                        "high",
+                        "unordered-collection",
+                        sink_type,
+                        _variable(arg),
+                        self.fi.path,
+                        origin,
+                        None,  # finding sits at the write; no separate sink pointer
+                    )
+                )

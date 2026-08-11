@@ -155,6 +155,7 @@ class Collector(ast.NodeVisitor):
         ) in UNORDERED_RETURN_ANNOTATIONS:
             fi.returns_unordered = True
             fi.unordered_site = (self.path, node, fi.name)
+            fi.unordered_sites.add((self.path, node, fi.name))
         fi.returns_class = astutils.annotation_root(getattr(node, "returns", None))
         if is_method:
             fi.absorbs = self._compute_absorbs(node, fi.param_index)

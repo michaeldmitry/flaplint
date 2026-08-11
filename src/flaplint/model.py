@@ -385,6 +385,12 @@ class FuncInfo:
     #: ``set()`` / ``glob()`` that births the instability rather than the
     #: blameless serializer. ``None`` until ``returns_unordered`` is set.
     unordered_site: Optional[Tuple[str, ast.AST, str]] = None
+    #: All distinct locally-born provenance sites whose instability this function
+    #: returns (accumulated over the fixed point). Mirroring ``element_sites`` /
+    #: ``itercaller_sites``, this supports multi-source returns: a dispatching
+    #: property with two branches, each building an unstable dict, emits one
+    #: finding per source rather than collapsing to a single representative.
+    unordered_sites: "Set[Tuple[str, ast.AST, str]]" = field(default_factory=set)
     #: whether the function returns a value whose order derives from a *sequence
     #: materialized from a locally-born unordered collection* (``list(some_set)``)
     #: -- a key-sort-resistant ``itercaller`` flavor. Tracked separately from
