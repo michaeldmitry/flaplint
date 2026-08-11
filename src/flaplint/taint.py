@@ -1102,10 +1102,14 @@ class TaintEngine:
             else:
                 out.add(("element", fi.path, node, fi.name))
         if fi.returns_unordered:
-            if fi.unordered_site is not None:
-                out.add(
-                    ("local", fi.unordered_site[0], fi.unordered_site[1], fi.unordered_site[2])
-                )
+            # One origin per distinct locally-born site: a dispatching property with
+            # two branches (proxy and upstream), each building a dict by iterating
+            # ``relation.units``, needs both origins surfaced so the report lists
+            # both fixes, not just the earliest. Mirrors ``element`` / ``itercaller``.
+            sites = fi.unordered_sites or ({fi.unordered_site} if fi.unordered_site else set())
+            if sites:
+                for s in sites:
+                    out.add(("local", s[0], s[1], s[2]))
             else:
                 out.add(("local", fi.path, node, fi.name))
         if fi.returns_itercaller:
