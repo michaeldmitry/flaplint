@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/michaeldmitry/flaplint/compare/v1.1.0...v1.1.1) (2026-08-11)
+
+
+### Bug Fixes
+
+* report all distinct local origins at same sink ([d9c63ec](https://github.com/michaeldmitry/flaplint/commit/d9c63ecce57627687e20e1793f33b30819c65eaf))
+* report all distinct local origins at same sink ([76a7948](https://github.com/michaeldmitry/flaplint/commit/76a79484bcb26dea081ed2d66008ea152cffd864))
+
 ## [1.1.0](https://github.com/michaeldmitry/flaplint/compare/v1.0.0...v1.1.0) (2026-07-20)
 
 
