@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.2](https://github.com/michaeldmitry/flaplint/compare/v1.1.1...v1.1.2) (2026-08-28)
+
+
+### Bug Fixes
+
+* pin class-reference receivers to their own class's summary ([363111c](https://github.com/michaeldmitry/flaplint/commit/363111ca74e7836e83280b5a349c07bd3ea4574f))
+
 ## [1.1.1](https://github.com/michaeldmitry/flaplint/compare/v1.1.0...v1.1.1) (2026-08-11)
 
 
