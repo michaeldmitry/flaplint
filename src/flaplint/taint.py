@@ -979,11 +979,14 @@ class TaintEngine:
 
         ``self.method()`` / ``cls.method()`` resolves to the enclosing class's
         method; without this, same-named methods on *other* classes union their
-        summaries in and over-taint the call site (a cross-class collision).
-        Builtin mapping views (``x.items()/keys()/values()``) never resolve to a
-        user method: on an arbitrary receiver they would collide with an
-        unrelated same-named property and import its taint (the receiver-taint
-        inheritance rule already carries their real, receiver-following order).
+        summaries in and over-taint the call site (a cross-class collision). A
+        receiver that names a class outright -- whether imported from another
+        module or defined in this file -- pins the same way, so an unrelated
+        same-named method never leaks its summary into the call. Builtin mapping
+        views (``x.items()``/ ``keys()``/``values()``) never resolve to a user
+        method: on an arbitrary receiver they would collide with an unrelated
+        same-named property and import its taint (the receiver-taint inheritance
+        rule already carries their real, receiver-following order).
         """
         candidates = self.registry.get(name or "", ())
         if (
@@ -1026,6 +1029,49 @@ class TaintEngine:
                 pinned = self._pin_to_import(by_cls or candidates, recv_cls)
                 if pinned is not (by_cls or candidates):
                     return pinned
+        # A receiver that *names a class outright* (a classmethod/staticmethod call)
+        # is not an instance, so ``_var_types`` never types it; unpinned, the bare
+        # name unions every same-named function in the scan and an unrelated class's
+        # unstable summary bleeds into the call (a cross-class collision). Two shapes
+        # pin:
+        if (
+            isinstance(call.func, ast.Attribute)
+            and isinstance(call.func.value, ast.Name)
+            and call.func.value.id not in ("self", "cls")
+            and call.func.value.id not in self._var_types
+        ):
+            recv = call.func.value.id
+            module = self._aliases.from_modules.get(recv)
+            if module:
+                # An imported class symbol (``from pkg import Thing``): undo an
+                # ``as`` alias, keep the referenced class's methods (its chain
+                # covers an inherited one), pinned to the module version the
+                # import points at (``v0`` vs ``v1`` of a vendored lib).
+                true_name = self._aliases.names.get(recv, recv)
+                chain = self._class_chain(true_name)
+                by_cls = [fi for fi in candidates if fi.class_name in chain]
+                pinned = [fi for fi in by_cls if _module_matches_path(fi.path, module)]
+                if pinned:
+                    return pinned
+                # A submodule symbol (``from a import b; b.fn()``) targets ``a/b.py``'s
+                # free functions; anything else is external to the scan, so no in-scan
+                # summary applies (arguments still flow via the default rule below).
+                return [
+                    fi
+                    for fi in candidates
+                    if fi.class_name is None
+                    and _module_matches_path(fi.path, f"{module}.{true_name}")
+                ]
+            # A class *defined in this file*: an intra-module reference, so keep
+            # this file's definitions of that class's chain -- not every scanned
+            # class's same-named methods.
+            if any(fi.class_name == recv and fi.path == self._current_path for fi in candidates):
+                chain = self._class_chain(recv)
+                return [
+                    fi
+                    for fi in candidates
+                    if fi.class_name in chain and fi.path == self._current_path
+                ]
         if name in BUILTIN_COLLECTION_METHODS and isinstance(call.func, ast.Attribute):
             recv = call.func.value
             is_self = isinstance(recv, ast.Name) and recv.id in ("self", "cls")
